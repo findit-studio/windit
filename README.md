@@ -15,9 +15,10 @@ Generic windowed-sequence processing — chunk, pad/mask, aggregate, smooth, seg
 
 `windit` is the windowing and post-processing machinery — chunk an input into
 window spans, pad and mask them, then aggregate / smooth / segment / split the
-per-window results — factored out of concrete models into one standalone,
-generic crate. It is the shared core the `diaric` and `zuoer` pipelines were
-extracted from.
+per-window results — in one standalone, generic crate. It follows the same
+standalone-crate pattern as the `diaric` and `zuoer` pipelines: the shared
+machinery lives in a generic crate of its own rather than being reimplemented
+inside each model.
 
 It owns no model code: no tokenizer, no resampler, no mel front-end, no
 inference runtime. It is pure computation plus pluggable policy traits. The
