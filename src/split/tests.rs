@@ -39,7 +39,7 @@ mod content_aware {
   fn packs_words_within_window() {
     let text = "a b c d e f g h";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(5));
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a b c d e", "f g h"]);
@@ -57,7 +57,7 @@ mod content_aware {
     // breaks at the sentence boundary rather than mid-sentence.
     let text = "One two. Three four five six.";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(5));
 
     assert_eq!(chunks.len(), 2);
     let first = &text[chunks[0].0..chunks[0].1];
@@ -76,7 +76,7 @@ mod content_aware {
     let text = "a b c d e f g h";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(5).with_overlap(1);
-    let chunks = ContentAware { len_fn }.chunk(text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(text, &opts);
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a b c d e", "e f g h"]);
@@ -108,7 +108,7 @@ mod content_aware {
     let text = "Aa bb cc. Dd ee ff. Gg hh ii. Jj kk ll. Mm nn oo. Pp qq rr.";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(12).with_overlap(4);
-    let chunks = ContentAware { len_fn }.chunk(text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(text, &opts);
 
     assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
     let repeats = repeated_tokens(text, &chunks);
@@ -129,7 +129,7 @@ mod content_aware {
     let text = [para; 5].join("\n\n");
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(24).with_overlap(6);
-    let chunks = ContentAware { len_fn }.chunk(&text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(&text, &opts);
 
     assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
     let repeats = repeated_tokens(&text, &chunks);
@@ -144,7 +144,7 @@ mod content_aware {
     // A zero window is invalid geometry; chunk short-circuits to no chunks rather
     // than emitting per-atom ranges that all violate the "<= window" guarantee.
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware { len_fn }.chunk("hello world", &WindowOptions::new(0));
+    let chunks = ContentAware::new(len_fn).chunk("hello world", &WindowOptions::new(0));
     assert!(chunks.is_empty());
   }
 
@@ -156,7 +156,7 @@ mod content_aware {
     let text = "ab";
     let len3 = |s: &str| s.chars().count() * 3; // each char measures 3 tokens
     let len_fn: &dyn Fn(&str) -> usize = &len3;
-    let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(2));
+    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(2));
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a", "b"]);
@@ -180,7 +180,7 @@ mod content_aware {
       text.push('x');
     }
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware { len_fn }.chunk(&text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn).chunk(&text, &WindowOptions::new(5));
 
     assert_eq!(chunks.len(), 20);
     for &(s, e) in &chunks {
@@ -193,10 +193,10 @@ mod content_aware {
   #[test]
   fn empty_and_whitespace_yield_no_chunks() {
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    assert!(ContentAware { len_fn }
+    assert!(ContentAware::new(len_fn)
       .chunk("", &WindowOptions::new(5))
       .is_empty());
-    assert!(ContentAware { len_fn }
+    assert!(ContentAware::new(len_fn)
       .chunk("   \n\n  ", &WindowOptions::new(5))
       .is_empty());
   }

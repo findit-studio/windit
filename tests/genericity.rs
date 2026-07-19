@@ -127,7 +127,7 @@ fn content_aware_chunk_is_window_config_driven() {
 
   // The len_fn callback defines "how long": here, whitespace-separated words.
   let count = |s: &str| s.split_whitespace().count();
-  let chunker = ContentAware { len_fn: &count };
+  let chunker = ContentAware::new(&count);
   let text = "a b c d e f g h i j k l";
 
   // The same chunker over two window sizes — only the configuration differs.
