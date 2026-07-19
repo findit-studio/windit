@@ -111,6 +111,10 @@ impl Default for SegmentOptions {
 /// Group the windows `predicate` accepts into merged, length-filtered element
 /// ranges, in input order.
 ///
+/// The sequence must be in span order (ascending `span.start`), as planners
+/// produce; a run's start is taken from its first window, not the minimum over
+/// the run.
+///
 /// A run is a maximal block of consecutive accepted windows. Each run becomes
 /// the [`Range`] from its first window's `span.start` to the largest
 /// `span.start + span.len` among its windows (so overlapping-window runs cover

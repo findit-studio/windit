@@ -19,7 +19,9 @@ pub enum WinditError {
   },
   /// Planning produced more windows than the configured `max_windows` cap.
   TooManyWindows {
-    /// The number of windows that would have been produced.
+    /// The window count at which planning aborted: always the configured
+    /// maximum plus one. Planning stops as soon as the cap is first exceeded,
+    /// so this is the abort count, not the size of the full (unbounded) plan.
     got: usize,
     /// The configured maximum.
     max: usize,
@@ -36,6 +38,15 @@ pub enum WinditError {
   /// An embedding could not be normalized to a finite unit vector: a component
   /// was not finite, or the vector had zero norm.
   NonFinite,
+  /// An exponential-moving-average smoothing factor (`alpha`) was outside the
+  /// valid `[0, 1]` range, or was not a number.
+  ///
+  /// Returned by [`EmaRenormalized`](crate::aggregate::EmaRenormalized), whose
+  /// out-of-range `alpha` would otherwise silently produce a sign-flipping
+  /// "average" rather than a moving average. The infallible
+  /// [`Ema`](crate::smooth::Ema) smoother has no error channel and instead
+  /// clamps `alpha` into range.
+  AlphaOutOfRange,
   /// The input sequence was empty where at least one element was required.
   Empty,
 }
@@ -57,6 +68,7 @@ impl core::fmt::Display for WinditError {
         write!(f, "dimension {got} does not match the expected {expected}")
       }
       Self::NonFinite => f.write_str("embedding could not be normalized to a finite unit vector"),
+      Self::AlphaOutOfRange => f.write_str("EMA smoothing factor alpha must be in [0, 1]"),
       Self::Empty => f.write_str("input sequence was empty"),
     }
   }
