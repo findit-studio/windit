@@ -30,10 +30,19 @@ pub struct Span {
 }
 
 impl Span {
-  /// The fraction of the window filled by real elements, in `(0, 1]`.
+  /// The fraction of the window filled by real elements, in `(0, 1]` for
+  /// planner-produced spans.
+  ///
+  /// Reports `0.0` for a zero-window span (`window == 0`), which a caller can
+  /// construct through the public fields instead of dividing by zero; the
+  /// planner itself never produces one.
   #[must_use]
   pub fn coverage(&self) -> f32 {
-    self.len as f32 / self.window as f32
+    if self.window == 0 {
+      0.0
+    } else {
+      self.len as f32 / self.window as f32
+    }
   }
 }
 
