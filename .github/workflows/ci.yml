@@ -135,6 +135,38 @@ jobs:
       - name: cargo check --target thumbv7em-none-eabihf --features alloc,text,serde
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc,text,serde
 
+  # Prove rustdoc is warning-clean on every feature row, not just under
+  # `--all-features`. A doc comment can carry an intra-doc link to an item that
+  # is only compiled under a feature the reader didn't enable; `--all-features`
+  # alone can never catch that, since every item is present there. `--each-
+  # feature` (cargo-hack) covers `--no-default-features` too, which is exactly
+  # the row an `--all-features`-only check would miss.
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-docs-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-docs-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install cargo-hack
+        run: cargo install cargo-hack
+      - name: cargo hack doc --each-feature
+        run: cargo hack doc --each-feature --no-deps
+      - name: cargo doc --all-features
+        run: cargo doc --all-features --no-deps
+
   build:
     name: build
     strategy:
