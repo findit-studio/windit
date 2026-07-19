@@ -1,6 +1,6 @@
 [package]
 name = "windit"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 repository = "https://github.com/findit-studio/windit"
 homepage = "https://github.com/findit-studio/windit"
@@ -36,7 +36,11 @@ serde = ["dep:serde"]
 # cannot provide (`f32::sqrt` is std-only). Pulled in with `alloc` because every
 # sqrt use lives in the alloc-gated aggregation code.
 libm = { version = "0.2", optional = true }
-unicode-segmentation = { version = "1", optional = true }
+# Pinned below 1.13 so the `text` feature honors the crate's 1.73 MSRV:
+# unicode-segmentation 1.13+ declares `rust-version = 1.85`. Versions `>=1, <1.13`
+# expose the same word/sentence-boundary API and build on 1.73 (verified in CI's
+# MSRV job). Raise this ceiling only alongside the crate's `rust-version`.
+unicode-segmentation = { version = ">=1, <1.13", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = [
   "alloc",
   "derive",
@@ -60,13 +64,11 @@ rpath = false
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(all_tests)',
-  'cfg(docsrs)',
   'cfg(tarpaulin)',
 ] }
