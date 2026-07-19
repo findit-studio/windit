@@ -30,17 +30,42 @@ mod tests;
 /// geometry that produced it. A well-formed range has `start <= end`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Range {
-  /// The first element in the range.
-  pub start: usize,
-  /// One past the last element in the range.
-  pub end: usize,
+  start: usize,
+  end: usize,
 }
 
 impl Range {
+  /// The half-open range covering the elements from `start` up to (but not
+  /// including) `end`.
+  ///
+  /// # Panics
+  ///
+  /// Panics via a debug assertion (debug builds only) if `start > end`. The
+  /// check is compiled out in release, so [`len`](Range::len) still saturates an
+  /// inverted range to `0` there.
+  #[must_use]
+  pub const fn new(start: usize, end: usize) -> Self {
+    debug_assert!(start <= end, "a range must satisfy start <= end");
+    Self { start, end }
+  }
+
+  /// The first element in the range.
+  #[must_use]
+  pub const fn start(&self) -> usize {
+    self.start
+  }
+
+  /// One past the last element in the range.
+  #[must_use]
+  pub const fn end(&self) -> usize {
+    self.end
+  }
+
   /// The number of elements the range covers (`end - start`).
   ///
-  /// Saturates to `0` for an inverted range (`start > end`), which a caller can
-  /// construct through the public fields; the crate itself never produces one.
+  /// Saturates to `0` for an inverted range (`start > end`). [`new`](Range::new)
+  /// rejects one only through a debug assertion, so a release build can still
+  /// hold such a range; the crate itself never produces one.
   #[must_use]
   pub const fn len(&self) -> usize {
     self.end.saturating_sub(self.start)
@@ -133,10 +158,9 @@ where
       if let Some(run) = current.as_mut() {
         run.end = run.end.max(end);
       } else {
-        current = Some(Range {
-          start: w.span.start(),
-          end,
-        });
+        // `end` is `span.start() + span.len()` and `len` is non-zero, so the
+        // range is well formed.
+        current = Some(Range::new(w.span.start(), end));
       }
     } else if let Some(run) = current.take() {
       raw.push(run);
@@ -211,13 +235,42 @@ pub trait SegmentPolicy<V> {
 /// Segment where the score is at or above a fixed threshold.
 ///
 /// A window is in-segment when `value >= thr`; the resulting runs are shaped by
-/// `opts`.
+/// the policy's [`SegmentOptions`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
-  /// Values greater than or equal to this are in-segment.
-  pub thr: f32,
-  /// Gap-merging and minimum-length options for the runs.
-  pub opts: SegmentOptions,
+  thr: f32,
+  opts: SegmentOptions,
+}
+
+impl Threshold {
+  /// Admit values at or above `thr`, shaping the runs with the default
+  /// [`SegmentOptions`].
+  #[must_use]
+  pub const fn new(thr: f32) -> Self {
+    Self {
+      thr,
+      opts: SegmentOptions::new(),
+    }
+  }
+
+  /// Shape the runs with `opts` rather than the default.
+  #[must_use]
+  pub const fn with_opts(mut self, opts: SegmentOptions) -> Self {
+    self.opts = opts;
+    self
+  }
+
+  /// The cutoff at or above which a value is in-segment.
+  #[must_use]
+  pub const fn thr(&self) -> f32 {
+    self.thr
+  }
+
+  /// The gap-merging and minimum-length options applied to the runs.
+  #[must_use]
+  pub const fn opts(&self) -> SegmentOptions {
+    self.opts
+  }
 }
 
 impl SegmentPolicy<f32> for Threshold {
@@ -233,12 +286,50 @@ impl SegmentPolicy<f32> for Threshold {
 /// between), then the latched-on windows are grouped by [`runs`] under `opts`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HysteresisSegment {
+  on: f32,
+  off: f32,
+  opts: SegmentOptions,
+}
+
+impl HysteresisSegment {
+  /// Latch on at `>= on` and off at `<= off`, shaping the resulting runs with
+  /// the default [`SegmentOptions`].
+  ///
+  /// Configure `on >= off`; [`Hysteresis`] documents how the gate degrades
+  /// otherwise.
+  #[must_use]
+  pub const fn new(on: f32, off: f32) -> Self {
+    Self {
+      on,
+      off,
+      opts: SegmentOptions::new(),
+    }
+  }
+
+  /// Shape the runs with `opts` rather than the default.
+  #[must_use]
+  pub const fn with_opts(mut self, opts: SegmentOptions) -> Self {
+    self.opts = opts;
+    self
+  }
+
   /// The turn-on threshold, forwarded to [`Hysteresis`].
-  pub on: f32,
+  #[must_use]
+  pub const fn on(&self) -> f32 {
+    self.on
+  }
+
   /// The turn-off threshold, forwarded to [`Hysteresis`].
-  pub off: f32,
-  /// Gap-merging and minimum-length options for the runs.
-  pub opts: SegmentOptions,
+  #[must_use]
+  pub const fn off(&self) -> f32 {
+    self.off
+  }
+
+  /// The gap-merging and minimum-length options applied to the runs.
+  #[must_use]
+  pub const fn opts(&self) -> SegmentOptions {
+    self.opts
+  }
 }
 
 impl SegmentPolicy<f32> for HysteresisSegment {

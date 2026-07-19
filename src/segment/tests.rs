@@ -26,7 +26,7 @@ fn runs_contiguous_maps_to_element_range() {
   // Frames 1 and 2 are above 0.5, so one run spanning elements [1, 3).
   let s = seq(&[0.1, 0.9, 0.8, 0.2, 0.1]);
   let out = runs(&s, |&v| v > 0.5, &plain());
-  assert_eq!(out, vec![Range { start: 1, end: 3 }]);
+  assert_eq!(out, vec![Range::new(1, 3)]);
 }
 
 #[test]
@@ -39,10 +39,7 @@ fn runs_maps_multi_element_spans() {
     Windowed::new(0.9, Span::new(8, 4, 4)),
   ];
   let out = runs(&s, |&v| v > 0.5, &plain());
-  assert_eq!(
-    out,
-    vec![Range { start: 0, end: 4 }, Range { start: 8, end: 12 }]
-  );
+  assert_eq!(out, vec![Range::new(0, 4), Range::new(8, 12)]);
 }
 
 #[test]
@@ -51,13 +48,10 @@ fn merge_gap_bridges_and_zero_keeps_separate() {
   let s = seq(&[0.9, 0.1, 0.9, 0.9]);
 
   let separate = runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(0));
-  assert_eq!(
-    separate,
-    vec![Range { start: 0, end: 1 }, Range { start: 2, end: 4 }]
-  );
+  assert_eq!(separate, vec![Range::new(0, 1), Range::new(2, 4)]);
 
   let bridged = runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(1));
-  assert_eq!(bridged, vec![Range { start: 0, end: 4 }]);
+  assert_eq!(bridged, vec![Range::new(0, 4)]);
 }
 
 #[test]
@@ -66,13 +60,10 @@ fn min_len_drops_short_runs() {
   let s = seq(&[0.9, 0.1, 0.9, 0.9, 0.9]);
 
   let kept_all = runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_min_len(0));
-  assert_eq!(
-    kept_all,
-    vec![Range { start: 0, end: 1 }, Range { start: 2, end: 5 }]
-  );
+  assert_eq!(kept_all, vec![Range::new(0, 1), Range::new(2, 5)]);
 
   let filtered = runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_min_len(2));
-  assert_eq!(filtered, vec![Range { start: 2, end: 5 }]);
+  assert_eq!(filtered, vec![Range::new(2, 5)]);
 }
 
 #[test]
@@ -81,14 +72,14 @@ fn longest_run_picks_longest_and_ties_earliest() {
   let s = seq(&[0.9, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9, 0.9]);
   assert_eq!(
     longest_run(&s, |&v| v > 0.5, &plain()),
-    Some(Range { start: 2, end: 5 })
+    Some(Range::new(2, 5))
   );
 
   // Two length-2 runs: the earliest wins the tie.
   let tie = seq(&[0.9, 0.9, 0.1, 0.9, 0.9]);
   assert_eq!(
     longest_run(&tie, |&v| v > 0.5, &plain()),
-    Some(Range { start: 0, end: 2 })
+    Some(Range::new(0, 2))
   );
 }
 
@@ -98,22 +89,14 @@ fn runs_sorted_descending_stable() {
   let s = seq(&[0.9, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9, 0.9]);
   assert_eq!(
     runs_sorted(&s, |&v| v > 0.5, &plain()),
-    vec![
-      Range { start: 2, end: 5 },
-      Range { start: 6, end: 8 },
-      Range { start: 0, end: 1 },
-    ]
+    vec![Range::new(2, 5), Range::new(6, 8), Range::new(0, 1),]
   );
 
   // Equal lengths keep input order (stable): [0,2) before [3,5).
   let tie = seq(&[0.9, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9]);
   assert_eq!(
     runs_sorted(&tie, |&v| v > 0.5, &plain()),
-    vec![
-      Range { start: 0, end: 2 },
-      Range { start: 3, end: 5 },
-      Range { start: 6, end: 7 },
-    ]
+    vec![Range::new(0, 2), Range::new(3, 5), Range::new(6, 7),]
   );
 }
 
@@ -129,15 +112,11 @@ fn vad_shaped_twenty_frames() {
   let speech = runs(&s, |&v| v > 0.5, &plain());
   assert_eq!(
     speech,
-    vec![
-      Range { start: 2, end: 6 },
-      Range { start: 9, end: 16 },
-      Range { start: 18, end: 20 },
-    ]
+    vec![Range::new(2, 6), Range::new(9, 16), Range::new(18, 20),]
   );
   assert_eq!(
     longest_run(&s, |&v| v > 0.5, &plain()),
-    Some(Range { start: 9, end: 16 })
+    Some(Range::new(9, 16))
   );
 
   // merge_gap 2 bridges only the 2-element gap before the final range (the
@@ -148,21 +127,15 @@ fn vad_shaped_twenty_frames() {
     |&v| v > 0.5,
     &SegmentOptions::new().with_merge_gap(2).with_min_len(5),
   );
-  assert_eq!(merged, vec![Range { start: 9, end: 20 }]);
+  assert_eq!(merged, vec![Range::new(9, 20)]);
 }
 
 #[test]
 fn threshold_policy_includes_boundary() {
   // thr 0.5 admits values >= 0.5, so the boundary value 0.5 is in-segment.
   let s = seq(&[0.5, 0.9, 0.2, 0.6]);
-  let policy = Threshold {
-    thr: 0.5,
-    opts: plain(),
-  };
-  assert_eq!(
-    policy.segment(&s),
-    vec![Range { start: 0, end: 2 }, Range { start: 3, end: 4 }]
-  );
+  let policy = Threshold::new(0.5);
+  assert_eq!(policy.segment(&s), vec![Range::new(0, 2), Range::new(3, 4)]);
 }
 
 #[test]
@@ -170,15 +143,8 @@ fn hysteresis_segment_reuses_smooth_then_runs() {
   // Same latch as smooth::Hysteresis (on 0.6, off 0.3): [0,1,1,0,1] over the
   // input, whose set frames form runs [1,3) and [4,5).
   let s = seq(&[0.1, 0.7, 0.5, 0.2, 0.6]);
-  let policy = HysteresisSegment {
-    on: 0.6,
-    off: 0.3,
-    opts: plain(),
-  };
-  assert_eq!(
-    policy.segment(&s),
-    vec![Range { start: 1, end: 3 }, Range { start: 4, end: 5 }]
-  );
+  let policy = HysteresisSegment::new(0.6, 0.3);
+  assert_eq!(policy.segment(&s), vec![Range::new(1, 3), Range::new(4, 5)]);
 }
 
 #[test]
@@ -195,19 +161,22 @@ fn empty_and_all_false_yield_none() {
 
 #[test]
 fn range_len_and_is_empty() {
-  let r = Range { start: 2, end: 5 };
+  let r = Range::new(2, 5);
   assert_eq!(r.len(), 3);
   assert!(!r.is_empty());
 
-  let empty = Range { start: 4, end: 4 };
+  let empty = Range::new(4, 4);
   assert_eq!(empty.len(), 0);
   assert!(empty.is_empty());
 }
 
 #[test]
 fn inverted_range_saturates_to_empty() {
-  // `Range` has public fields, so a caller can build an inverted range. `len`
-  // must saturate to zero instead of underflowing rather than panic or wrap.
+  // `Range::new` rejects an inverted range only through a debug assertion, so a
+  // release build can still hold one. This test builds it through the struct
+  // literal — reachable here because `tests` is a child of the defining module —
+  // to stand in for that release-build range, and pins `len` saturating to zero
+  // rather than underflowing.
   let inverted = Range { start: 10, end: 5 };
   assert_eq!(inverted.len(), 0);
   assert!(inverted.is_empty());

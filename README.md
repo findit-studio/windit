@@ -102,7 +102,7 @@ let frames: Vec<Windowed<f32>> = probs
 // Find the longest continuous speech region, ignoring runs under two frames.
 let opts = SegmentOptions::new().with_min_len(2);
 let speech = longest_run(&frames, |&p| p >= 0.5, &opts);
-assert_eq!(speech, Some(Range { start: 4, end: 7 }));
+assert_eq!(speech, Some(Range::new(4, 7)));
 ```
 
 ## Content-aware text chunking: the `len_fn` callback
