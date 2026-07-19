@@ -334,11 +334,7 @@ impl HysteresisSegment {
 
 impl SegmentPolicy<f32> for HysteresisSegment {
   fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
-    let gated = Hysteresis {
-      on: self.on,
-      off: self.off,
-    }
-    .smooth(seq);
+    let gated = Hysteresis::new(self.on, self.off).smooth(seq);
     // The gate emits exactly 0.0 / 1.0, so `>= 0.5` selects the latched-on runs.
     runs(&gated, |&v| v >= 0.5, &self.opts)
   }
