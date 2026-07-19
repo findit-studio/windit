@@ -84,6 +84,34 @@ fn ema_renormalized_recency() {
 }
 
 #[test]
+fn ema_renormalized_rejects_out_of_range_alpha() {
+  let embeddings: [&[f32]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let coverages = [1.0, 1.0];
+  // alpha 2.0 previously produced a sign-flipping "average" silently; now typed.
+  assert!(matches!(
+    EmaRenormalized { alpha: 2.0 }.aggregate_f32(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  // A negative alpha is likewise rejected.
+  assert!(matches!(
+    EmaRenormalized { alpha: -0.5 }.aggregate_f32(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  // NaN alpha is out of range and is caught before it can yield a NaN vector.
+  assert!(matches!(
+    EmaRenormalized { alpha: f32::NAN }.aggregate_f32(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  // The closed-interval endpoints stay valid.
+  assert!(EmaRenormalized { alpha: 0.0 }
+    .aggregate_f32(&embeddings, &coverages, 2)
+    .is_ok());
+  assert!(EmaRenormalized { alpha: 1.0 }
+    .aggregate_f32(&embeddings, &coverages, 2)
+    .is_ok());
+}
+
+#[test]
 fn keep_separate_returns_all_windows() {
   let windows = vec![
     win(&[1.0, 0.0], 4, 4),

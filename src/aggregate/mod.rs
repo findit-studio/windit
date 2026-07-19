@@ -75,7 +75,9 @@ pub trait AggregatePolicy {
   /// Combine `embeddings` (each a `dim`-length f32 slice) with their matching
   /// `coverages` into a single `dim`-length f32 vector.
   ///
-  /// The returned vector is L2-normalized. `coverages` must have the same length
+  /// The built-in policies return an L2-normalized vector, and a custom policy
+  /// should do the same; either way [`aggregate`] re-normalizes the result
+  /// through [`Vector::from_unnormalized`]. `coverages` must have the same length
   /// as `embeddings` even for policies that do not weight by coverage.
   ///
   /// # Errors
@@ -152,11 +154,15 @@ pub struct MeanRenormalized;
 ///
 /// State advances `s_i = alpha * emb_i + (1 - alpha) * s_{i-1}` from `s_0 = emb_0`,
 /// so later windows weigh more (recency). `coverages` are ignored beyond the
-/// length check. `alpha` is expected in `[0, 1]`.
+/// length check. `alpha` must be in `[0, 1]`; an out-of-range or non-finite
+/// `alpha` is rejected with [`WinditError::AlphaOutOfRange`] rather than
+/// silently producing a non-convex (sign-flipping) combination.
 #[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmaRenormalized {
-  /// The smoothing factor in `[0, 1]`: larger values track recent windows more.
+  /// The smoothing factor, which must be in `[0, 1]`: larger values track recent
+  /// windows more. Outside that range (or NaN) is an
+  /// [`AlphaOutOfRange`](WinditError::AlphaOutOfRange) error.
   pub alpha: f32,
 }
 
@@ -216,6 +222,11 @@ impl AggregatePolicy for EmaRenormalized {
     dim: usize,
   ) -> Result<Vec<f32>, WinditError> {
     check_inputs(embeddings, coverages, dim)?;
+    // A convex EMA needs alpha in [0, 1]; anything else (including NaN, which
+    // fails the range test) is a configuration error, not a normalizable vector.
+    if !(0.0..=1.0).contains(&self.alpha) {
+      return Err(WinditError::AlphaOutOfRange);
+    }
     let mut state = embeddings[0].to_vec();
     for emb in &embeddings[1..] {
       for (s, &e) in state.iter_mut().zip(emb.iter()) {

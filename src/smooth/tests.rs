@@ -48,6 +48,23 @@ fn hysteresis_latches_and_holds() {
 }
 
 #[test]
+fn ema_clamps_alpha_and_never_emits_nan() {
+  // alpha 2.0 clamps to 1.0 (track the input exactly): s_t = x_t.
+  let input = seq(&[0.5, 0.8]);
+  let out = Ema { alpha: 2.0 }.smooth(&input);
+  assert_eq!(values(&out), vec![0.5, 0.8]);
+
+  // A NaN alpha clamps to 0.0 (hold the seed): every output is finite, so the
+  // infallible smooth path never leaks a NaN downstream.
+  let out = Ema { alpha: f32::NAN }.smooth(&input);
+  assert!(
+    out.iter().all(|w| w.value.is_finite()),
+    "outputs must be finite"
+  );
+  assert_eq!(values(&out), vec![0.5, 0.5]);
+}
+
+#[test]
 fn empty_input_yields_empty() {
   let input: Vec<Windowed<f32>> = Vec::new();
   assert!(Ema { alpha: 0.5 }.smooth(&input).is_empty());
