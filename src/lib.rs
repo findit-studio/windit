@@ -22,9 +22,11 @@
 //!
 //! # Feature flags
 //!
+//! - **(no features)**: the type and trait surface — [`Span`](plan::Span),
+//!   [`WindowOptions`](plan::WindowOptions), the [`Vector`](windowed::Vector)
+//!   trait, and [`WinditError`] — is always available.
 //! - **`alloc`** (default): the `Vec`-returning algorithms ([`WindowPlan::spans`],
-//!   [`slice_pad_mask`], and the policies). The type and trait surface compiles
-//!   without it.
+//!   [`slice_pad_mask`], and the policies).
 //! - **`std`**: implies `alloc` and adds the [`std::error::Error`] implementation
 //!   for [`WinditError`].
 //! - **`text`**: content-aware string chunking (adds `unicode-segmentation`).
