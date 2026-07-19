@@ -1,5 +1,5 @@
 use super::*;
-use alloc::vec;
+use std::vec;
 
 #[test]
 fn full_window_all_real() {

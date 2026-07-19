@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use std::{vec, vec::Vec};
 
 use super::{Ema, Hysteresis, SmoothPolicy};
 use crate::{plan::Span, windowed::Windowed};

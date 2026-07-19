@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use std::{vec, vec::Vec};
 
 use super::{
   longest_run, runs, runs_sorted, HysteresisSegment, Range, SegmentOptions, SegmentPolicy,

@@ -1,5 +1,5 @@
 use super::*;
-use alloc::{vec, vec::Vec};
+use std::{vec, vec::Vec};
 
 #[test]
 fn exact_windows_no_overlap() {

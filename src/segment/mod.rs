@@ -14,7 +14,7 @@
 //! which is the binary-VAD path.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{

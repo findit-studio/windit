@@ -9,7 +9,7 @@
 //!   smoothing, generalized to any f32 score sequence.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::windowed::Windowed;

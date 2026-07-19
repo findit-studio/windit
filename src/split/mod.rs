@@ -12,7 +12,7 @@
 //! because it returns byte-offset ranges into the text rather than element spans.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 #[cfg(feature = "text")]
 use unicode_segmentation::UnicodeSegmentation;
@@ -137,7 +137,7 @@ fn split_range(
     return Vec::new();
   }
   if len_fn(&text[start..end]) <= window {
-    return alloc::vec![(start, end)];
+    return std::vec![(start, end)];
   }
   let mut out = Vec::new();
   match level {

@@ -6,7 +6,7 @@
 //! pad / mask) and post-processing (aggregate / smooth / segment).
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use crate::error::WinditError;
 
