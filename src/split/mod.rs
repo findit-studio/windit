@@ -57,11 +57,7 @@ impl SplitPolicy for FixedWindow {
 #[cfg(feature = "text")]
 #[derive(Clone, Copy)]
 pub struct ContentAware<'a> {
-  /// Measures the length of a text slice in the caller's units. `chunk`
-  /// guarantees every returned range measures at most the window under this
-  /// function, save for a single `char` that alone exceeds the window (it
-  /// cannot be split further).
-  pub len_fn: &'a dyn Fn(&str) -> usize,
+  len_fn: &'a dyn Fn(&str) -> usize,
 }
 
 #[cfg(feature = "text")]
@@ -69,7 +65,24 @@ pub struct ContentAware<'a> {
 const _: () = {
   use unicode_segmentation::UnicodeSegmentation;
 
-  impl ContentAware<'_> {
+  impl<'a> ContentAware<'a> {
+    /// A chunker that measures text length with `len_fn`.
+    ///
+    /// [`chunk`](ContentAware::chunk) guarantees every returned range measures
+    /// at most the window under this function, save for a single `char` that
+    /// alone exceeds the window (it cannot be split further).
+    #[must_use]
+    pub const fn new(len_fn: &'a dyn Fn(&str) -> usize) -> Self {
+      Self { len_fn }
+    }
+
+    /// The caller-supplied length function, in whose units the window is
+    /// measured.
+    // No `#[must_use]`: the `Fn` trait object already carries one.
+    pub const fn len_fn(&self) -> &'a dyn Fn(&str) -> usize {
+      self.len_fn
+    }
+
     /// Chunk `text` into byte-offset ranges, each measuring at most
     /// [`WindowOptions::window`] under `len_fn`.
     ///
@@ -92,6 +105,22 @@ const _: () = {
     /// fallback, punctuation lying outside word boundaries (a trailing period,
     /// say) is not covered by any chunk. If `opts` is not valid — a zero window,
     /// or an overlap at least the window — no chunks are produced.
+    ///
+    /// ```
+    /// use windit::plan::WindowOptions;
+    /// use windit::split::ContentAware;
+    ///
+    /// // "tokens" = whitespace-separated words, so the window counts words.
+    /// let count = |s: &str| s.split_whitespace().count();
+    /// let chunker = ContentAware::new(&count);
+    ///
+    /// let text = "a b c d e f g h i j k l";
+    /// let chunks = chunker.chunk(text, &WindowOptions::new(4));
+    /// assert_eq!(chunks.len(), 3);
+    /// for (start, end) in chunks {
+    ///   assert!(count(&text[start..end]) <= 4);
+    /// }
+    /// ```
     #[must_use]
     pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Vec<(usize, usize)> {
       if opts.validate().is_err() {
