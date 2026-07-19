@@ -5,9 +5,6 @@
 //! tokens, patches, and frames. The same spans drive pre-processing (slice /
 //! pad / mask) and post-processing (aggregate / smooth / segment).
 
-#[cfg(any(feature = "std", feature = "alloc"))]
-use std::vec::Vec;
-
 use crate::error::WinditError;
 
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
@@ -78,7 +75,6 @@ pub enum TailPolicy {
 /// defaults to no cap (`None`). Unknown keys are rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,
@@ -196,75 +192,79 @@ impl WindowOptions {
 
 /// The window planner: turns an input length and [`WindowOptions`] into the list
 /// of [`Span`]s that drives pre- and post-processing.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug)]
 pub struct WindowPlan;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl WindowPlan {
-  /// Plan the windows covering `input_len` elements under `opts`, in input
-  /// order.
-  ///
-  /// An empty input yields an empty plan; a non-empty input can also yield an
-  /// empty plan when [`TailPolicy::DropBelowMin`] drops the sole, too-short
-  /// window. The final window may be ragged according to the [`TailPolicy`].
-  /// When `opts.hop() <= opts.window()` every input element is covered by at
-  /// least one span; a larger hop strides over the input, leaving gaps
-  /// uncovered.
-  ///
-  /// # Errors
-  ///
-  /// Propagates [`WindowOptions::validate`], and returns
-  /// [`WinditError::TooManyWindows`] if the plan would exceed
-  /// [`WindowOptions::max_windows`].
-  pub fn spans(opts: &WindowOptions, input_len: usize) -> Result<Vec<Span>, WinditError> {
-    opts.validate()?;
-    let (w, hop) = (opts.window(), opts.hop());
-    let mut out = Vec::new();
-    if input_len == 0 {
-      return Ok(out);
-    }
-    let mut start = 0usize;
-    loop {
-      // Reachable only when `hop > w` (a stride wider than the window); keeps
-      // the function total instead of underflowing `input_len - start`.
-      if start >= input_len {
-        break;
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+const _: () = {
+  use std::vec::Vec;
+
+  impl WindowPlan {
+    /// Plan the windows covering `input_len` elements under `opts`, in input
+    /// order.
+    ///
+    /// An empty input yields an empty plan; a non-empty input can also yield an
+    /// empty plan when [`TailPolicy::DropBelowMin`] drops the sole, too-short
+    /// window. The final window may be ragged according to the [`TailPolicy`].
+    /// When `opts.hop() <= opts.window()` every input element is covered by at
+    /// least one span; a larger hop strides over the input, leaving gaps
+    /// uncovered.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`WindowOptions::validate`], and returns
+    /// [`WinditError::TooManyWindows`] if the plan would exceed
+    /// [`WindowOptions::max_windows`].
+    pub fn spans(opts: &WindowOptions, input_len: usize) -> Result<Vec<Span>, WinditError> {
+      opts.validate()?;
+      let (w, hop) = (opts.window(), opts.hop());
+      let mut out = Vec::new();
+      if input_len == 0 {
+        return Ok(out);
       }
-      let len = core::cmp::min(w, input_len - start);
-      // `input_len - start` is safe under the loop guard (`start < input_len`);
-      // computing the tail this way avoids overflowing `start + w` when
-      // `input_len` is within a window of `usize::MAX`.
-      let is_tail = input_len - start <= w;
-      let keep = match opts.tail() {
-        TailPolicy::DropBelowMin(m) => len >= *m || len == w,
-        _ => true,
-      };
-      if keep {
-        out.push(Span {
-          start,
-          len,
-          window: w,
-        });
-      }
-      if let Some(max) = opts.max_windows() {
-        if out.len() > max {
-          return Err(WinditError::TooManyWindows {
-            got: out.len(),
-            max,
+      let mut start = 0usize;
+      loop {
+        // Reachable only when `hop > w` (a stride wider than the window); keeps
+        // the function total instead of underflowing `input_len - start`.
+        if start >= input_len {
+          break;
+        }
+        let len = core::cmp::min(w, input_len - start);
+        // `input_len - start` is safe under the loop guard (`start < input_len`);
+        // computing the tail this way avoids overflowing `start + w` when
+        // `input_len` is within a window of `usize::MAX`.
+        let is_tail = input_len - start <= w;
+        let keep = match opts.tail() {
+          TailPolicy::DropBelowMin(m) => len >= *m || len == w,
+          _ => true,
+        };
+        if keep {
+          out.push(Span {
+            start,
+            len,
+            window: w,
           });
         }
+        if let Some(max) = opts.max_windows() {
+          if out.len() > max {
+            return Err(WinditError::TooManyWindows {
+              got: out.len(),
+              max,
+            });
+          }
+        }
+        if is_tail {
+          break;
+        }
+        // A hop that would carry `start` past `usize::MAX` cannot reach any further
+        // in-bounds element, so stop rather than wrap.
+        match start.checked_add(hop) {
+          Some(s) => start = s,
+          None => break,
+        }
       }
-      if is_tail {
-        break;
-      }
-      // A hop that would carry `start` past `usize::MAX` cannot reach any further
-      // in-bounds element, so stop rather than wrap.
-      match start.checked_add(hop) {
-        Some(s) => start = s,
-        None => break,
-      }
+      Ok(out)
     }
-    Ok(out)
   }
-}
+};

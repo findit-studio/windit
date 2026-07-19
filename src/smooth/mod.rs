@@ -8,13 +8,11 @@
 //! - `Hysteresis` is the latching two-threshold gate used for binary VAD
 //!   smoothing, generalized to any f32 score sequence.
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use crate::windowed::Windowed;
 
-#[cfg(all(test, any(feature = "std", feature = "alloc")))]
+#[cfg(test)]
 mod tests;
 
 /// A policy that smooths a windowed value sequence, preserving each span.
@@ -23,7 +21,6 @@ mod tests;
 /// `V = f32`. An implementor that carries values through unchanged (rather
 /// than computing new ones, as [`Ema`] and [`Hysteresis`] do) declares its own
 /// `V: Clone` bound on its `impl`.
-#[cfg(any(feature = "std", feature = "alloc"))]
 pub trait SmoothPolicy<V> {
   /// Return a smoothed sequence the same length as `seq`, each element keeping
   /// its input [`Span`](crate::plan::Span).
@@ -38,7 +35,6 @@ pub trait SmoothPolicy<V> {
 /// (hold the seed). With a clamped alpha and finite inputs, the recurrence
 /// introduces no NaN. `Ema` does not sanitize inputs, though: a non-finite
 /// (`NaN`/infinite) input value still propagates through the recurrence.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ema {
   /// The smoothing factor; clamped into `[0, 1]` (a NaN clamps to `0.0`).
@@ -53,7 +49,6 @@ pub struct Ema {
 /// suppresses chatter. If misconfigured with `on < off`, the turn-on test is
 /// evaluated first and wins, so the gate degrades to a single threshold at `on`.
 /// This is the binary VAD smoothing generalized to any f32 score.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hysteresis {
   /// The turn-on threshold: a value `>= on` latches the gate on.
@@ -62,7 +57,6 @@ pub struct Hysteresis {
   pub off: f32,
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl SmoothPolicy<f32> for Ema {
   fn smooth(&self, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
     // Clamp alpha into [0, 1] deterministically. NaN is handled explicitly
@@ -87,7 +81,6 @@ impl SmoothPolicy<f32> for Ema {
   }
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl SmoothPolicy<f32> for Hysteresis {
   fn smooth(&self, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
     let mut out = Vec::with_capacity(seq.len());

@@ -5,13 +5,11 @@
 //! buffer, right-pads the remainder, and produces the matching attention mask
 //! (`1` for real elements, `0` for padding).
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{error::WinditError, plan::Span};
 
-#[cfg(all(test, any(feature = "std", feature = "alloc")))]
+#[cfg(test)]
 mod tests;
 
 /// Slice `elements` to `span`, right-pad to the span's window size with `pad`,
@@ -31,7 +29,6 @@ mod tests;
 ///
 /// Panics via a debug assertion (debug builds only) if
 /// `span.start + span.len > elements.len()`.
-#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, Vec<u8>) {
   debug_assert!(
     span.start + span.len <= elements.len(),
@@ -61,7 +58,6 @@ pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, 
 /// Returns [`WinditError::DimMismatch`] when the span runs past `elements`
 /// (`span.start + span.len > elements.len()`), reporting `got = elements.len()`
 /// and `expected = span.start + span.len`.
-#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn try_slice_pad_mask<T: Copy>(
   elements: &[T],
   span: &Span,
