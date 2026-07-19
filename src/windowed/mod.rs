@@ -65,6 +65,25 @@ impl<V> Windowed<V> {
   pub const fn span(&self) -> Span {
     self.span
   }
+
+  /// The per-window value, moved out of the pairing.
+  ///
+  /// The owning counterpart to [`value`](Windowed::value), for callers that need
+  /// the `V` itself — the embeddings behind a `keep_separate` result, say —
+  /// rather than a borrow of it. The fields are not public, so this is the only
+  /// way to obtain an owned `V` without cloning.
+  #[must_use]
+  pub fn into_value(self) -> V {
+    self.value
+  }
+
+  /// The value and its span, moved out of the pairing.
+  ///
+  /// [`into_value`](Windowed::into_value) when the span is not needed.
+  #[must_use]
+  pub fn into_parts(self) -> (V, Span) {
+    (self.value, self.span)
+  }
 }
 
 /// A [`Windowed`] embedding: a value that implements [`Vector`] paired with the
