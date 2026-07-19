@@ -11,6 +11,13 @@ categories = ["algorithms", "no-std", "text-processing"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.73"
+# Keep the published package to source, license, readme, and the acceptance
+# suite; CI configuration is development-only.
+exclude = [
+  ".github/",
+  "ci/",
+  ".codecov.yml",
+]
 
 [[bench]]
 path = "benches/windit.rs"
