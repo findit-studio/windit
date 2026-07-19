@@ -10,7 +10,7 @@ keywords = ["windowing", "embedding", "aggregation", "chunking", "vad"]
 categories = ["algorithms", "no-std", "text-processing"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-rust-version = "1.73"
+rust-version = "1.95"
 # Keep the published package to source, license, readme, and the acceptance
 # suite; CI configuration is development-only.
 exclude = [
@@ -40,12 +40,14 @@ serde = ["dep:serde"]
 # unconditionally regardless of that feature, so the default is already
 # no_std-safe — do not "fix" this.
 libm = { version = "0.2", optional = true }
-# Pinned below 1.13 so the `text` feature honors the crate's 1.73 MSRV:
-# unicode-segmentation 1.13+ declares `rust-version = 1.85`. Versions
-# `>=1.6, <1.13` expose the same word/sentence-boundary API and build on 1.73
-# (verified in CI's MSRV job). Raise this ceiling only alongside the crate's
-# `rust-version`.
-unicode-segmentation = { version = ">=1.6, <1.13", optional = true }
+# Word and sentence boundaries for the `text` feature. Unbounded within 1.x: the
+# newest release (1.13.3) declares `rust-version = 1.85`, well under this crate's
+# 1.95 MSRV, so the version ceiling this dependency used to carry is obsolete.
+# Default features are not disabled because there are none to disable: the
+# crate's sole feature (`no_std`) is a legacy no-op and is not a default, and the
+# crate is `no_std`-compatible as shipped — proven by CI's bare-metal
+# `--features alloc,text` row.
+unicode-segmentation = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = [
   "alloc",
   "derive",
