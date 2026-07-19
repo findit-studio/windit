@@ -4,4 +4,10 @@
 //! use windit::prelude::*;
 //! ```
 
-pub use crate::error::WinditError;
+pub use crate::{
+  error::WinditError,
+  plan::{Span, TailPolicy, WindowOptions},
+};
+
+#[cfg(feature = "alloc")]
+pub use crate::plan::WindowPlan;
