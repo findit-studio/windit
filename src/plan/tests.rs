@@ -77,6 +77,21 @@ fn zero_window_and_bad_overlap_error() {
   ));
 }
 
+#[test]
+fn zero_window_span_coverage_is_zero() {
+  // `Span` has public fields, so a caller can build a zero-window span.
+  // `coverage` must report `0.0` instead of dividing by zero (which would
+  // yield `inf`, or `NaN` for a zero `len` too) — the planner itself never
+  // produces one.
+  let span = Span {
+    start: 0,
+    len: 5,
+    window: 0,
+  };
+  assert_eq!(span.coverage(), 0.0);
+  assert!(span.coverage().is_finite());
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn window_options_serde_round_trip() {
