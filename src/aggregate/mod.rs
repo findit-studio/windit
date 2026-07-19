@@ -149,12 +149,35 @@ pub struct MeanRenormalized;
 /// length check. `alpha` must be in `[0, 1]`; an out-of-range or non-finite
 /// `alpha` is rejected with [`WinditError::AlphaOutOfRange`] rather than
 /// silently producing a non-convex (sign-flipping) combination.
+///
+/// Like [`WindowOptions`](crate::plan::WindowOptions), construction is
+/// infallible and the range is checked where the value is used — here in
+/// [`aggregate_f32`](AggregatePolicy::aggregate_f32), which already returns a
+/// `Result`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmaRenormalized {
-  /// The smoothing factor, which must be in `[0, 1]`: larger values track recent
-  /// windows more. Outside that range (or NaN) is an
-  /// [`AlphaOutOfRange`](WinditError::AlphaOutOfRange) error.
-  pub alpha: f32,
+  alpha: f32,
+}
+
+impl EmaRenormalized {
+  /// An EMA aggregation with the given smoothing factor.
+  ///
+  /// `alpha` is not validated here: a value outside `[0, 1]` (or a NaN) is
+  /// reported as [`AlphaOutOfRange`](WinditError::AlphaOutOfRange) by
+  /// [`aggregate_f32`](AggregatePolicy::aggregate_f32). Deferring the check is
+  /// what keeps this constructor usable from `AggregatePolicyKind::into_policy`,
+  /// which builds a policy from deserialized configuration and has no error
+  /// channel of its own.
+  #[must_use]
+  pub const fn new(alpha: f32) -> Self {
+    Self { alpha }
+  }
+
+  /// The smoothing factor: larger values track recent windows more.
+  #[must_use]
+  pub const fn alpha(&self) -> f32 {
+    self.alpha
+  }
 }
 
 /// L2-norm-weighted mean, then renormalization: higher-magnitude inputs dominate.
@@ -238,7 +261,7 @@ pub enum AggregatePolicyKind {
   MeanRenormalized,
   /// Selects [`EmaRenormalized`] with the given smoothing factor.
   Ema {
-    /// The EMA smoothing factor, forwarded to [`EmaRenormalized::alpha`].
+    /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
     alpha: f32,
   },
   /// Selects [`SaliencyWeighted`].
@@ -254,7 +277,7 @@ impl AggregatePolicyKind {
     match self {
       Self::CoverageWeightedMean => Box::new(CoverageWeightedMean),
       Self::MeanRenormalized => Box::new(MeanRenormalized),
-      Self::Ema { alpha } => Box::new(EmaRenormalized { alpha }),
+      Self::Ema { alpha } => Box::new(EmaRenormalized::new(alpha)),
       Self::SaliencyWeighted => Box::new(SaliencyWeighted),
     }
   }

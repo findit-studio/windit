@@ -67,13 +67,13 @@ fn ema_renormalized_recency() {
   // order reverses the emphasis, proving ordering matters.
   let coverages = [1.0, 1.0, 1.0];
   let fwd: [&[f32]; 3] = [&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]];
-  let out = EmaRenormalized { alpha: 0.5 }
+  let out = EmaRenormalized::new(0.5)
     .aggregate_f32(&fwd, &coverages, 3)
     .unwrap();
   assert_close(&out, &[0.4082483, 0.4082483, 0.8164966]);
 
   let rev: [&[f32]; 3] = [&[0.0, 0.0, 1.0], &[0.0, 1.0, 0.0], &[1.0, 0.0, 0.0]];
-  let out_rev = EmaRenormalized { alpha: 0.5 }
+  let out_rev = EmaRenormalized::new(0.5)
     .aggregate_f32(&rev, &coverages, 3)
     .unwrap();
   assert_close(&out_rev, &[0.8164966, 0.4082483, 0.4082483]);
@@ -85,24 +85,24 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
   let coverages = [1.0, 1.0];
   // alpha 2.0 previously produced a sign-flipping "average" silently; now typed.
   assert!(matches!(
-    EmaRenormalized { alpha: 2.0 }.aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(2.0).aggregate_f32(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // A negative alpha is likewise rejected.
   assert!(matches!(
-    EmaRenormalized { alpha: -0.5 }.aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(-0.5).aggregate_f32(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // NaN alpha is out of range and is caught before it can yield a NaN vector.
   assert!(matches!(
-    EmaRenormalized { alpha: f32::NAN }.aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(f32::NAN).aggregate_f32(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // The closed-interval endpoints stay valid.
-  assert!(EmaRenormalized { alpha: 0.0 }
+  assert!(EmaRenormalized::new(0.0)
     .aggregate_f32(&embeddings, &coverages, 2)
     .is_ok());
-  assert!(EmaRenormalized { alpha: 1.0 }
+  assert!(EmaRenormalized::new(1.0)
     .aggregate_f32(&embeddings, &coverages, 2)
     .is_ok());
 }
@@ -168,7 +168,7 @@ fn kind_into_policy_matches_builtin() {
     &windows3,
   )
   .unwrap();
-  let via_builtin = aggregate(&EmaRenormalized { alpha: 0.5 }, &windows3).unwrap();
+  let via_builtin = aggregate(&EmaRenormalized::new(0.5), &windows3).unwrap();
   assert_close(via_kind.as_slice(), via_builtin.as_slice());
 }
 
