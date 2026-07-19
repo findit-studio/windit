@@ -8,16 +8,7 @@ fn seq(values: &[f32]) -> Vec<Windowed<f32>> {
   values
     .iter()
     .enumerate()
-    .map(|(i, &v)| {
-      Windowed::new(
-        v,
-        Span {
-          start: i,
-          len: 1,
-          window: 1,
-        },
-      )
-    })
+    .map(|(i, &v)| Windowed::new(v, Span::new(i, 1, 1)))
     .collect()
 }
 

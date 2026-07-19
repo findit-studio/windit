@@ -13,26 +13,62 @@ mod tests;
 /// A single window's placement over the input: where it starts, how many real
 /// elements it covers, and the fixed window size it pads to.
 ///
-/// `len` is the number of *real* input elements (`0 < len <= window`); the
-/// remaining `window - len` positions are padding. [`coverage`](Span::coverage)
-/// reports the real fraction.
+/// [`len`](Span::len) is the number of *real* input elements (`0 < len <=
+/// window`); the remaining `window - len` positions are padding.
+/// [`coverage`](Span::coverage) reports the real fraction.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Span {
-  /// Index of the first real element, in input elements.
-  pub start: usize,
-  /// Number of real elements in the window (`0 < len <= window`).
-  pub len: usize,
-  /// The fixed window size this span pads to, in elements.
-  pub window: usize,
+  start: usize,
+  len: usize,
+  window: usize,
 }
 
+// A span always covers at least one real element, so an `is_empty` companion to
+// `len` would be a constant `false` — a misleading addition rather than the
+// useful pair the lint assumes.
+#[allow(clippy::len_without_is_empty)]
 impl Span {
+  /// A span starting at `start` that covers `len` real elements of a
+  /// `window`-wide window, the remaining `window - len` positions being padding.
+  ///
+  /// # Panics
+  ///
+  /// Panics via a debug assertion (debug builds only) unless `0 < len <=
+  /// window`. The check is compiled out in release, so
+  /// [`coverage`](Span::coverage) still guards against a zero window there.
+  #[must_use]
+  pub const fn new(start: usize, len: usize, window: usize) -> Self {
+    debug_assert!(
+      len > 0 && len <= window,
+      "a span must satisfy 0 < len <= window"
+    );
+    Self { start, len, window }
+  }
+
+  /// Index of the first real element, in input elements.
+  #[must_use]
+  pub const fn start(&self) -> usize {
+    self.start
+  }
+
+  /// Number of real elements in the window (`0 < len <= window`).
+  #[must_use]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+
+  /// The fixed window size this span pads to, in elements.
+  #[must_use]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+
   /// The fraction of the window filled by real elements, in `(0, 1]` for
   /// planner-produced spans.
   ///
-  /// Reports `0.0` for a zero-window span (`window == 0`), which a caller can
-  /// construct through the public fields instead of dividing by zero; the
-  /// planner itself never produces one.
+  /// Reports `0.0` for a zero-window span (`window == 0`) instead of dividing by
+  /// zero. [`new`](Span::new) rejects one only through a debug assertion, so a
+  /// release build can still hold such a span; the planner never produces one.
   #[must_use]
   pub fn coverage(&self) -> f32 {
     if self.window == 0 {
@@ -241,11 +277,9 @@ const _: () = {
           _ => true,
         };
         if keep {
-          out.push(Span {
-            start,
-            len,
-            window: w,
-          });
+          // `w` is non-zero (validated) and the loop guard gives `start <
+          // input_len`, so `len` is in `1..=w`: the span invariant holds.
+          out.push(Span::new(start, len, w));
         }
         if let Some(max) = opts.max_windows() {
           if out.len() > max {

@@ -31,20 +31,20 @@ mod tests;
 /// `span.start + span.len > elements.len()`.
 pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, Vec<u8>) {
   debug_assert!(
-    span.start + span.len <= elements.len(),
+    span.start() + span.len() <= elements.len(),
     "span (start {}, len {}) runs past element length {}",
-    span.start,
-    span.len,
+    span.start(),
+    span.len(),
     elements.len()
   );
-  let window = span.window;
+  let window = span.window();
 
   let mut values = Vec::with_capacity(window);
-  values.extend_from_slice(&elements[span.start..span.start + span.len]);
+  values.extend_from_slice(&elements[span.start()..span.start() + span.len()]);
   values.resize(window, pad);
 
   let mut mask = Vec::with_capacity(window);
-  mask.resize(span.len, 1u8);
+  mask.resize(span.len(), 1u8);
   mask.resize(window, 0u8);
 
   (values, mask)
@@ -63,7 +63,7 @@ pub fn try_slice_pad_mask<T: Copy>(
   span: &Span,
   pad: T,
 ) -> Result<(Vec<T>, Vec<u8>), WinditError> {
-  let required = span.start + span.len;
+  let required = span.start() + span.len();
   if required > elements.len() {
     return Err(WinditError::DimMismatch {
       got: elements.len(),

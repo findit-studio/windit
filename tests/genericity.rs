@@ -64,7 +64,7 @@ fn run<E: Vector>(unit_window: usize, input_len: usize, embed: impl Fn(&Span) ->
 /// vector. The dimension is fixed at 4 across every case; window size is what
 /// varies.
 fn embed(span: &Span) -> TestEmbedding {
-  let base = (span.start % 7) as f32 + 1.0;
+  let base = (span.start() % 7) as f32 + 1.0;
   let raw: Vec<f32> = (0..4).map(|i| base + i as f32 + 1.0).collect();
   TestEmbedding::from_unnormalized(&raw).expect("valid embedding")
 }
@@ -103,16 +103,7 @@ fn vad_frame_segment_longest_run() {
   let frames: Vec<Windowed<f32>> = probs
     .iter()
     .enumerate()
-    .map(|(i, &p)| {
-      Windowed::new(
-        p,
-        Span {
-          start: i,
-          len: 1,
-          window: 1,
-        },
-      )
-    })
+    .map(|(i, &p)| Windowed::new(p, Span::new(i, 1, 1)))
     .collect();
 
   let opts = SegmentOptions::new();

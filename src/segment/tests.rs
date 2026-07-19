@@ -12,16 +12,7 @@ fn seq(values: &[f32]) -> Vec<Windowed<f32>> {
   values
     .iter()
     .enumerate()
-    .map(|(i, &v)| {
-      Windowed::new(
-        v,
-        Span {
-          start: i,
-          len: 1,
-          window: 1,
-        },
-      )
-    })
+    .map(|(i, &v)| Windowed::new(v, Span::new(i, 1, 1)))
     .collect()
 }
 
@@ -43,30 +34,9 @@ fn runs_maps_multi_element_spans() {
   // Three width-4 windows; the middle one is below threshold. Ranges come from
   // span.start .. span.start + span.len, i.e. element units, not frame indices.
   let s = [
-    Windowed::new(
-      0.9,
-      Span {
-        start: 0,
-        len: 4,
-        window: 4,
-      },
-    ),
-    Windowed::new(
-      0.1,
-      Span {
-        start: 4,
-        len: 4,
-        window: 4,
-      },
-    ),
-    Windowed::new(
-      0.9,
-      Span {
-        start: 8,
-        len: 4,
-        window: 4,
-      },
-    ),
+    Windowed::new(0.9, Span::new(0, 4, 4)),
+    Windowed::new(0.1, Span::new(4, 4, 4)),
+    Windowed::new(0.9, Span::new(8, 4, 4)),
   ];
   let out = runs(&s, |&v| v > 0.5, &plain());
   assert_eq!(

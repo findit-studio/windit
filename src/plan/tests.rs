@@ -6,8 +6,8 @@ fn exact_windows_no_overlap() {
   let o = WindowOptions::new(4);
   let s = WindowPlan::spans(&o, 12).unwrap();
   assert_eq!(s.len(), 3);
-  assert_eq!((s[0].start, s[0].len), (0, 4));
-  assert_eq!((s[2].start, s[2].len), (8, 4));
+  assert_eq!((s[0].start(), s[0].len()), (0, 4));
+  assert_eq!((s[2].start(), s[2].len()), (8, 4));
   assert_eq!(s[0].coverage(), 1.0);
 }
 
@@ -16,7 +16,7 @@ fn ragged_tail_keeps_partial_with_coverage() {
   let o = WindowOptions::new(4); // 10 elems -> [0..4],[4..8],[8..10 len2 cov .5]
   let s = WindowPlan::spans(&o, 10).unwrap();
   assert_eq!(s.len(), 3);
-  assert_eq!((s[2].start, s[2].len), (8, 2));
+  assert_eq!((s[2].start(), s[2].len()), (8, 2));
   assert!((s[2].coverage() - 0.5).abs() < 1e-6);
 }
 
@@ -24,14 +24,17 @@ fn ragged_tail_keeps_partial_with_coverage() {
 fn overlap_hops_correctly() {
   let o = WindowOptions::new(4).with_overlap(2); // hop 2
   let s = WindowPlan::spans(&o, 8).unwrap(); // [0..4],[2..6],[4..8]
-  assert_eq!(s.iter().map(|x| x.start).collect::<Vec<_>>(), vec![0, 2, 4]);
+  assert_eq!(
+    s.iter().map(|x| x.start()).collect::<Vec<_>>(),
+    vec![0, 2, 4]
+  );
 }
 
 #[test]
 fn drop_below_min_drops_short_tail() {
   let o = WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(2));
   let s = WindowPlan::spans(&o, 9).unwrap(); // tail len 1 < 2 -> dropped
-  assert_eq!(s.last().map(|x| (x.start, x.len)), Some((4, 4)));
+  assert_eq!(s.last().map(|x| (x.start(), x.len())), Some((4, 4)));
 }
 
 #[test]
@@ -39,7 +42,7 @@ fn fits_in_one_window_is_single_span() {
   let o = WindowOptions::new(512);
   let s = WindowPlan::spans(&o, 40).unwrap();
   assert_eq!(s.len(), 1);
-  assert_eq!((s[0].start, s[0].len), (0, 40));
+  assert_eq!((s[0].start(), s[0].len()), (0, 40));
 }
 
 #[test]
@@ -59,14 +62,14 @@ fn spans_no_overflow_near_usize_max() {
   let opts = WindowOptions::new(usize::MAX - 10).with_hop(100);
   let s = WindowPlan::spans(&opts, usize::MAX - 5).unwrap();
   assert_eq!(s.len(), 2);
-  assert_eq!((s[0].start, s[1].start), (0, 100));
+  assert_eq!((s[0].start(), s[1].start()), (0, 100));
 
   // A hop whose advance would overflow `start + hop` breaks cleanly instead of
   // panicking: two windows are placed, then the advance saturates and stops.
   let hop = usize::MAX / 2 + 1;
   let s = WindowPlan::spans(&WindowOptions::new(10).with_hop(hop), usize::MAX).unwrap();
   assert_eq!(s.len(), 2);
-  assert_eq!((s[0].start, s[1].start), (0, hop));
+  assert_eq!((s[0].start(), s[1].start()), (0, hop));
 }
 
 #[test]
@@ -79,10 +82,12 @@ fn zero_window_and_bad_overlap_error() {
 
 #[test]
 fn zero_window_span_coverage_is_zero() {
-  // `Span` has public fields, so a caller can build a zero-window span.
-  // `coverage` must report `0.0` instead of dividing by zero (which would
-  // yield `inf`, or `NaN` for a zero `len` too) — the planner itself never
-  // produces one.
+  // `Span::new` rejects a zero window only through a debug assertion, so a
+  // release build can still hold one. This test builds it through the struct
+  // literal — reachable here because `tests` is a child of the defining module —
+  // to stand in for that release-build span, and pins `coverage` reporting `0.0`
+  // rather than dividing by zero (which would yield `inf`, or `NaN` for a zero
+  // `len` too). The planner itself never produces one.
   let span = Span {
     start: 0,
     len: 5,
@@ -90,6 +95,13 @@ fn zero_window_span_coverage_is_zero() {
   };
   assert_eq!(span.coverage(), 0.0);
   assert!(span.coverage().is_finite());
+}
+
+#[test]
+fn span_new_exposes_geometry_through_accessors() {
+  let span = Span::new(8, 3, 4);
+  assert_eq!((span.start(), span.len(), span.window()), (8, 3, 4));
+  assert!((span.coverage() - 0.75).abs() < 1e-6);
 }
 
 #[cfg(feature = "serde")]

@@ -18,11 +18,7 @@ use crate::{
 fn win(raw: &[f32], len: usize, window: usize) -> WindowEmbedding<TestVec> {
   Windowed::new(
     TestVec::from_unnormalized(raw).unwrap(),
-    Span {
-      start: 0,
-      len,
-      window,
-    },
+    Span::new(0, len, window),
   )
 }
 

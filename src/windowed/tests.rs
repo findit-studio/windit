@@ -11,15 +11,11 @@ fn from_unnormalized_l2_normalizes() {
 
 #[test]
 fn windowed_carries_value_and_span() {
-  let span = Span {
-    start: 0,
-    len: 2,
-    window: 4,
-  };
+  let span = Span::new(0, 2, 4);
   let e: WindowEmbedding<TestVec> =
     Windowed::new(TestVec::from_unnormalized(&[3.0, 4.0]).unwrap(), span);
   assert_eq!(e.span(), span);
-  assert_eq!(e.span.start, 0);
+  assert_eq!(e.span().start(), 0);
   assert_close(e.value().as_slice(), &[0.6, 0.8]);
   assert_eq!(e.value.dim(), 2);
 }

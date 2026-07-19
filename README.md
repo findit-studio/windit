@@ -96,7 +96,7 @@ let probs = [0.1, 0.9, 0.8, 0.2, 0.7, 0.9, 0.6];
 let frames: Vec<Windowed<f32>> = probs
   .iter()
   .enumerate()
-  .map(|(i, &p)| Windowed::new(p, Span { start: i, len: 1, window: 1 }))
+  .map(|(i, &p)| Windowed::new(p, Span::new(i, 1, 1)))
   .collect();
 
 // Find the longest continuous speech region, ignoring runs under two frames.
