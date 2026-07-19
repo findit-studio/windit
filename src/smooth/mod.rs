@@ -20,10 +20,11 @@ mod tests;
 /// A policy that smooths a windowed value sequence, preserving each span.
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
-/// `V = f32`. `V: Clone` is part of the contract so implementors that carry
-/// values through unchanged can do so.
+/// `V = f32`. An implementor that carries values through unchanged (rather
+/// than computing new ones, as [`Ema`] and [`Hysteresis`] do) declares its own
+/// `V: Clone` bound on its `impl`.
 #[cfg(feature = "alloc")]
-pub trait SmoothPolicy<V: Clone> {
+pub trait SmoothPolicy<V> {
   /// Return a smoothed sequence the same length as `seq`, each element keeping
   /// its input [`Span`](crate::plan::Span).
   fn smooth(&self, seq: &[Windowed<V>]) -> Vec<Windowed<V>>;
