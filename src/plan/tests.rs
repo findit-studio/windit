@@ -58,3 +58,22 @@ fn zero_window_and_bad_overlap_error() {
     Err(WinditError::ZeroWindow)
   ));
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_serde_round_trip() {
+  // Every field set to a non-default value, including the tuple tail variant and
+  // the window cap, so the round trip covers the whole geometry.
+  let opts = WindowOptions::new(512)
+    .with_overlap(64)
+    .with_tail(TailPolicy::DropBelowMin(10))
+    .with_max_windows(8);
+  let json = serde_json::to_string(&opts).unwrap();
+  let back: WindowOptions = serde_json::from_str(&json).unwrap();
+  assert_eq!(opts, back);
+
+  // The default tail and absent cap (a `None`) round-trip as well.
+  let simple = WindowOptions::new(4);
+  let back: WindowOptions = serde_json::from_str(&serde_json::to_string(&simple).unwrap()).unwrap();
+  assert_eq!(simple, back);
+}

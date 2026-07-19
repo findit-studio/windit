@@ -37,6 +37,9 @@ serde = { version = "1", optional = true, default-features = false, features = [
 
 [dev-dependencies]
 criterion = "0.8"
+# A serde data format for the round-trip tests. `alloc`-only (no `std`) so the
+# tests exercise serde in the `no_std + alloc` configuration too.
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.bench]
 opt-level = 3
