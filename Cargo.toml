@@ -34,7 +34,11 @@ serde = ["dep:serde"]
 [dependencies]
 # `libm` supplies `sqrtf` for the L2 renormalization in `aggregate`, which core
 # cannot provide (`f32::sqrt` is std-only). Pulled in with `alloc` because every
-# sqrt use lives in the alloc-gated aggregation code.
+# sqrt use lives in the alloc-gated aggregation code. Default features are kept
+# (no `default-features = false`) deliberately: libm's only default feature is
+# `arch` (architecture-specific intrinsics), and libm is `#![no_std]`
+# unconditionally regardless of that feature, so the default is already
+# no_std-safe — do not "fix" this.
 libm = { version = "0.2", optional = true }
 # Pinned below 1.13 so the `text` feature honors the crate's 1.73 MSRV:
 # unicode-segmentation 1.13+ declares `rust-version = 1.85`. Versions
