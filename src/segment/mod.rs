@@ -42,9 +42,12 @@ pub struct Range {
 #[cfg(feature = "alloc")]
 impl Range {
   /// The number of elements the range covers (`end - start`).
+  ///
+  /// Saturates to `0` for an inverted range (`start > end`), which a caller can
+  /// construct through the public fields; the crate itself never produces one.
   #[must_use]
   pub const fn len(&self) -> usize {
-    self.end - self.start
+    self.end.saturating_sub(self.start)
   }
 
   /// Whether the range covers no elements (`start >= end`).

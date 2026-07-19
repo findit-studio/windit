@@ -235,6 +235,15 @@ fn range_len_and_is_empty() {
 }
 
 #[test]
+fn inverted_range_saturates_to_empty() {
+  // `Range` has public fields, so a caller can build an inverted range. `len`
+  // must saturate to zero instead of underflowing rather than panic or wrap.
+  let inverted = Range { start: 10, end: 5 };
+  assert_eq!(inverted.len(), 0);
+  assert!(inverted.is_empty());
+}
+
+#[test]
 fn segment_options_builder_and_default() {
   let o = SegmentOptions::new().with_min_len(3).with_merge_gap(2);
   assert_eq!(o.min_len, 3);
