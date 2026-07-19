@@ -129,12 +129,12 @@ where
   let mut current: Option<Range> = None;
   for w in seq {
     if predicate(&w.value) {
-      let end = w.span.start + w.span.len;
+      let end = w.span.start() + w.span.len();
       if let Some(run) = current.as_mut() {
         run.end = run.end.max(end);
       } else {
         current = Some(Range {
-          start: w.span.start,
+          start: w.span.start(),
           end,
         });
       }
