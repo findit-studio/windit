@@ -30,15 +30,43 @@ pub trait SmoothPolicy<V> {
 /// Exponential moving average: `s_t = alpha * x_t + (1 - alpha) * s_{t-1}`.
 ///
 /// Seeded with `s_0 = x_0`. A larger `alpha` tracks the input more closely; a
-/// smaller one smooths harder. This policy is infallible, so `alpha` is clamped
-/// into `[0, 1]` deterministically: a non-finite (NaN) `alpha` clamps to `0.0`
-/// (hold the seed). With a clamped alpha and finite inputs, the recurrence
+/// smaller one smooths harder. This policy is infallible, so [`Ema::new`] clamps
+/// `alpha` into `[0, 1]` deterministically: a non-finite (NaN) `alpha` clamps to
+/// `0.0` (hold the seed). With a clamped alpha and finite inputs, the recurrence
 /// introduces no NaN. `Ema` does not sanitize inputs, though: a non-finite
 /// (`NaN`/infinite) input value still propagates through the recurrence.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ema {
-  /// The smoothing factor; clamped into `[0, 1]` (a NaN clamps to `0.0`).
-  pub alpha: f32,
+  alpha: f32,
+}
+
+impl Ema {
+  /// An exponential moving average with the given smoothing factor, clamped
+  /// into `[0, 1]`.
+  ///
+  /// Clamping at construction is what keeps the infallible [`SmoothPolicy`] path
+  /// total: above `1.0` clamps to `1.0`, below `0.0` clamps to `0.0`, and a NaN
+  /// becomes `0.0` (hold the seed). [`alpha`](Ema::alpha) reports the clamped
+  /// value the recurrence actually uses.
+  #[must_use]
+  pub const fn new(alpha: f32) -> Self {
+    // A NaN fails both comparisons and falls through to `0.0`; `f32::clamp`
+    // would propagate it instead, and is not const.
+    let alpha = if alpha > 1.0 {
+      1.0
+    } else if alpha >= 0.0 {
+      alpha
+    } else {
+      0.0
+    };
+    Self { alpha }
+  }
+
+  /// The smoothing factor, always in `[0, 1]`.
+  #[must_use]
+  pub const fn alpha(&self) -> f32 {
+    self.alpha
+  }
 }
 
 /// Latching two-threshold gate producing a binary `0.0` / `1.0` sequence.
@@ -51,17 +79,43 @@ pub struct Ema {
 /// This is the binary VAD smoothing generalized to any f32 score.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hysteresis {
+  on: f32,
+  off: f32,
+}
+
+impl Hysteresis {
+  /// A gate that latches on at `>= on` and off at `<= off`.
+  ///
+  /// Configure `on >= off`; the band between them is the hold region. An
+  /// `on < off` pair is deliberately not rejected: the type documents the
+  /// single-threshold behaviour it degrades to, which is defined and
+  /// deterministic rather than invalid.
+  #[must_use]
+  pub const fn new(on: f32, off: f32) -> Self {
+    Self { on, off }
+  }
+
   /// The turn-on threshold: a value `>= on` latches the gate on.
-  pub on: f32,
+  #[must_use]
+  pub const fn on(&self) -> f32 {
+    self.on
+  }
+
   /// The turn-off threshold: a value `<= off` latches the gate off.
-  pub off: f32,
+  #[must_use]
+  pub const fn off(&self) -> f32 {
+    self.off
+  }
 }
 
 impl SmoothPolicy<f32> for Ema {
   fn smooth(&self, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
-    // Clamp alpha into [0, 1] deterministically. NaN is handled explicitly
-    // (mapped to 0.0, "hold the seed") because `f32::clamp` would propagate it;
-    // this infallible policy must never leak a NaN into the output.
+    // `Ema::new` is the only way to set `alpha` and clamps it there, so this
+    // re-clamp is currently unreachable. It is kept as the last line of defence
+    // for the output contract — an infallible policy that never leaks a NaN
+    // downstream — because that contract must survive any future construction
+    // path that bypasses `new`, a serde derive on this type being the obvious
+    // one. NaN is handled explicitly since `f32::clamp` would propagate it.
     let alpha = if self.alpha.is_nan() {
       0.0
     } else {
