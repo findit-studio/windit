@@ -45,9 +45,9 @@ pub trait Vector: Sized {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Windowed<V> {
   /// The per-window value produced from the span.
-  pub value: V,
+  pub(crate) value: V,
   /// The span of input this value covers.
-  pub span: Span,
+  pub(crate) span: Span,
 }
 
 impl<V> Windowed<V> {

@@ -25,16 +25,14 @@
 //! [`Span`]: crate::plan::Span
 //! [`Span::coverage`]: crate::plan::Span::coverage
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use std::{vec, vec::Vec};
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{
   error::WinditError,
   windowed::{Vector, WindowEmbedding},
 };
 
-#[cfg(all(test, any(feature = "std", feature = "alloc")))]
+#[cfg(test)]
 mod tests;
 
 /// A policy that combines a sequence of window embeddings into one embedding.
@@ -69,7 +67,6 @@ mod tests;
 ///   }
 /// }
 /// ```
-#[cfg(any(feature = "std", feature = "alloc"))]
 pub trait AggregatePolicy {
   /// Combine `embeddings` (each a `dim`-length f32 slice) with their matching
   /// `coverages` into a single `dim`-length f32 vector.
@@ -104,7 +101,6 @@ pub trait AggregatePolicy {
 ///
 /// [`WinditError::Empty`] if `windows` is empty; otherwise any error from the
 /// policy or from [`Vector::from_unnormalized`].
-#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn aggregate<E, P>(policy: &P, windows: &[WindowEmbedding<E>]) -> Result<E, WinditError>
 where
   E: Vector,
@@ -128,7 +124,6 @@ where
 ///
 /// The counterpart to [`aggregate`], for callers that keep per-window embeddings
 /// (for example, one speaker centroid per window) instead of collapsing them.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[must_use]
 pub fn keep_separate<E>(windows: Vec<WindowEmbedding<E>>) -> Vec<WindowEmbedding<E>> {
   windows
@@ -138,14 +133,12 @@ pub fn keep_separate<E>(windows: Vec<WindowEmbedding<E>>) -> Vec<WindowEmbedding
 ///
 /// Each window contributes in proportion to its [`Span::coverage`](crate::plan::Span::coverage),
 /// so a padded ragged tail counts less than a full window.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoverageWeightedMean;
 
 /// Uniform (unweighted) mean, then L2 renormalization.
 ///
 /// Every window contributes equally regardless of coverage.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MeanRenormalized;
 
@@ -156,7 +149,6 @@ pub struct MeanRenormalized;
 /// length check. `alpha` must be in `[0, 1]`; an out-of-range or non-finite
 /// `alpha` is rejected with [`WinditError::AlphaOutOfRange`] rather than
 /// silently producing a non-convex (sign-flipping) combination.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmaRenormalized {
   /// The smoothing factor, which must be in `[0, 1]`: larger values track recent
@@ -172,11 +164,9 @@ pub struct EmaRenormalized {
 /// ignored beyond the length check. This differs from the other strategies only
 /// when the inputs carry magnitude; [`aggregate`] feeds unit vectors, so use
 /// [`aggregate_f32`](AggregatePolicy::aggregate_f32) directly to exploit it.
-#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SaliencyWeighted;
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl AggregatePolicy for CoverageWeightedMean {
   fn aggregate_f32(
     &self,
@@ -188,7 +178,6 @@ impl AggregatePolicy for CoverageWeightedMean {
   }
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl AggregatePolicy for MeanRenormalized {
   fn aggregate_f32(
     &self,
@@ -200,7 +189,6 @@ impl AggregatePolicy for MeanRenormalized {
   }
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl AggregatePolicy for SaliencyWeighted {
   fn aggregate_f32(
     &self,
@@ -212,7 +200,6 @@ impl AggregatePolicy for SaliencyWeighted {
   }
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl AggregatePolicy for EmaRenormalized {
   fn aggregate_f32(
     &self,
@@ -275,7 +262,6 @@ impl AggregatePolicyKind {
 
 /// Validate that `embeddings` is non-empty, `coverages` matches its length, and
 /// every embedding has length `dim`.
-#[cfg(any(feature = "std", feature = "alloc"))]
 fn check_inputs(embeddings: &[&[f32]], coverages: &[f32], dim: usize) -> Result<(), WinditError> {
   if embeddings.is_empty() {
     return Err(WinditError::Empty);
@@ -298,7 +284,6 @@ fn check_inputs(embeddings: &[&[f32]], coverages: &[f32], dim: usize) -> Result<
 }
 
 /// Accumulate `sum_i weight(i, emb_i) * emb_i` and L2-renormalize it.
-#[cfg(any(feature = "std", feature = "alloc"))]
 fn weighted_sum_renorm(
   embeddings: &[&[f32]],
   coverages: &[f32],
@@ -318,7 +303,6 @@ fn weighted_sum_renorm(
 }
 
 /// The L2 norm of `v`, via `libm::sqrtf` (core has no `f32::sqrt`).
-#[cfg(any(feature = "std", feature = "alloc"))]
 fn l2_norm(v: &[f32]) -> f32 {
   libm::sqrtf(v.iter().map(|x| x * x).sum::<f32>())
 }
@@ -329,7 +313,6 @@ fn l2_norm(v: &[f32]) -> f32 {
 ///
 /// [`WinditError::NonFinite`] if the norm is zero or not finite (which also
 /// catches a non-finite component, since it propagates into the norm).
-#[cfg(any(feature = "std", feature = "alloc"))]
 fn l2_renorm(v: &mut [f32]) -> Result<(), WinditError> {
   let norm = l2_norm(v);
   if !norm.is_finite() || norm == 0.0 {

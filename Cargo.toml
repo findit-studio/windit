@@ -83,7 +83,10 @@ rpath = false
 [package.metadata.docs.rs]
 all-features = true
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
