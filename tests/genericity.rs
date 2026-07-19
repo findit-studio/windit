@@ -110,15 +110,11 @@ fn vad_frame_segment_longest_run() {
   let speech = runs(&frames, |&p| p >= 0.5, &opts);
   assert_eq!(
     speech,
-    vec![
-      Range { start: 10, end: 20 },
-      Range { start: 30, end: 60 },
-      Range { start: 70, end: 75 },
-    ]
+    vec![Range::new(10, 20), Range::new(30, 60), Range::new(70, 75),]
   );
   assert_eq!(
     longest_run(&frames, |&p| p >= 0.5, &opts),
-    Some(Range { start: 30, end: 60 })
+    Some(Range::new(30, 60))
   );
 }
 
