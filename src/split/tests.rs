@@ -71,7 +71,8 @@ mod content_aware {
 
   #[test]
   fn overlap_repeats_tail_tokens() {
-    // overlap 1: the second chunk repeats the last token of the first.
+    // overlap 1: the second chunk repeats the last token of the first. Words are
+    // single-token atoms, so a token budget and an atom count coincide here.
     let text = "a b c d e f g h";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(5).with_overlap(1);
@@ -79,6 +80,92 @@ mod content_aware {
 
     let slices: alloc::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, alloc::vec!["a b c d e", "e f g h"]);
+  }
+
+  /// Measure the tokens repeated between each pair of consecutive chunks.
+  fn repeated_tokens(text: &str, chunks: &[(usize, usize)]) -> alloc::vec::Vec<usize> {
+    chunks
+      .windows(2)
+      .map(|w| {
+        let (_, e0) = w[0];
+        let (s1, _) = w[1];
+        if s1 < e0 {
+          word_count(&text[s1..e0])
+        } else {
+          0
+        }
+      })
+      .collect()
+  }
+
+  #[test]
+  fn overlap_is_a_token_budget_over_sentence_atoms() {
+    // Six capitalized 3-token sentences (18 tokens), window 12, overlap 4. With
+    // multi-token atoms the overlap is a TOKEN budget, not an atom count: the
+    // packer repeats at most 4 tokens of trailing whole sentences (one sentence,
+    // 3 tokens), giving two chunks -- not the advance-by-one slide (3 chunks,
+    // 9 repeated tokens) that an atom-count overlap produced.
+    let text = "Aa bb cc. Dd ee ff. Gg hh ii. Jj kk ll. Mm nn oo. Pp qq rr.";
+    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let opts = WindowOptions::new(12).with_overlap(4);
+    let chunks = ContentAware { len_fn }.chunk(text, &opts);
+
+    assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
+    let repeats = repeated_tokens(text, &chunks);
+    assert_eq!(repeats, alloc::vec![3]);
+    assert!(
+      repeats.iter().all(|&r| r <= 4),
+      "no repeat may exceed the 4-token overlap budget, got {repeats:?}"
+    );
+  }
+
+  #[test]
+  fn overlap_budget_over_paragraph_atoms() {
+    // Five 8-token paragraphs (40 tokens), window 24, overlap 6. A whole
+    // paragraph (8 tokens) exceeds the 6-token budget, so no atom is repeated
+    // and the packer advances a full chunk: two chunks, zero repeated tokens --
+    // NOT the atom-count slide (3 chunks) that repeated 16 tokens per step.
+    let para = "The quick brown fox jumps over lazy dogs";
+    let text = [para; 5].join("\n\n");
+    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let opts = WindowOptions::new(24).with_overlap(6);
+    let chunks = ContentAware { len_fn }.chunk(&text, &opts);
+
+    assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
+    let repeats = repeated_tokens(&text, &chunks);
+    assert!(
+      repeats.iter().all(|&r| r <= 6),
+      "no repeat may exceed the 6-token overlap budget, got {repeats:?}"
+    );
+  }
+
+  #[test]
+  fn chunk_rejects_invalid_window() {
+    // A zero window is invalid geometry; chunk short-circuits to no chunks rather
+    // than emitting per-atom ranges that all violate the "<= window" guarantee.
+    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let chunks = ContentAware { len_fn }.chunk("hello world", &WindowOptions::new(0));
+    assert!(chunks.is_empty());
+  }
+
+  #[test]
+  fn single_oversized_char_is_the_sole_exception() {
+    // A single char that alone measures more than the window cannot be split
+    // further, so it is emitted as-is: the one documented exception to the
+    // "every range measures <= window" guarantee.
+    let text = "ab";
+    let len3 = |s: &str| s.chars().count() * 3; // each char measures 3 tokens
+    let len_fn: &dyn Fn(&str) -> usize = &len3;
+    let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(2));
+
+    let slices: alloc::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    assert_eq!(slices, alloc::vec!["a", "b"]);
+    for &(s, e) in &chunks {
+      assert!(
+        len3(&text[s..e]) > 2,
+        "the oversize char is emitted despite exceeding the window"
+      );
+    }
   }
 
   #[test]
