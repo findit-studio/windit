@@ -13,16 +13,16 @@
 //! through [`smooth::Hysteresis`](crate::smooth::Hysteresis) and then segments,
 //! which is the binary-VAD path.
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{
   smooth::{Hysteresis, SmoothPolicy},
   windowed::Windowed,
 };
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
 /// A half-open range of input elements, `[start, end)`.
@@ -30,7 +30,7 @@ mod tests;
 /// Units are input elements (samples, tokens, patches, frames) — the same units
 /// as [`Span`](crate::plan::Span) — so a range is independent of the window
 /// geometry that produced it. A well-formed range has `start <= end`.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Range {
   /// The first element in the range.
@@ -39,7 +39,7 @@ pub struct Range {
   pub end: usize,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl Range {
   /// The number of elements the range covers (`end - start`).
   ///
@@ -62,14 +62,14 @@ impl Range {
 /// Both values are in input elements. Construct with [`SegmentOptions::new`]
 /// (keep everything, merge only touching runs) and refine with the `with_*`
 /// builders.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SegmentOptions {
   min_len: usize,
   merge_gap: usize,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl SegmentOptions {
   /// Options that keep every run and merge only touching or overlapping runs
   /// (`min_len == 0`, `merge_gap == 0`).
@@ -108,7 +108,7 @@ impl SegmentOptions {
   }
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl Default for SegmentOptions {
   fn default() -> Self {
     Self::new()
@@ -128,7 +128,7 @@ impl Default for SegmentOptions {
 /// the union of their spans). The runs are then merged when separated by at most
 /// [`SegmentOptions::merge_gap`] elements, and any run shorter than
 /// [`SegmentOptions::min_len`] is dropped.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn runs<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Vec<Range>
 where
   F: Fn(&V) -> bool,
@@ -162,7 +162,7 @@ where
 /// The longest range from [`runs`], breaking ties toward the earliest.
 ///
 /// Returns `None` when [`runs`] is empty.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn longest_run<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Option<Range>
 where
   F: Fn(&V) -> bool,
@@ -181,7 +181,7 @@ where
 /// The ranges from [`runs`], sorted by length descending.
 ///
 /// The sort is stable, so equal-length ranges keep their input order.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub fn runs_sorted<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Vec<Range>
 where
   F: Fn(&V) -> bool,
@@ -194,7 +194,7 @@ where
 /// Merge runs whose gap to the previous run is at most `merge_gap`.
 ///
 /// `ranges` must be sorted by `start` (as [`runs`] produces them).
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 fn merge_adjacent(ranges: Vec<Range>, merge_gap: usize) -> Vec<Range> {
   let mut out: Vec<Range> = Vec::with_capacity(ranges.len());
   for r in ranges {
@@ -214,7 +214,7 @@ fn merge_adjacent(ranges: Vec<Range>, merge_gap: usize) -> Vec<Range> {
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
 /// `V = f32` (speech probabilities, energies, logits).
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub trait SegmentPolicy<V> {
   /// Segment `seq` into the element ranges it selects, in input order.
   fn segment(&self, seq: &[Windowed<V>]) -> Vec<Range>;
@@ -224,7 +224,7 @@ pub trait SegmentPolicy<V> {
 ///
 /// A window is in-segment when `value >= thr`; the resulting runs are shaped by
 /// `opts`.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
   /// Values greater than or equal to this are in-segment.
@@ -233,7 +233,7 @@ pub struct Threshold {
   pub opts: SegmentOptions,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl SegmentPolicy<f32> for Threshold {
   fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
     runs(seq, |&v| v >= self.thr, &self.opts)
@@ -245,7 +245,7 @@ impl SegmentPolicy<f32> for Threshold {
 /// The sequence is first smoothed by [`Hysteresis`]
 /// with these `on` / `off` thresholds (turn on at `>= on`, off at `<= off`, hold
 /// between), then the latched-on windows are grouped by [`runs`] under `opts`.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HysteresisSegment {
   /// The turn-on threshold, forwarded to [`Hysteresis`].
@@ -256,7 +256,7 @@ pub struct HysteresisSegment {
   pub opts: SegmentOptions,
 }
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl SegmentPolicy<f32> for HysteresisSegment {
   fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
     let gated = Hysteresis {

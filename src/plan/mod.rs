@@ -5,12 +5,12 @@
 //! tokens, patches, and frames. The same spans drive pre-processing (slice /
 //! pad / mask) and post-processing (aggregate / smooth / segment).
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 use alloc::vec::Vec;
 
 use crate::error::WinditError;
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
 /// A single window's placement over the input: where it starts, how many real
@@ -196,11 +196,11 @@ impl WindowOptions {
 
 /// The window planner: turns an input length and [`WindowOptions`] into the list
 /// of [`Span`]s that drives pre- and post-processing.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug)]
 pub struct WindowPlan;
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl WindowPlan {
   /// Plan the windows covering `input_len` elements under `opts`, in input
   /// order.

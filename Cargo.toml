@@ -24,6 +24,17 @@ path = "benches/windit.rs"
 name = "windit"
 harness = false
 
+# Hierarchical, not independent: `std` implies `alloc`. The heap tier owns the
+# sqrt dependency (`alloc = ["dep:libm"]`) because every sqrt call lives in the
+# alloc-gated aggregation code, so a `std`-without-`alloc` build would compile
+# that code with no `libm::sqrtf` to call. Decoupling to `std = []` would force
+# `std` to either pull libm anyway or carry a second, std-only sqrt path — the
+# duplicate implementation an independent feature model invites.
+#
+# Because `std` implies `alloc`, the crate's `any(feature = "std", feature =
+# "alloc")` gates are today exactly equivalent to gating on `alloc` alone. They
+# are spelled the long way deliberately, so they stay correct if this table is
+# ever decoupled.
 [features]
 default = ["alloc"]
 alloc = ["dep:libm"]

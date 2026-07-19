@@ -7,7 +7,7 @@
 //! whole suite) require it. Under a feature set without `alloc` the file compiles
 //! to an empty test binary, so the `serde`-only / no-feature matrix rows still
 //! build.
-#![cfg(feature = "alloc")]
+#![cfg(any(feature = "std", feature = "alloc"))]
 
 use windit::prelude::*;
 

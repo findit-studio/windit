@@ -43,7 +43,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 
-#[cfg(any(feature = "alloc", feature = "std"))]
+#[cfg(any(feature = "std", feature = "alloc"))]
 extern crate alloc;
 
 pub mod aggregate;
@@ -57,7 +57,7 @@ pub mod windowed;
 
 mod error;
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod test_support;
 
 pub use error::WinditError;
