@@ -7,6 +7,7 @@
 pub use crate::{
   error::WinditError,
   plan::{Span, TailPolicy, WindowOptions},
+  windowed::{Vector, WindowEmbedding, Windowed},
 };
 
 #[cfg(feature = "alloc")]
