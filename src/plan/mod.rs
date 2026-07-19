@@ -39,6 +39,7 @@ impl Span {
 
 /// How the planner treats a final window that does not fill a whole [`Span`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum TailPolicy {
   /// Keep the ragged tail as a partial span; its [`Span::coverage`] is below
   /// `1.0`. This is the default.
@@ -61,7 +62,12 @@ pub enum TailPolicy {
 /// until [`WindowPlan::spans`] runs — or you call
 /// [`validate`](WindowOptions::validate) directly — so construction is
 /// infallible.
+///
+/// With the `serde` feature every field is serialized and required on
+/// deserialization, so a persisted geometry replays exactly (no field silently
+/// defaults).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,

@@ -147,3 +147,23 @@ fn kind_into_policy_matches_builtin() {
   let via_builtin = aggregate(&EmaRenormalized { alpha: 0.5 }, &windows3).unwrap();
   assert_close(via_kind.as_slice(), via_builtin.as_slice());
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn kind_serde_round_trip() {
+  for kind in [
+    AggregatePolicyKind::CoverageWeightedMean,
+    AggregatePolicyKind::MeanRenormalized,
+    AggregatePolicyKind::Ema { alpha: 0.25 },
+    AggregatePolicyKind::SaliencyWeighted,
+  ] {
+    let json = serde_json::to_string(&kind).unwrap();
+    let back: AggregatePolicyKind = serde_json::from_str(&json).unwrap();
+    assert_eq!(kind, back);
+  }
+
+  // The Ema variant carries its `alpha` field through serialization intact.
+  let json = serde_json::to_string(&AggregatePolicyKind::Ema { alpha: 0.75 }).unwrap();
+  let back: AggregatePolicyKind = serde_json::from_str(&json).unwrap();
+  assert!(matches!(back, AggregatePolicyKind::Ema { alpha } if alpha == 0.75));
+}
