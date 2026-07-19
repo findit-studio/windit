@@ -52,6 +52,24 @@ fn max_windows_errors() {
 }
 
 #[test]
+fn spans_no_overflow_near_usize_max() {
+  // `input_len` within `window` of usize::MAX must not overflow the tail check
+  // (a debug panic) nor wrap into an unbounded loop (release). The tail is
+  // detected on the second window and packing stops.
+  let opts = WindowOptions::new(usize::MAX - 10).with_hop(100);
+  let s = WindowPlan::spans(&opts, usize::MAX - 5).unwrap();
+  assert_eq!(s.len(), 2);
+  assert_eq!((s[0].start, s[1].start), (0, 100));
+
+  // A hop whose advance would overflow `start + hop` breaks cleanly instead of
+  // panicking: two windows are placed, then the advance saturates and stops.
+  let hop = usize::MAX / 2 + 1;
+  let s = WindowPlan::spans(&WindowOptions::new(10).with_hop(hop), usize::MAX).unwrap();
+  assert_eq!(s.len(), 2);
+  assert_eq!((s[0].start, s[1].start), (0, hop));
+}
+
+#[test]
 fn zero_window_and_bad_overlap_error() {
   assert!(matches!(
     WindowOptions::new(0).validate(),
@@ -76,4 +94,23 @@ fn window_options_serde_round_trip() {
   let simple = WindowOptions::new(4);
   let back: WindowOptions = serde_json::from_str(&serde_json::to_string(&simple).unwrap()).unwrap();
   assert_eq!(simple, back);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_serde_optional_cap_and_rejects_unknown_keys() {
+  // `max_windows` may be omitted; it then defaults to no cap.
+  let opts: WindowOptions =
+    serde_json::from_str(r#"{"window":4,"hop":4,"tail":"KeepWithCoverage"}"#).unwrap();
+  assert_eq!(opts.max_windows(), None);
+
+  // A required (non-optional) field is still enforced.
+  assert!(serde_json::from_str::<WindowOptions>(r#"{"window":4,"hop":4}"#).is_err());
+
+  // An unknown key (e.g. a typo'd `max_window`) is rejected by
+  // `deny_unknown_fields` rather than silently ignored.
+  assert!(serde_json::from_str::<WindowOptions>(
+    r#"{"window":4,"hop":4,"tail":"KeepWithCoverage","max_window":2}"#
+  )
+  .is_err());
 }

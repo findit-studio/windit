@@ -63,11 +63,13 @@ pub enum TailPolicy {
 /// [`validate`](WindowOptions::validate) directly — so construction is
 /// infallible.
 ///
-/// With the `serde` feature every field is serialized and required on
-/// deserialization, so a persisted geometry replays exactly (no field silently
-/// defaults).
+/// With the `serde` feature every field is serialized, so a self-persisted
+/// geometry always round-trips exactly. On deserialization the `window`, `hop`,
+/// and `tail` fields are required; `max_windows` may be omitted and then
+/// defaults to no cap (`None`). Unknown keys are rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,
@@ -194,10 +196,12 @@ impl WindowPlan {
   /// Plan the windows covering `input_len` elements under `opts`, in input
   /// order.
   ///
-  /// An empty input yields an empty plan. The final window may be ragged
-  /// according to the [`TailPolicy`]. When `opts.hop() <= opts.window()` every
-  /// input element is covered by at least one span; a larger hop strides over
-  /// the input, leaving gaps uncovered.
+  /// An empty input yields an empty plan; a non-empty input can also yield an
+  /// empty plan when [`TailPolicy::DropBelowMin`] drops the sole, too-short
+  /// window. The final window may be ragged according to the [`TailPolicy`].
+  /// When `opts.hop() <= opts.window()` every input element is covered by at
+  /// least one span; a larger hop strides over the input, leaving gaps
+  /// uncovered.
   ///
   /// # Errors
   ///
@@ -219,7 +223,10 @@ impl WindowPlan {
         break;
       }
       let len = core::cmp::min(w, input_len - start);
-      let is_tail = start + w >= input_len;
+      // `input_len - start` is safe under the loop guard (`start < input_len`);
+      // computing the tail this way avoids overflowing `start + w` when
+      // `input_len` is within a window of `usize::MAX`.
+      let is_tail = input_len - start <= w;
       let keep = match opts.tail() {
         TailPolicy::DropBelowMin(m) => len >= *m || len == w,
         _ => true,
@@ -242,7 +249,12 @@ impl WindowPlan {
       if is_tail {
         break;
       }
-      start += hop;
+      // A hop that would carry `start` past `usize::MAX` cannot reach any further
+      // in-bounds element, so stop rather than wrap.
+      match start.checked_add(hop) {
+        Some(s) => start = s,
+        None => break,
+      }
     }
     Ok(out)
   }
