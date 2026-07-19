@@ -67,7 +67,8 @@ impl SplitPolicy for FixedWindow {
 pub struct ContentAware<'a> {
   /// Measures the length of a text slice in the caller's units. `chunk`
   /// guarantees every returned range measures at most the window under this
-  /// function.
+  /// function, save for a single `char` that alone exceeds the window (it
+  /// cannot be split further).
   pub len_fn: &'a dyn Fn(&str) -> usize,
 }
 
@@ -82,13 +83,24 @@ impl ContentAware<'_> {
   /// that overflows the window on its own is split further — a long sentence
   /// into words, a long word into `len_fn`-measured character slices. Chunks are
   /// packed greedily; when [`WindowOptions::overlap`] is non-zero, consecutive
-  /// chunks repeat that many trailing boundary units (tokens).
+  /// chunks repeat at most that many trailing tokens' worth of whole boundary
+  /// units (as measured by `len_fn`).
   ///
   /// Ranges cover the tokenized content in order; inter-token whitespace falls
   /// inside a chunk's span but is never a chunk of its own. An empty or
   /// whitespace-only input yields no chunks.
+  ///
+  /// Every returned range measures at most the window, with a single exception:
+  /// a lone `char` whose own measure exceeds the window is emitted as-is,
+  /// because it cannot be split further. In the oversized-sentence word
+  /// fallback, punctuation lying outside word boundaries (a trailing period,
+  /// say) is not covered by any chunk. If `opts` is not valid — a zero window,
+  /// or an overlap at least the window — no chunks are produced.
   #[must_use]
   pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Vec<(usize, usize)> {
+    if opts.validate().is_err() {
+      return Vec::new();
+    }
     let atoms = split_range(
       text,
       0,
@@ -218,8 +230,9 @@ fn split_chars(
   out
 }
 
-/// Greedily pack `atoms` into chunks no longer than the window, repeating
-/// `overlap` trailing atoms between consecutive chunks.
+/// Greedily pack `atoms` into chunks no longer than the window, repeating at
+/// most `overlap` tokens' worth of trailing whole atoms between consecutive
+/// chunks (`overlap` is a token budget measured by `len_fn`, not an atom count).
 ///
 /// `atoms` must be in order; each is assumed to fit the window on its own.
 #[cfg(feature = "text")]
@@ -249,10 +262,15 @@ fn pack(
     if j >= atoms.len() {
       break;
     }
-    // Back up `overlap` atoms for the next chunk, but always advance at least one
-    // so packing terminates.
-    let consumed = j - i;
-    i += consumed.saturating_sub(overlap).max(1);
+    // Back up for the next chunk by TOKEN budget, not atom count: repeat as many
+    // trailing whole atoms as fit in `overlap` tokens (measured over the real
+    // contiguous text, so it is robust to non-additive tokenizers), but always
+    // advance at least one atom so packing terminates.
+    let mut next = j;
+    while next > i + 1 && len_fn(&text[atoms[next - 1].0..atoms[j - 1].1]) <= overlap {
+      next -= 1;
+    }
+    i = next;
   }
   chunks
 }
