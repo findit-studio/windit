@@ -11,26 +11,26 @@
 //! tokenizer defines "how long". It is a separate surface from [`SplitPolicy`]
 //! because it returns byte-offset ranges into the text rather than element spans.
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 use alloc::vec::Vec;
 
 #[cfg(feature = "text")]
 use unicode_segmentation::UnicodeSegmentation;
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{
   error::WinditError,
   plan::{Span, WindowOptions, WindowPlan},
 };
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
 /// A policy that divides an input of `input_len` elements into [`Span`]s.
 ///
 /// The trait is object-safe (`&dyn SplitPolicy` works): the only method takes an
 /// element count and [`WindowOptions`] and returns the plan.
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub trait SplitPolicy {
   /// Plan the spans covering `input_len` elements under `opts`.
   ///
@@ -43,11 +43,11 @@ pub trait SplitPolicy {
 }
 
 /// The mechanical fixed-window split: a direct delegation to [`WindowPlan::spans`].
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FixedWindow;
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl SplitPolicy for FixedWindow {
   fn split(&self, input_len: usize, opts: &WindowOptions) -> Result<Vec<Span>, WinditError> {
     WindowPlan::spans(opts, input_len)

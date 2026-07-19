@@ -7,7 +7,7 @@
 
 use crate::{error::WinditError, plan::Span};
 
-#[cfg(all(test, feature = "alloc"))]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
 /// A fixed-dimension embedding living in f32 space.

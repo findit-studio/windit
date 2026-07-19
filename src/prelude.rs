@@ -16,7 +16,7 @@ pub use crate::{
   windowed::{Vector, WindowEmbedding, Windowed},
 };
 
-#[cfg(feature = "alloc")]
+#[cfg(any(feature = "std", feature = "alloc"))]
 pub use crate::{
   aggregate::{
     aggregate, keep_separate, AggregatePolicy, CoverageWeightedMean, EmaRenormalized,
@@ -35,5 +35,5 @@ pub use crate::{
 #[cfg(feature = "text")]
 pub use crate::split::ContentAware;
 
-#[cfg(all(feature = "serde", feature = "alloc"))]
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 pub use crate::aggregate::AggregatePolicyKind;
