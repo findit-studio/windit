@@ -24,11 +24,16 @@
 //!
 //! - **(no features)**: the type and trait surface — [`Span`](plan::Span),
 //!   [`WindowOptions`](plan::WindowOptions), the [`Vector`](windowed::Vector)
-//!   trait, and [`WinditError`] — is always available.
+//!   trait, and [`WinditError`] (including its [`core::error::Error`]
+//!   implementation) — is always available.
 //! - **`alloc`** (default): the `Vec`-returning algorithms ([`WindowPlan::spans`],
 //!   [`slice_pad_mask`], and the policies).
-//! - **`std`**: implies `alloc` and adds the [`std::error::Error`] implementation
-//!   for [`WinditError`].
+//! - **`std`**: implies `alloc` and links the crate against `std` (that is, it
+//!   turns off the crate's `#![no_std]`). It gates no API of its own:
+//!   [`WinditError`] implements [`core::error::Error`] unconditionally, and in a
+//!   `std` build that is the very same trait as `std::error::Error`. The feature
+//!   is kept because downstream crates conventionally unify on a `std` feature
+//!   and need one to enable here.
 //! - **`text`**: content-aware string chunking (adds `unicode-segmentation`).
 //! - **`serde`**: `Serialize` / `Deserialize` for the configuration and policy
 //!   enums.

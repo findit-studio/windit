@@ -81,5 +81,4 @@ impl core::fmt::Display for WinditError {
   }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for WinditError {}
+impl core::error::Error for WinditError {}
