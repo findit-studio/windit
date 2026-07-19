@@ -25,4 +25,4 @@ embeddings, VAD, and ASR.
 - Split policies: `FixedWindow`, and the tokenizer-free `ContentAware` string
   chunker behind the `text` feature.
 - `no_std + alloc` support with optional `std`, `text`, and `serde` features;
-  minimum supported Rust version 1.73.
+  minimum supported Rust version 1.95.

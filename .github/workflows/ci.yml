@@ -288,11 +288,11 @@ jobs:
           bash ci/miri_sb.sh "${{ matrix.target }}"
 
   # Prove the declared `rust-version` (Cargo.toml) genuinely builds, per feature
-  # row, so an MSRV-raising dependency (e.g. unicode-segmentation >= 1.13, which
-  # requires rustc 1.85) cannot regress the MSRV silently. Warnings are not denied
-  # here: lints evolve across toolchains, so MSRV is about buildability only.
+  # row, so a dependency upgrade or a newer-than-MSRV language or library feature
+  # cannot regress the floor silently. Warnings are not denied here: lints evolve
+  # across toolchains, so MSRV is about buildability only.
   msrv:
-    name: msrv (1.73)
+    name: msrv (1.95)
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: ""
@@ -317,8 +317,8 @@ jobs:
           key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-msrv-
-      - name: Install Rust 1.73
-        run: rustup toolchain install 1.73 --profile minimal && rustup default 1.73
+      - name: Install Rust 1.95
+        run: rustup toolchain install 1.95 --profile minimal && rustup default 1.95
       - name: cargo build ${{ matrix.features }}
         run: cargo build ${{ matrix.features }}
 
