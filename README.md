@@ -90,10 +90,19 @@ own by implementing the trait.
 ```rust
 use windit::prelude::*;
 
-// Find the longest continuous speech region from per-frame probabilities.
-let frames: Vec<Windowed<f32>> = /* one Windowed<f32> per VAD frame */;
-let opts = SegmentOptions::new().with_min_len(3).with_merge_gap(2);
+// Per-frame speech probabilities: one `Windowed<f32>` per VAD frame, each frame
+// covering a single element.
+let probs = [0.1, 0.9, 0.8, 0.2, 0.7, 0.9, 0.6];
+let frames: Vec<Windowed<f32>> = probs
+  .iter()
+  .enumerate()
+  .map(|(i, &p)| Windowed::new(p, Span { start: i, len: 1, window: 1 }))
+  .collect();
+
+// Find the longest continuous speech region, ignoring runs under two frames.
+let opts = SegmentOptions::new().with_min_len(2);
 let speech = longest_run(&frames, |&p| p >= 0.5, &opts);
+assert_eq!(speech, Some(Range { start: 4, end: 7 }));
 ```
 
 ## Content-aware text chunking: the `len_fn` callback
@@ -105,9 +114,9 @@ length through a **caller-supplied `len_fn` callback**, so *you* define what a
 "token" is (a word count, a real tokenizer's id count, code points) without this
 crate ever depending on a tokenizer:
 
-```rust
+```rust,ignore
+use windit::plan::WindowOptions;
 use windit::split::ContentAware;
-use windit::WindowOptions;
 
 // "tokens" = whitespace-separated words, windows of 32, overlap of 4.
 let count = |s: &str| s.split_whitespace().count();
