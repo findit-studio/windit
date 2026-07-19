@@ -34,7 +34,9 @@ pub trait SmoothPolicy<V: Clone> {
 /// Seeded with `s_0 = x_0`. A larger `alpha` tracks the input more closely; a
 /// smaller one smooths harder. This policy is infallible, so `alpha` is clamped
 /// into `[0, 1]` deterministically: a non-finite (NaN) `alpha` clamps to `0.0`
-/// (hold the seed), and smoothing never emits NaN.
+/// (hold the seed). With a clamped alpha and finite inputs, the recurrence
+/// introduces no NaN. `Ema` does not sanitize inputs, though: a non-finite
+/// (`NaN`/infinite) input value still propagates through the recurrence.
 #[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ema {

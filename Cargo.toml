@@ -37,10 +37,11 @@ serde = ["dep:serde"]
 # sqrt use lives in the alloc-gated aggregation code.
 libm = { version = "0.2", optional = true }
 # Pinned below 1.13 so the `text` feature honors the crate's 1.73 MSRV:
-# unicode-segmentation 1.13+ declares `rust-version = 1.85`. Versions `>=1, <1.13`
-# expose the same word/sentence-boundary API and build on 1.73 (verified in CI's
-# MSRV job). Raise this ceiling only alongside the crate's `rust-version`.
-unicode-segmentation = { version = ">=1, <1.13", optional = true }
+# unicode-segmentation 1.13+ declares `rust-version = 1.85`. Versions
+# `>=1.6, <1.13` expose the same word/sentence-boundary API and build on 1.73
+# (verified in CI's MSRV job). Raise this ceiling only alongside the crate's
+# `rust-version`.
+unicode-segmentation = { version = ">=1.6, <1.13", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = [
   "alloc",
   "derive",
