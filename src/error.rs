@@ -5,7 +5,14 @@
 ///
 /// Every fallible operation in the crate returns this type. Variants carry the
 /// offending values so callers can report or recover without re-deriving them.
+///
+/// This enum is `#[non_exhaustive]`: new variants may be added without that
+/// being a breaking change. The taxonomy has already grown once — adding
+/// [`WinditError::AlphaOutOfRange`] rather than overloading the ill-fitting
+/// [`WinditError::NonFinite`] for an out-of-range EMA `alpha` — so callers
+/// outside this crate must match with a wildcard arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum WinditError {
   /// The configured window size was zero, so no geometry can be produced.
   ZeroWindow,
