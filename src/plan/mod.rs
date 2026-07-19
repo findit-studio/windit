@@ -75,6 +75,7 @@ pub enum TailPolicy {
 /// defaults to no cap (`None`). Unknown keys are rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,
