@@ -1,14 +1,14 @@
 //! Split policies: decide how an input is divided before windowing.
 //!
-//! [`SplitPolicy`] maps an input length and [`WindowOptions`] to the [`Span`]s
-//! that cover it. [`FixedWindow`] is the mechanical element-count split — it
-//! delegates to [`WindowPlan::spans`], so any unit (samples, tokens, patches)
+//! `SplitPolicy` maps an input length and `WindowOptions` to the `Span`s
+//! that cover it. `FixedWindow` is the mechanical element-count split — it
+//! delegates to `WindowPlan::spans`, so any unit (samples, tokens, patches)
 //! is divided the same way.
 //!
-//! [`ContentAware`] (feature `text`) is the tokenizer-free string chunker: it
+//! `ContentAware` (feature `text`) is the tokenizer-free string chunker: it
 //! packs text into chunks that respect paragraph, sentence, and word boundaries,
 //! measuring length through a caller-supplied `len_fn` so the caller's own
-//! tokenizer defines "how long". It is a separate surface from [`SplitPolicy`]
+//! tokenizer defines "how long". It is a separate surface from `SplitPolicy`
 //! because it returns byte-offset ranges into the text rather than element spans.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
