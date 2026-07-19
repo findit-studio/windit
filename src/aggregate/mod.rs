@@ -27,7 +27,7 @@
 //! [`Span::coverage`]: crate::plan::Span::coverage
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::{vec, vec::Vec};
+use std::{vec, vec::Vec};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{
@@ -263,8 +263,8 @@ pub enum AggregatePolicyKind {
 impl AggregatePolicyKind {
   /// Build the boxed built-in policy this kind selects.
   #[must_use]
-  pub fn into_policy(self) -> alloc::boxed::Box<dyn AggregatePolicy> {
-    use alloc::boxed::Box;
+  pub fn into_policy(self) -> std::boxed::Box<dyn AggregatePolicy> {
+    use std::boxed::Box;
     match self {
       Self::CoverageWeightedMean => Box::new(CoverageWeightedMean),
       Self::MeanRenormalized => Box::new(MeanRenormalized),

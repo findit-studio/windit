@@ -6,7 +6,7 @@
 //! (`1` for real elements, `0` for padding).
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use crate::{error::WinditError, plan::Span};

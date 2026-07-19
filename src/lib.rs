@@ -43,8 +43,14 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 
-#[cfg(any(feature = "std", feature = "alloc"))]
-extern crate alloc;
+// House strategy: alias `alloc` as `std` so heap-type paths read `std::`
+// uniformly across the `std` and `no_std + alloc` tiers. This works only for
+// names `alloc` provides (`Vec`, `Box`, `String`, `vec!`) — it cannot supply
+// std-only APIs such as time, fs, net, thread, or process. Any future need for
+// those must be gated on the `std` feature, not assumed available through this
+// alias.
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+extern crate alloc as std;
 
 pub mod aggregate;
 pub mod plan;

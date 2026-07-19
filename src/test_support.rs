@@ -6,7 +6,7 @@
 //! module. Neither helper needs `std`: [`TestVec`] normalizes through
 //! `libm::sqrtf` and [`assert_close`] avoids the std-only float methods.
 
-use alloc::vec::Vec;
+use std::vec::Vec;
 
 use crate::{error::WinditError, windowed::Vector};
 

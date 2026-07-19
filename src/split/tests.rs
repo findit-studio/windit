@@ -25,7 +25,7 @@ fn fixed_window_propagates_plan_errors() {
 
 #[cfg(feature = "text")]
 mod content_aware {
-  use alloc::string::String;
+  use std::string::String;
 
   use super::super::ContentAware;
   use crate::plan::WindowOptions;
@@ -41,8 +41,8 @@ mod content_aware {
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(5));
 
-    let slices: alloc::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
-    assert_eq!(slices, alloc::vec!["a b c d e", "f g h"]);
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    assert_eq!(slices, std::vec!["a b c d e", "f g h"]);
     for &(s, e) in &chunks {
       assert!(word_count(&text[s..e]) <= 5);
     }
@@ -78,12 +78,12 @@ mod content_aware {
     let opts = WindowOptions::new(5).with_overlap(1);
     let chunks = ContentAware { len_fn }.chunk(text, &opts);
 
-    let slices: alloc::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
-    assert_eq!(slices, alloc::vec!["a b c d e", "e f g h"]);
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    assert_eq!(slices, std::vec!["a b c d e", "e f g h"]);
   }
 
   /// Measure the tokens repeated between each pair of consecutive chunks.
-  fn repeated_tokens(text: &str, chunks: &[(usize, usize)]) -> alloc::vec::Vec<usize> {
+  fn repeated_tokens(text: &str, chunks: &[(usize, usize)]) -> std::vec::Vec<usize> {
     chunks
       .windows(2)
       .map(|w| {
@@ -112,7 +112,7 @@ mod content_aware {
 
     assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
     let repeats = repeated_tokens(text, &chunks);
-    assert_eq!(repeats, alloc::vec![3]);
+    assert_eq!(repeats, std::vec![3]);
     assert!(
       repeats.iter().all(|&r| r <= 4),
       "no repeat may exceed the 4-token overlap budget, got {repeats:?}"
@@ -158,8 +158,8 @@ mod content_aware {
     let len_fn: &dyn Fn(&str) -> usize = &len3;
     let chunks = ContentAware { len_fn }.chunk(text, &WindowOptions::new(2));
 
-    let slices: alloc::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
-    assert_eq!(slices, alloc::vec!["a", "b"]);
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    assert_eq!(slices, std::vec!["a", "b"]);
     for &(s, e) in &chunks {
       assert!(
         len3(&text[s..e]) > 2,
