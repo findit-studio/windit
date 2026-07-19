@@ -19,12 +19,16 @@ harness = false
 
 [features]
 default = ["alloc"]
-alloc = []
+alloc = ["dep:libm"]
 std = ["alloc"]
 text = ["alloc", "dep:unicode-segmentation"]
 serde = ["dep:serde"]
 
 [dependencies]
+# `libm` supplies `sqrtf` for the L2 renormalization in `aggregate`, which core
+# cannot provide (`f32::sqrt` is std-only). Pulled in with `alloc` because every
+# sqrt use lives in the alloc-gated aggregation code.
+libm = { version = "0.2", optional = true }
 unicode-segmentation = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = [
   "alloc",

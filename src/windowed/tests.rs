@@ -1,33 +1,5 @@
 use super::*;
-
-/// A minimal embedding double that L2-normalizes on construction. Uses `sqrt`,
-/// so the whole test module is `std`-gated; the [`Vector`] trait itself is
-/// no_std.
-struct TestVec(Vec<f32>);
-
-impl Vector for TestVec {
-  fn as_slice(&self) -> &[f32] {
-    &self.0
-  }
-
-  fn from_unnormalized(v: &[f32]) -> Result<Self, WinditError> {
-    if v.is_empty() {
-      return Err(WinditError::Empty);
-    }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm == 0.0 {
-      return Err(WinditError::NonFinite);
-    }
-    Ok(Self(v.iter().map(|x| x / norm).collect()))
-  }
-}
-
-fn assert_close(got: &[f32], want: &[f32]) {
-  assert_eq!(got.len(), want.len(), "len mismatch: {got:?} vs {want:?}");
-  for (g, w) in got.iter().zip(want) {
-    assert!((g - w).abs() < 1e-6, "value mismatch: {got:?} vs {want:?}");
-  }
-}
+use crate::test_support::{assert_close, TestVec};
 
 #[test]
 fn from_unnormalized_l2_normalizes() {

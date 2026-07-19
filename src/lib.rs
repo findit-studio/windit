@@ -52,4 +52,7 @@ pub mod windowed;
 
 mod error;
 
+#[cfg(all(test, feature = "alloc"))]
+mod test_support;
+
 pub use error::WinditError;
