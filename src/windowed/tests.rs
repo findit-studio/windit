@@ -21,6 +21,20 @@ fn windowed_carries_value_and_span() {
 }
 
 #[test]
+fn windowed_moves_value_out() {
+  let span = Span::new(0, 2, 4);
+  let e: WindowEmbedding<TestVec> =
+    Windowed::new(TestVec::from_unnormalized(&[3.0, 4.0]).unwrap(), span);
+  assert_close(e.into_value().as_slice(), &[0.6, 0.8]);
+
+  let e: WindowEmbedding<TestVec> =
+    Windowed::new(TestVec::from_unnormalized(&[3.0, 4.0]).unwrap(), span);
+  let (value, got_span) = e.into_parts();
+  assert_eq!(got_span, span);
+  assert_close(value.as_slice(), &[0.6, 0.8]);
+}
+
+#[test]
 fn zero_norm_is_nonfinite_error() {
   assert!(matches!(
     TestVec::from_unnormalized(&[0.0, 0.0]),
