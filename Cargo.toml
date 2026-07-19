@@ -1,29 +1,38 @@
 [package]
-name = "template-rs"
+name = "windit"
 version = "0.0.0"
 edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+repository = "https://github.com/findit-studio/windit"
+homepage = "https://github.com/findit-studio/windit"
+documentation = "https://docs.rs/windit"
+description = "Generic windowed-sequence processing: chunk, pad/mask, aggregate, smooth, segment — for embeddings, VAD, and ASR."
+keywords = ["windowing", "embedding", "aggregation", "chunking", "vad"]
+categories = ["algorithms", "no-std", "text-processing"]
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 rust-version = "1.73"
 
 [[bench]]
-path = "benches/foo.rs"
-name = "foo"
+path = "benches/windit.rs"
+name = "windit"
 harness = false
 
 [features]
-default = ["std"]
+default = ["alloc"]
 alloc = []
-std = []
+std = ["alloc"]
+text = ["alloc", "dep:unicode-segmentation"]
+serde = ["dep:serde"]
 
 [dependencies]
+unicode-segmentation = { version = "1", optional = true }
+serde = { version = "1", optional = true, default-features = false, features = [
+  "alloc",
+  "derive",
+] }
 
 [dev-dependencies]
 criterion = "0.8"
-tempfile = "3"
 
 [profile.bench]
 opt-level = 3
@@ -44,5 +53,6 @@ rust_2018_idioms = "warn"
 single_use_lifetimes = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
   'cfg(all_tests)',
+  'cfg(docsrs)',
   'cfg(tarpaulin)',
 ] }
