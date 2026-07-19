@@ -99,6 +99,36 @@ jobs:
           rustup target add ${{ matrix.target }}
           cargo build --target ${{ matrix.target }}
 
+  # Prove the crate's headline `no_std` claim against a target that genuinely
+  # lacks `std` — unlike the `cross` job above, whose targets (e.g.
+  # riscv64gc-unknown-linux-gnu) all have std and so would let a `std` leak
+  # into the alloc-only tier pass unnoticed. `cargo check` is enough: there is
+  # no linker for a bare-metal target without extra setup, and this job exists
+  # to catch a `std` leak in the type/trait surface, not to link a binary.
+  no-std:
+    name: no-std
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-no-std-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-no-std-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install bare-metal target (thumbv7em-none-eabihf)
+        run: rustup target add thumbv7em-none-eabihf
+      - name: cargo check --target thumbv7em-none-eabihf --features alloc
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc
+      - name: cargo check --target thumbv7em-none-eabihf --features alloc,text
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc,text
+
   build:
     name: build
     strategy:
