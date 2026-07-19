@@ -1,26 +1,25 @@
 //! Aggregation policies: combine a window sequence into a single embedding.
 //!
-//! [`AggregatePolicy`] is the object-safe seam: it works entirely in f32 space
-//! ([`aggregate_f32`](AggregatePolicy::aggregate_f32)), so `&dyn AggregatePolicy`
-//! is usable. The generic free function [`aggregate`] extracts the f32 slices and
-//! per-window coverages from a `&[WindowEmbedding<E>]`, runs the policy, and
-//! reconstructs the embedding type `E` through [`Vector::from_unnormalized`].
-//! Keeping reconstruction out of the trait is what lets the trait stay
-//! object-safe while embedding reconstruction stays generic.
+//! `AggregatePolicy` is the object-safe seam: it works entirely in f32 space
+//! (`aggregate_f32`), so `&dyn AggregatePolicy` is usable. The generic free
+//! function `aggregate` extracts the f32 slices and per-window coverages from
+//! a `&[WindowEmbedding<E>]`, runs the policy, and reconstructs the embedding
+//! type `E` through `Vector::from_unnormalized`. Keeping reconstruction out
+//! of the trait is what lets the trait stay object-safe while embedding
+//! reconstruction stays generic.
 //!
 //! Built-in strategies weight the windows by different signals:
 //!
-//! - [`CoverageWeightedMean`] (the default) weights by [`Span::coverage`], so
+//! - `CoverageWeightedMean` (the default) weights by [`Span::coverage`], so
 //!   fuller windows count more.
-//! - [`MeanRenormalized`] weights uniformly (a renormalized arithmetic mean).
-//! - [`EmaRenormalized`] weights by recency (an exponential moving average).
-//! - [`SaliencyWeighted`] weights by each input's L2 norm, so higher-magnitude
-//!   (more salient) inputs dominate. Because [`aggregate`] passes already-unit
+//! - `MeanRenormalized` weights uniformly (a renormalized arithmetic mean).
+//! - `EmaRenormalized` weights by recency (an exponential moving average).
+//! - `SaliencyWeighted` weights by each input's L2 norm, so higher-magnitude
+//!   (more salient) inputs dominate. Because `aggregate` passes already-unit
 //!   embeddings, saliency is meaningful only when a caller invokes
-//!   [`aggregate_f32`](AggregatePolicy::aggregate_f32) directly with vectors that
-//!   still carry magnitude.
+//!   `aggregate_f32` directly with vectors that still carry magnitude.
 //!
-//! [`keep_separate`] is the multi-vector path: it returns every window unchanged
+//! `keep_separate` is the multi-vector path: it returns every window unchanged
 //! for callers that want per-window embeddings rather than one summary.
 //!
 //! [`Span`]: crate::plan::Span

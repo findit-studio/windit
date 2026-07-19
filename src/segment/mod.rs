@@ -1,17 +1,17 @@
 //! Segmentation: reduce a windowed score sequence to continuous element ranges.
 //!
-//! The core is [`runs`]: it walks a `&[Windowed<V>]`, groups the windows a
+//! The core is `runs`: it walks a `&[Windowed<V>]`, groups the windows a
 //! caller-supplied predicate accepts into contiguous runs, maps each run to a
-//! half-open [`Range`] in input-element units through its spans, then applies
-//! two [`SegmentOptions`] passes — merge runs separated by at most `merge_gap`
-//! elements, then drop runs shorter than `min_len`. [`longest_run`] and
-//! [`runs_sorted`] rank those ranges; the find-longest-continuous-range case
-//! (the longest speech region, say) is [`longest_run`].
+//! half-open `Range` in input-element units through its spans, then applies
+//! two `SegmentOptions` passes — merge runs separated by at most `merge_gap`
+//! elements, then drop runs shorter than `min_len`. `longest_run` and
+//! `runs_sorted` rank those ranges; the find-longest-continuous-range case
+//! (the longest speech region, say) is `longest_run`.
 //!
-//! [`SegmentPolicy`] packages a predicate with its options. [`Threshold`] admits
-//! values at or above a cutoff; [`HysteresisSegment`] first latches the sequence
-//! through [`smooth::Hysteresis`](crate::smooth::Hysteresis) and then segments,
-//! which is the binary-VAD path.
+//! `SegmentPolicy` packages a predicate with its options. `Threshold` admits
+//! values at or above a cutoff; `HysteresisSegment` first latches the sequence
+//! through `smooth::Hysteresis` and then segments, which is the binary-VAD
+//! path.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;

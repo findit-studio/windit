@@ -8,7 +8,7 @@
 //!
 //! # The unifying idea
 //!
-//! A single [`WindowPlan`](plan::WindowPlan) geometry maps an input length plus a
+//! A single `WindowPlan` geometry maps an input length plus a
 //! fully configurable [`WindowOptions`](plan::WindowOptions) to a list of
 //! [`Span`](plan::Span)s — plain `usize` element counts, so samples, tokens,
 //! patches, and frames are treated identically. Those same spans drive both
@@ -26,8 +26,8 @@
 //!   [`WindowOptions`](plan::WindowOptions), the [`Vector`](windowed::Vector)
 //!   trait, and [`WinditError`] (including its [`core::error::Error`]
 //!   implementation) — is always available.
-//! - **`alloc`** (default): the `Vec`-returning algorithms ([`WindowPlan::spans`],
-//!   [`slice_pad_mask`], and the policies).
+//! - **`alloc`** (default): the `Vec`-returning algorithms (`WindowPlan::spans`,
+//!   `slice_pad_mask`, and the policies).
 //! - **`std`**: implies `alloc` and links the crate against `std` (that is, it
 //!   turns off the crate's `#![no_std]`). It gates no API of its own:
 //!   [`WinditError`] implements [`core::error::Error`] unconditionally, and in a
@@ -37,9 +37,6 @@
 //! - **`text`**: content-aware string chunking (adds `unicode-segmentation`).
 //! - **`serde`**: `Serialize` / `Deserialize` for the configuration and policy
 //!   enums.
-//!
-//! [`WindowPlan::spans`]: plan::WindowPlan::spans
-//! [`slice_pad_mask`]: pre::slice_pad_mask
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 

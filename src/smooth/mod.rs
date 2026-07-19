@@ -1,11 +1,11 @@
 //! Smoothing policies: map a windowed sequence to a smoothed sequence.
 //!
-//! A [`SmoothPolicy`] rewrites the value of each [`Windowed<V>`] while leaving
+//! A `SmoothPolicy` rewrites the value of each `Windowed<V>` while leaving
 //! its [`Span`](crate::plan::Span) untouched, so the output stays aligned with
 //! the input windows. The built-ins operate on `V = f32`:
 //!
-//! - [`Ema`] is an exponential moving average (temporal low-pass).
-//! - [`Hysteresis`] is the latching two-threshold gate used for binary VAD
+//! - `Ema` is an exponential moving average (temporal low-pass).
+//! - `Hysteresis` is the latching two-threshold gate used for binary VAD
 //!   smoothing, generalized to any f32 score sequence.
 
 #[cfg(any(feature = "std", feature = "alloc"))]

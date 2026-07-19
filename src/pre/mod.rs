@@ -1,7 +1,7 @@
 //! Pre-processing: turn a span into a fixed-width, padded window and its mask.
 //!
-//! A [`Span`] from a [`WindowPlan`](crate::plan::WindowPlan) selects a run of
-//! real input elements; [`slice_pad_mask`] copies them into a `window`-length
+//! A `Span` from a `WindowPlan` selects a run of
+//! real input elements; `slice_pad_mask` copies them into a `window`-length
 //! buffer, right-pads the remainder, and produces the matching attention mask
 //! (`1` for real elements, `0` for padding).
 

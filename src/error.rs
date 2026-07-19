@@ -48,10 +48,10 @@ pub enum WinditError {
   /// An exponential-moving-average smoothing factor (`alpha`) was outside the
   /// valid `[0, 1]` range, or was not a number.
   ///
-  /// Returned by [`EmaRenormalized`](crate::aggregate::EmaRenormalized), whose
+  /// Returned by `EmaRenormalized`, whose
   /// out-of-range `alpha` would otherwise silently produce a sign-flipping
   /// "average" rather than a moving average. The infallible
-  /// [`Ema`](crate::smooth::Ema) smoother has no error channel and instead
+  /// `Ema` smoother has no error channel and instead
   /// clamps `alpha` into range.
   AlphaOutOfRange,
   /// The input sequence was empty where at least one element was required.

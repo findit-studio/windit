@@ -7,8 +7,8 @@
 //! The value and geometry types are always available. The `Vec`-returning
 //! algorithms — the planner, the pre-processing helpers, and the four strategy
 //! families — are re-exported under the `alloc` feature, matching where they are
-//! defined. The content-aware chunker [`ContentAware`] joins them under the
-//! `text` feature, and [`AggregatePolicyKind`] under `serde`.
+//! defined. The content-aware chunker `ContentAware` joins them under the
+//! `text` feature, and `AggregatePolicyKind` under `serde`.
 
 pub use crate::{
   error::WinditError,

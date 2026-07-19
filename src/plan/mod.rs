@@ -1,6 +1,6 @@
 //! Window geometry: configurable options, tail handling, spans, and the planner.
 //!
-//! A [`WindowPlan`] turns an input length plus a [`WindowOptions`] into a list of
+//! A `WindowPlan` turns an input length plus a [`WindowOptions`] into a list of
 //! [`Span`]s — plain `usize` element counts, unit-agnostic across samples,
 //! tokens, patches, and frames. The same spans drive pre-processing (slice /
 //! pad / mask) and post-processing (aggregate / smooth / segment).
@@ -68,7 +68,7 @@ pub enum TailPolicy {
 ///
 /// Construct with [`WindowOptions::new`] (non-overlapping windows that keep a
 /// ragged tail) and refine with the `with_*` builders. Nothing is validated
-/// until [`WindowPlan::spans`] runs — or you call
+/// until `WindowPlan::spans` runs — or you call
 /// [`validate`](WindowOptions::validate) directly — so construction is
 /// infallible.
 ///
@@ -91,7 +91,7 @@ impl WindowOptions {
   /// [`TailPolicy::KeepWithCoverage`], and no window cap.
   ///
   /// The window size is not validated here; a zero window is rejected by
-  /// [`validate`](WindowOptions::validate) and [`WindowPlan::spans`].
+  /// [`validate`](WindowOptions::validate) and `WindowPlan::spans`.
   #[must_use]
   pub const fn new(window: usize) -> Self {
     Self {
