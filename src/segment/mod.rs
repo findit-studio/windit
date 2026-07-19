@@ -59,19 +59,14 @@ impl Range {
 
 /// Post-processing applied to raw runs: gap merging and minimum length.
 ///
-/// Both fields are in input elements. Construct with [`SegmentOptions::new`]
+/// Both values are in input elements. Construct with [`SegmentOptions::new`]
 /// (keep everything, merge only touching runs) and refine with the `with_*`
 /// builders.
 #[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SegmentOptions {
-  /// Minimum kept run length, in input elements. Runs shorter than this are
-  /// dropped; `0` keeps every run.
-  pub min_len: usize,
-  /// Largest inter-run gap to bridge, in input elements. Consecutive runs
-  /// separated by at most this many elements are merged; `0` merges only runs
-  /// that touch or overlap.
-  pub merge_gap: usize,
+  min_len: usize,
+  merge_gap: usize,
 }
 
 #[cfg(feature = "alloc")]
@@ -98,6 +93,18 @@ impl SegmentOptions {
   pub const fn with_merge_gap(mut self, merge_gap: usize) -> Self {
     self.merge_gap = merge_gap;
     self
+  }
+
+  /// The minimum kept run length, in input elements.
+  #[must_use]
+  pub const fn min_len(&self) -> usize {
+    self.min_len
+  }
+
+  /// The largest inter-run gap to bridge, in input elements.
+  #[must_use]
+  pub const fn merge_gap(&self) -> usize {
+    self.merge_gap
   }
 }
 
@@ -147,8 +154,8 @@ where
     raw.push(run);
   }
 
-  let mut merged = merge_adjacent(raw, opts.merge_gap);
-  merged.retain(|r| r.len() >= opts.min_len);
+  let mut merged = merge_adjacent(raw, opts.merge_gap());
+  merged.retain(|r| r.len() >= opts.min_len());
   merged
 }
 

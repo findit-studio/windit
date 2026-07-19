@@ -246,11 +246,11 @@ fn inverted_range_saturates_to_empty() {
 #[test]
 fn segment_options_builder_and_default() {
   let o = SegmentOptions::new().with_min_len(3).with_merge_gap(2);
-  assert_eq!(o.min_len, 3);
-  assert_eq!(o.merge_gap, 2);
+  assert_eq!(o.min_len(), 3);
+  assert_eq!(o.merge_gap(), 2);
 
   let d = SegmentOptions::default();
-  assert_eq!(d.min_len, 0);
-  assert_eq!(d.merge_gap, 0);
+  assert_eq!(d.min_len(), 0);
+  assert_eq!(d.merge_gap(), 0);
   assert_eq!(d, SegmentOptions::new());
 }
