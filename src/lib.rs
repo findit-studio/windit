@@ -34,8 +34,6 @@
 //! [`WindowPlan::spans`]: plan::WindowPlan::spans
 //! [`slice_pad_mask`]: pre::slice_pad_mask
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
 
 #[cfg(any(feature = "alloc", feature = "std"))]
