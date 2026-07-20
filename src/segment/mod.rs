@@ -16,6 +16,7 @@
 use std::vec::Vec;
 
 use crate::{
+  error::WinditError,
   smooth::{Hysteresis, SmoothPolicy},
   windowed::Windowed,
 };
@@ -38,15 +39,34 @@ impl Range {
   /// The half-open range covering the elements from `start` up to (but not
   /// including) `end`.
   ///
+  /// The infallible counterpart to [`try_new`](Range::try_new), for the callers
+  /// that know their bounds and would only unwrap.
+  ///
   /// # Panics
   ///
-  /// Panics via a debug assertion (debug builds only) if `start > end`. The
-  /// check is compiled out in release, so [`len`](Range::len) still saturates an
-  /// inverted range to `0` there.
+  /// Panics, in every build, if `start > end`. Use
+  /// [`try_new`](Range::try_new) to handle untrusted bounds instead.
   #[must_use]
   pub const fn new(start: usize, end: usize) -> Self {
-    debug_assert!(start <= end, "a range must satisfy start <= end");
-    Self { start, end }
+    match Self::try_new(start, end) {
+      Ok(range) => range,
+      Err(_) => panic!("a range must satisfy start <= end"),
+    }
+  }
+
+  /// The checked counterpart of [`new`](Range::new): validate the bounds rather
+  /// than panic on them.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::InvalidRange`] if `start > end`. That is the range
+  /// invariant [`len`](Range::len) relies on, so it is enforced identically in
+  /// debug and release.
+  pub const fn try_new(start: usize, end: usize) -> Result<Self, WinditError> {
+    if start > end {
+      return Err(WinditError::InvalidRange { start, end });
+    }
+    Ok(Self { start, end })
   }
 
   /// The first element in the range.
@@ -63,11 +83,15 @@ impl Range {
 
   /// The number of elements the range covers (`end - start`).
   ///
-  /// Saturates to `0` for an inverted range (`start > end`). [`new`](Range::new)
-  /// rejects one only through a debug assertion, so a release build can still
-  /// hold such a range; the crate itself never produces one.
+  /// Never underflows: both constructors reject `start > end` in every build,
+  /// and the only writes that bypass them — [`runs`] and `merge_adjacent`
+  /// extending a run — move `end` upward alone.
   #[must_use]
   pub const fn len(&self) -> usize {
+    // The saturation is therefore unreachable. It is kept as the last line of
+    // defence for those in-crate field writes: a future one that moved `end`
+    // downward would report a zero-length range rather than underflow into a
+    // near-`usize::MAX` length that `min_len` would then wave through.
     self.end.saturating_sub(self.start)
   }
 
@@ -142,10 +166,10 @@ impl Default for SegmentOptions {
 ///
 /// A run is a maximal block of consecutive accepted windows. Each run becomes
 /// the [`Range`] from its first window's `span.start` to the largest
-/// `span.start + span.len` among its windows (so overlapping-window runs cover
-/// the union of their spans). The runs are then merged when separated by at most
-/// [`SegmentOptions::merge_gap`] elements, and any run shorter than
-/// [`SegmentOptions::min_len`] is dropped.
+/// [`Span::end`](crate::plan::Span::end) among its windows (so
+/// overlapping-window runs cover the union of their spans). The runs are then
+/// merged when separated by at most [`SegmentOptions::merge_gap`] elements, and
+/// any run shorter than [`SegmentOptions::min_len`] is dropped.
 pub fn runs<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Vec<Range>
 where
   F: Fn(&V) -> bool,
@@ -154,12 +178,12 @@ where
   let mut current: Option<Range> = None;
   for w in seq {
     if predicate(&w.value) {
-      let end = w.span.start() + w.span.len();
+      let end = w.span.end();
       if let Some(run) = current.as_mut() {
         run.end = run.end.max(end);
       } else {
-        // `end` is `span.start() + span.len()` and `len` is non-zero, so the
-        // range is well formed.
+        // `Span::end` is `start + len` with a non-zero `len`, so `start < end`
+        // and the range is well formed.
         current = Some(Range::new(w.span.start(), end));
       }
     } else if let Some(run) = current.take() {

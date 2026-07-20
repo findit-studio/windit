@@ -1,16 +1,16 @@
 //! The crate-wide error type.
 
 /// An error produced by window planning, pre-processing, embedding
-/// normalization, or aggregation.
+/// normalization, aggregation, or segmentation.
 ///
 /// Every fallible operation in the crate returns this type. Variants carry the
 /// offending values so callers can report or recover without re-deriving them.
 ///
 /// This enum is `#[non_exhaustive]`: new variants may be added without that
-/// being a breaking change. The taxonomy has already grown once — adding
-/// [`WinditError::AlphaOutOfRange`] rather than overloading the ill-fitting
-/// [`WinditError::NonFinite`] for an out-of-range EMA `alpha` — so callers
-/// outside this crate must match with a wildcard arm.
+/// being a breaking change. The taxonomy has already grown more than once — for
+/// example adding [`WinditError::AlphaOutOfRange`] rather than overloading the
+/// ill-fitting [`WinditError::NonFinite`] for an out-of-range EMA `alpha` — so
+/// callers outside this crate must match with a wildcard arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum WinditError {
@@ -32,6 +32,23 @@ pub enum WinditError {
     got: usize,
     /// The configured maximum.
     max: usize,
+  },
+  /// A span was not well formed: it covered no real element, covered more than
+  /// its window, or its end (`start + len`) was not representable as a `usize`.
+  InvalidSpan {
+    /// The rejected start, in input elements.
+    start: usize,
+    /// The rejected count of real elements.
+    len: usize,
+    /// The window the length must stay within, in elements.
+    window: usize,
+  },
+  /// A range was inverted: its start lay past its end.
+  InvalidRange {
+    /// The rejected start, in input elements.
+    start: usize,
+    /// The rejected end, in input elements.
+    end: usize,
   },
   /// Two quantities that had to share a dimension did not — for example an
   /// embedding whose length differed from its peers, or a span that ran past
@@ -70,6 +87,15 @@ impl core::fmt::Display for WinditError {
       }
       Self::TooManyWindows { got, max } => {
         write!(f, "produced {got} windows, exceeding the maximum of {max}")
+      }
+      Self::InvalidSpan { start, len, window } => {
+        write!(
+          f,
+          "span (start {start}, len {len}, window {window}) must satisfy 0 < len <= window with a representable start + len"
+        )
+      }
+      Self::InvalidRange { start, end } => {
+        write!(f, "range start {start} must not exceed its end {end}")
       }
       Self::DimMismatch { got, expected } => {
         write!(f, "dimension {got} does not match the expected {expected}")

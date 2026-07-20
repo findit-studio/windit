@@ -12,7 +12,10 @@ embeddings, VAD, and ASR.
 ### Added
 
 - Window geometry: `WindowOptions`, `WindowPlan`, `Span`, and `TailPolicy` for
-  turning an input length into unit-agnostic window spans.
+  turning an input length into unit-agnostic window spans. `Span` and
+  `segment::Range` each pair a panicking `new` with a checked `try_new`, and
+  both enforce their invariants — `0 < len <= window` with a representable
+  `Span::end`, and `start <= end` — identically in debug and release.
 - Pre-processing: `slice_pad_mask` / `try_slice_pad_mask` to slice, right-pad,
   and mask a span into a fixed-width window.
 - Scalars: the sealed `Scalar` and `Real` traits and the `ComputeOf` alias,

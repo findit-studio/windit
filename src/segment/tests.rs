@@ -4,7 +4,7 @@ use super::{
   longest_run, runs, runs_sorted, HysteresisSegment, Range, SegmentOptions, SegmentPolicy,
   Threshold,
 };
-use crate::{plan::Span, windowed::Windowed};
+use crate::{error::WinditError, plan::Span, windowed::Windowed};
 
 /// One `Windowed<f32>` per value, each covering a single element (window 1), so
 /// element units and frame indices coincide.
@@ -172,14 +172,43 @@ fn range_len_and_is_empty() {
 
 #[test]
 fn inverted_range_saturates_to_empty() {
-  // `Range::new` rejects an inverted range only through a debug assertion, so a
-  // release build can still hold one. This test builds it through the struct
-  // literal — reachable here because `tests` is a child of the defining module —
-  // to stand in for that release-build range, and pins `len` saturating to zero
-  // rather than underflowing.
+  // Both constructors reject an inverted range in every build, so this one is
+  // built through the struct literal — reachable here because `tests` is a child
+  // of the defining module — to stand in for an in-crate write to `end` that
+  // moved it downward. It pins `len` saturating to zero rather than underflowing
+  // into a near-`usize::MAX` length.
   let inverted = Range { start: 10, end: 5 };
   assert_eq!(inverted.len(), 0);
   assert!(inverted.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "start <= end")]
+fn range_new_rejects_an_inverted_range_in_every_build() {
+  let _ = Range::new(10, 5);
+}
+
+#[test]
+fn range_try_new_reports_an_inverted_range_as_a_typed_error() {
+  assert_eq!(
+    Range::try_new(10, 5),
+    Err(WinditError::InvalidRange { start: 10, end: 5 })
+  );
+  assert_eq!(Range::try_new(4, 4).unwrap(), Range::new(4, 4));
+}
+
+#[test]
+fn span_at_the_usize_boundary_never_produces_an_inverted_run() {
+  // A span starting at `usize::MAX` used to wrap `start + len` to `0` here and
+  // yield `Range { start: usize::MAX, end: 0 }`; it is now unconstructible.
+  assert!(Span::try_new(usize::MAX, 1, 1).is_err());
+
+  // The largest span that does exist segments to its exact element range.
+  let span = Span::try_new(usize::MAX - 1, 1, 1).unwrap();
+  let s = [Windowed::new(0.9f32, span)];
+  let out = runs(&s, |&v| v > 0.5, &plain());
+  assert_eq!(out, vec![Range::new(usize::MAX - 1, usize::MAX)]);
+  assert_eq!(out[0].len(), 1);
 }
 
 #[test]

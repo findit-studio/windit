@@ -31,18 +31,40 @@ impl Span {
   /// A span starting at `start` that covers `len` real elements of a
   /// `window`-wide window, the remaining `window - len` positions being padding.
   ///
+  /// The infallible counterpart to [`try_new`](Span::try_new), for the callers
+  /// that know their geometry — a literal in a test, a plan the caller just
+  /// validated — and would only unwrap.
+  ///
   /// # Panics
   ///
-  /// Panics via a debug assertion (debug builds only) unless `0 < len <=
-  /// window`. The check is compiled out in release, so
-  /// [`coverage`](Span::coverage) still guards against a zero window there.
+  /// Panics, in every build, unless `0 < len <= window` and `start + len` is
+  /// representable as a `usize`. Use [`try_new`](Span::try_new) to handle an
+  /// untrusted geometry instead.
   #[must_use]
   pub const fn new(start: usize, len: usize, window: usize) -> Self {
-    debug_assert!(
-      len > 0 && len <= window,
-      "a span must satisfy 0 < len <= window"
-    );
-    Self { start, len, window }
+    match Self::try_new(start, len, window) {
+      Ok(span) => span,
+      Err(_) => panic!("a span must satisfy 0 < len <= window with a representable start + len"),
+    }
+  }
+
+  /// The checked counterpart of [`new`](Span::new): validate the geometry rather
+  /// than panic on it.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::InvalidSpan`] unless `0 < len <= window` and
+  /// `start + len` is representable as a `usize`. Those three conditions are the
+  /// span invariant every other method on this type relies on, so they are
+  /// enforced identically in debug and release.
+  pub const fn try_new(start: usize, len: usize, window: usize) -> Result<Self, WinditError> {
+    // `len <= window` with a non-zero `len` also rules out a zero window, so
+    // `coverage` divides by a positive denominator; the checked addition is what
+    // keeps `end` exact for every span that exists.
+    if len == 0 || len > window || start.checked_add(len).is_none() {
+      return Err(WinditError::InvalidSpan { start, len, window });
+    }
+    Ok(Self { start, len, window })
   }
 
   /// Index of the first real element, in input elements.
@@ -57,25 +79,36 @@ impl Span {
     self.len
   }
 
+  /// One past the last real element the span covers (`start + len`), in input
+  /// elements.
+  ///
+  /// The exclusive end of the real (unpadded) region, in the same element units
+  /// as the segmentation ranges — and the single place this crate performs the
+  /// `start + len` addition.
+  #[must_use]
+  pub const fn end(&self) -> usize {
+    // Both constructors reject a span whose `start + len` is not representable,
+    // in every build, so the saturation is unreachable. It is kept as the last
+    // line of defence for the "never wraps" contract this method's callers rely
+    // on: `usize::MAX` is out of bounds for any slice and so is caught by the
+    // length checks downstream, whereas a wrap would alias a low index and
+    // silently select the wrong elements.
+    self.start.saturating_add(self.len)
+  }
+
   /// The fixed window size this span pads to, in elements.
   #[must_use]
   pub const fn window(&self) -> usize {
     self.window
   }
 
-  /// The fraction of the window filled by real elements, in `(0, 1]` for
-  /// planner-produced spans.
+  /// The fraction of the window filled by real elements, always in `(0, 1]`.
   ///
-  /// Reports `0.0` for a zero-window span (`window == 0`) instead of dividing by
-  /// zero. [`new`](Span::new) rejects one only through a debug assertion, so a
-  /// release build can still hold such a span; the planner never produces one.
+  /// Both constructors enforce `0 < len <= window` in every build, so the
+  /// denominator is positive and the quotient is finite.
   #[must_use]
   pub fn coverage(&self) -> f32 {
-    if self.window == 0 {
-      0.0
-    } else {
-      self.len as f32 / self.window as f32
-    }
+    self.len as f32 / self.window as f32
   }
 }
 
@@ -278,7 +311,9 @@ const _: () = {
         };
         if keep {
           // `w` is non-zero (validated) and the loop guard gives `start <
-          // input_len`, so `len` is in `1..=w`: the span invariant holds.
+          // input_len`, so `len` is in `1..=w`; `len` is also at most
+          // `input_len - start`, so `start + len <= input_len` is representable.
+          // The whole span invariant holds, and `new` cannot panic here.
           out.push(Span::new(start, len, w));
         }
         if let Some(max) = opts.max_windows() {
