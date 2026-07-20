@@ -184,6 +184,180 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
 }
 
 #[test]
+fn large_magnitude_and_underflowing_vectors_normalize_at_f32() {
+  // Nothing about these vectors is invalid: every component is an ordinary
+  // finite f32 and every normalized result is exactly [1, 0]. It was squaring
+  // them that left the scalar -- 1e20 squares to infinity, 1e-30 to zero -- so a
+  // norm taken as sqrt(sum(x*x)) reported NonFinite (or a zero norm) for input
+  // the caller was entitled to have normalized.
+  let coverages = [1.0];
+  for big in [1e20_f32, 1e30, f32::MAX] {
+    let embeddings: [&[f32]; 1] = [&[big, 0.0]];
+    assert_eq!(
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .unwrap(),
+      vec![1.0_f32, 0.0],
+      "magnitude {big:e} must normalize, not be rejected"
+    );
+  }
+  for tiny in [1e-30_f32, f32::MIN_POSITIVE, f32::from_bits(1)] {
+    let embeddings: [&[f32]; 1] = [&[tiny, 0.0]];
+    assert_eq!(
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .unwrap(),
+      vec![1.0_f32, 0.0],
+      "magnitude {tiny:e} must normalize, not be rejected"
+    );
+  }
+
+  // A vector whose norm is not representable even though its normalization is:
+  // sqrt(2) * 3e38 overflows f32, but the unit vector is the ordinary diagonal.
+  let embeddings: [&[f32]; 1] = [&[3e38, 3e38]];
+  assert_close(
+    &MeanRenormalized
+      .aggregate_values(&embeddings, &coverages, 2)
+      .unwrap(),
+    &[0.70710677, 0.70710677],
+  );
+
+  // A genuinely unnormalizable vector is still rejected, by the same path.
+  let zero: [&[f32]; 1] = [&[0.0, 0.0]];
+  assert!(matches!(
+    MeanRenormalized.aggregate_values(&zero, &coverages, 2),
+    Err(WinditError::NonFinite)
+  ));
+  let nan: [&[f32]; 1] = [&[f32::NAN, 1.0]];
+  assert!(matches!(
+    MeanRenormalized.aggregate_values(&nan, &coverages, 2),
+    Err(WinditError::NonFinite)
+  ));
+  let inf: [&[f32]; 1] = [&[f32::INFINITY, 1.0]];
+  assert!(matches!(
+    MeanRenormalized.aggregate_values(&inf, &coverages, 2),
+    Err(WinditError::NonFinite)
+  ));
+}
+
+#[test]
+fn large_magnitude_and_underflowing_vectors_normalize_at_f64() {
+  // The same defect at the other shipped scalar. 1e20 and 1e-30 square
+  // comfortably inside f64 and were never affected there, which is the point of
+  // pinning them alongside the exponents that do reach it (~1e200).
+  let coverages = [1.0];
+  for big in [1e200_f64, f64::MAX] {
+    let embeddings: [&[f64]; 1] = [&[big, 0.0]];
+    assert_eq!(
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .unwrap(),
+      vec![1.0_f64, 0.0],
+      "magnitude {big:e} must normalize, not be rejected"
+    );
+  }
+  for tiny in [1e-200_f64, f64::MIN_POSITIVE, f64::from_bits(1)] {
+    let embeddings: [&[f64]; 1] = [&[tiny, 0.0]];
+    assert_eq!(
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .unwrap(),
+      vec![1.0_f64, 0.0],
+      "magnitude {tiny:e} must normalize, not be rejected"
+    );
+  }
+  for in_range in [1e20_f64, 1e-30_f64] {
+    let embeddings: [&[f64]; 1] = [&[in_range, 0.0]];
+    assert_eq!(
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .unwrap(),
+      vec![1.0_f64, 0.0]
+    );
+  }
+}
+
+#[test]
+fn saliency_magnitude_weights_survive_their_own_scale() {
+  // SaliencyWeighted weights each input by its own L2 norm, so a 1e20 input
+  // contributes 1e20 * 1e20 = 1e40 to the accumulator -- infinity in f32 -- even
+  // once the norm itself is computed safely. Only the accumulator's direction
+  // survives renormalization, so it is rescaled rather than surrendered.
+  let embeddings: [&[f32]; 2] = [&[1e20, 0.0], &[0.0, 1e20]];
+  let out = SaliencyWeighted
+    .aggregate_values(&embeddings, &[1.0, 1.0], 2)
+    .unwrap();
+  assert_close(&out, &[0.70710677, 0.70710677]);
+
+  // Equal magnitudes weight equally, so the result matches the plain mean over
+  // the same directions -- the saliency is doing nothing here except overflow.
+  let unit: [&[f32]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let mean = MeanRenormalized
+    .aggregate_values(&unit, &[1.0, 1.0], 2)
+    .unwrap();
+  assert_close(&out, &mean);
+
+  // And the weighting still ranks by magnitude once rescaled: a 1e20 input
+  // against a 1e10 one leans almost entirely toward the larger.
+  let uneven: [&[f32]; 2] = [&[1e20, 0.0], &[0.0, 1e10]];
+  let skewed = SaliencyWeighted
+    .aggregate_values(&uneven, &[1.0, 1.0], 2)
+    .unwrap();
+  assert!(
+    skewed[0] > 0.999_999 && skewed[1] > 0.0,
+    "the 1e20 input must dominate without erasing the 1e10 one, got {skewed:?}"
+  );
+}
+
+#[test]
+fn normal_magnitude_normalization_stays_bit_identical() {
+  // The scale-aware path is a fallback, not a replacement: whenever the direct
+  // sum of squares lands in range it is still the answer, so every pinned f32
+  // value keeps its exact bits. Asserted against the naive computation with
+  // `assert_eq!` rather than a tolerance, since a tolerance is precisely what
+  // would hide a changed rounding.
+  let raw = [0.6_f32, 0.8, 0.1, 3.0, -2.5];
+  let mut naive = 0.0_f32;
+  for x in raw {
+    naive += x * x;
+  }
+  let norm = libm::sqrtf(naive);
+  let want: Vec<f32> = raw.iter().map(|x| x / norm).collect();
+
+  let embeddings: [&[f32]; 1] = [&raw];
+  assert_eq!(
+    MeanRenormalized
+      .aggregate_values(&embeddings, &[1.0], 5)
+      .unwrap(),
+    want
+  );
+  // Coverage 1.0 widens to an exact 1.0 weight, so this must agree to the bit.
+  assert_eq!(
+    CoverageWeightedMean
+      .aggregate_values(&embeddings, &[1.0], 5)
+      .unwrap(),
+    want
+  );
+
+  // Saliency scales the accumulator by the vector's own norm before
+  // renormalizing, so its direct path is reproduced with that weight in place
+  // rather than compared to the unweighted one.
+  let weighted: Vec<f32> = raw.iter().map(|x| norm * x).collect();
+  let mut naive_weighted = 0.0_f32;
+  for x in &weighted {
+    naive_weighted += x * x;
+  }
+  let weighted_norm = libm::sqrtf(naive_weighted);
+  let want_saliency: Vec<f32> = weighted.iter().map(|x| x / weighted_norm).collect();
+  assert_eq!(
+    SaliencyWeighted
+      .aggregate_values(&embeddings, &[1.0], 5)
+      .unwrap(),
+    want_saliency
+  );
+}
+
+#[test]
 fn keep_separate_returns_all_windows() {
   let windows = vec![
     win(&[1.0, 0.0], 4, 4),

@@ -37,6 +37,25 @@ fn sqrt_matches_known_values() {
 }
 
 #[test]
+fn abs_drops_the_sign_and_keeps_the_magnitude() {
+  // Also the guard against `Real::abs` resolving to itself, as for `is_finite`.
+  assert_eq!(<f32 as Real>::abs(2.5), 2.5);
+  assert_eq!(<f32 as Real>::abs(-2.5), 2.5);
+  assert_eq!(<f32 as Real>::abs(0.0), 0.0);
+  assert_eq!(<f32 as Real>::abs(-0.0), 0.0);
+  assert_eq!(<f64 as Real>::abs(-2.5), 2.5);
+  assert_eq!(<f64 as Real>::abs(0.0), 0.0);
+
+  // Exact at the extremes the scale-aware norm divides by, where an approximate
+  // magnitude would reintroduce the overflow it exists to avoid.
+  assert_eq!(<f32 as Real>::abs(-f32::MAX), f32::MAX);
+  assert_eq!(<f32 as Real>::abs(-f32::MIN_POSITIVE), f32::MIN_POSITIVE);
+  assert_eq!(<f64 as Real>::abs(-f64::MAX), f64::MAX);
+  assert!(!<f32 as Real>::abs(f32::NAN).is_finite());
+  assert_eq!(<f32 as Real>::abs(f32::NEG_INFINITY), f32::INFINITY);
+}
+
+#[test]
 fn is_finite_rejects_infinities_and_nan() {
   // Also the guard against `Real::is_finite` resolving to itself: a recursive
   // implementation would overflow the stack here rather than return.
