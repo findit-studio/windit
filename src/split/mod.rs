@@ -274,10 +274,14 @@ const _: () = {
     ///
     /// # Cost
     ///
-    /// Length is queried through [`MeasureText::measure_within`], `O(a log a)`
-    /// times for `a` atoms: the packing never re-measures a range whose measure
-    /// it already knows, and it locates each overlap boundary by probing rather
-    /// than by walking one atom at a time.
+    /// Length is queried through [`MeasureText::measure_within`] `O(a)` times for
+    /// `a` atoms: the packing never re-measures a range whose measure it already
+    /// knows, and it locates each overlap boundary by a linear scan over just the
+    /// trailing atoms of the chunk it closes. Those scans cover adjacent atom
+    /// ranges that tile the atom stream, so together they stay linear in `a`. The
+    /// scan is not a bisection because a context-sensitive measurer's token count
+    /// need not fall monotonically as the repeated suffix shortens, so only a walk
+    /// from the longest candidate suffix inward finds the earliest one that fits.
     ///
     /// `a` counts the atoms the emitted chunks are built from, not the atoms the
     /// whole text contains. Atoms are produced on demand and packed as they are
@@ -285,7 +289,7 @@ const _: () = {
     /// produced, and the memory, as well as the chunk count: a capped chunking
     /// stops at the first chunk past the cap and never splits the text beyond it.
     /// Peak memory is one chunk's worth of atoms — the block the overlap search
-    /// probes backwards through — plus the chunks emitted so far.
+    /// scans back through — plus the chunks emitted so far.
     ///
     /// Whether the cap also bounds the *measurement* is up to the measurer. Each
     /// descent level, down to the first atom, measures its whole range once, and
@@ -790,39 +794,21 @@ const _: () = {
   /// The smallest `t` in `lo..=hi` that `accepts` admits, taking `hi` — the
   /// "repeat nothing" sentinel — as admitted by definition.
   ///
-  /// Probes outward from `lo` in doubling steps, then bisects the bracket that
-  /// establishes. A budget wide enough to repeat the whole chunk therefore costs
-  /// one measurement and a budget that repeats a few trailing atoms costs a few,
-  /// where walking one atom at a time cost one measurement per repeated atom —
-  /// each over a substring that grew with it, which is what made packing at a
-  /// near-window overlap quadratic per chunk.
+  /// The scan is a linear walk from `lo` upward that returns the first admitted
+  /// `t`, because `accepts` is not monotonic in `t`: a context-sensitive tokenizer
+  /// (BPE, wordpiece) can measure a longer trailing suffix as *fewer* tokens than
+  /// a shorter one, so admission can toggle off and back on as the suffix shortens.
+  /// A doubling-and-bisection search assumes a single reject-to-admit flip and can
+  /// bracket straight past the earliest admitted `t`, returning a later suffix — or
+  /// the sentinel — and silently dropping configured overlap. A linear walk finds
+  /// the earliest admitted `t` for an arbitrary `accepts`.
   ///
-  /// `accepts` is consulted only at real candidates, and the returned `t` is
-  /// either `hi` or a candidate it admitted, so the block finally repeated has
-  /// always been measured directly however the search reached it.
+  /// It stays bounded: `lo..hi` spans only the just-closed chunk's trailing atoms,
+  /// each `accepts` is a `measure_within` capped at the overlap budget, and across
+  /// the whole packing successive overlap searches scan adjacent atom ranges that
+  /// tile the atom stream — so the walks cost `O(a)` in total, not per chunk.
+  /// `accepts` is consulted only at real candidates, never at the `hi` sentinel.
   fn first_accepted(lo: usize, hi: usize, accepts: impl Fn(usize) -> bool) -> usize {
-    let (mut low, mut high) = (lo, hi);
-    let mut step = 1usize;
-    while low < high {
-      let probe = low.saturating_add(step - 1);
-      if probe >= high {
-        break;
-      }
-      if accepts(probe) {
-        high = probe;
-        break;
-      }
-      low = probe + 1;
-      step = step.saturating_mul(2);
-    }
-    while low < high {
-      let mid = low + (high - low) / 2;
-      if accepts(mid) {
-        high = mid;
-      } else {
-        low = mid + 1;
-      }
-    }
-    low
+    (lo..hi).find(|&t| accepts(t)).unwrap_or(hi)
   }
 };
