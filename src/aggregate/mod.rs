@@ -32,18 +32,31 @@
 //!
 //! # Scale
 //!
-//! Every policy ends in an L2 renormalization, and a vector's squares can leave
-//! the scalar's range long before the vector does: `[1e20_f32, 0.0]` squares to
-//! infinity and `[1e-30_f32, 0.0]` to zero, though both normalize to exactly
-//! `[1, 0]`. Renormalization therefore falls back to dividing by the largest
-//! component before squaring, which also normalizes a vector whose norm is not
-//! representable at all (`[3e38_f32, 3e38]`), and `SaliencyWeighted` rescales its
-//! magnitude weights the same way. [`WinditError::NonFinite`] is left to mean
-//! what it says: an all-zero vector, or a component that is itself not finite.
+//! Every policy ends in an L2 renormalization, and the arithmetic can leave the
+//! scalar's range long before the vector does. A vector's squares go first:
+//! `[1e20_f32, 0.0]` squares to infinity and `[1e-30_f32, 0.0]` to zero, though
+//! both normalize to exactly `[1, 0]`. A vector's norm can follow while the unit
+//! vector stays ordinary: `[3e38_f32, 3e38]` has a norm of `sqrt(2) * 3e38`.
+//! None of that is a property of the vector, and none of it is grounds to reject
+//! one.
 //!
-//! The fallback is a fallback. A vector whose sum of squares lands in range is
-//! normalized by exactly the computation it always was, bit for bit, so no
-//! ordinary-magnitude result moves.
+//! Every reduction here is therefore taken in a domain shifted by a power of
+//! two, chosen from the inputs' own exponents before any of them is folded.
+//! Scaling by a power of two moves the exponent and leaves the significand
+//! alone, so the shifted reduction is the unshifted one to the bit — same
+//! direction, same rounding — wherever the unshifted one was valid, and the
+//! shift divides back out of a renormalized result. What it buys is range: each
+//! shift is the one nearest zero that keeps every product, partial sum, and sum
+//! of squares clear of both ends of the scalar.
+//!
+//! There is no second attempt anywhere, which is what keeps
+//! [`WinditError::NonFinite`] meaning what it says: an all-zero vector, or a
+//! component that is itself not finite. A retry cannot tell those from a norm
+//! that merely overflowed, and a vector whose components cancel exactly is not a
+//! vector whose norm was unrepresentable — it is a vector with no direction.
+//! Because every scale is a power of two, a cancelling sum stays exactly zero
+//! and is rejected on the only path there is, rather than rounding to some
+//! arbitrary residue that normalizes to an arbitrary answer.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
@@ -278,7 +291,16 @@ impl<C: Real> AggregatePolicy<C> for SaliencyWeighted {
     coverages: &[f32],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
-    weighted_sum_renorm(embeddings, coverages, dim, |_, emb| l2_norm(emb))
+    check_inputs(embeddings, coverages, dim)?;
+    // Materialized rather than recomputed inside the fold: `weighted_sum_renorm`
+    // reads each weight twice — once to size its shift, once to apply it — and a
+    // norm is a full pass over the window.
+    let shift = saliency_shift(embeddings, dim);
+    let weights: Vec<C> = embeddings
+      .iter()
+      .map(|emb| scaled_l2_norm(emb, shift))
+      .collect();
+    weighted_sum_renorm(embeddings, coverages, dim, |i, _| weights[i])
   }
 }
 
@@ -301,10 +323,22 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     // the f32 fold would round the complement to f32 precision and make the
     // f64 path gratuitously less accurate than its type promises.
     let alpha = C::from_f32(self.alpha);
+    let complement = C::ONE - alpha;
+    let shift = ema_shift(embeddings);
     let mut state = embeddings[0].to_vec();
+    if shift != 0 {
+      for s in &mut state {
+        *s = s.ldexp(shift);
+      }
+    }
+    // The shift rides on `alpha` rather than on each component: the state is
+    // already in the shifted domain, so `(alpha * 2^s) * e` is the incoming term
+    // scaled to match. At the ordinary `shift == 0` this is `alpha` itself and
+    // the fold is unchanged.
+    let scaled_alpha = alpha.ldexp(shift);
     for emb in &embeddings[1..] {
       for (s, &e) in state.iter_mut().zip(emb.iter()) {
-        *s = alpha * e + (C::ONE - alpha) * *s;
+        *s = scaled_alpha * e + complement * *s;
       }
     }
     l2_renorm(&mut state)?;
@@ -382,6 +416,12 @@ fn check_inputs<C: Real>(
 }
 
 /// Accumulate `sum_i weight(i, emb_i) * emb_i` and L2-renormalize it.
+///
+/// One pass, no retry. The power-of-two shift that keeps the accumulation in
+/// range is chosen from the inputs before any of them is folded, so there is no
+/// failure to recover from and nothing to recompute a second way. An
+/// accumulator that lands on the zero vector landed there because the inputs
+/// cancel, and [`l2_renorm`] says so.
 fn weighted_sum_renorm<C: Real>(
   embeddings: &[&[C]],
   coverages: &[f32],
@@ -391,79 +431,122 @@ fn weighted_sum_renorm<C: Real>(
   // `dim` is caller-supplied, but this has just proved it is the length of an
   // embedding that exists, so the accumulator below is bounded by real data.
   check_inputs(embeddings, coverages, dim)?;
+  let shift = accumulation_shift(embeddings, &weight);
   let mut acc = vec![C::ZERO; dim];
   for (i, emb) in embeddings.iter().enumerate() {
-    let w = weight(i, emb);
+    // The whole shift rides on the weight: `(w * 2^s) * e` and `w * (e * 2^s)`
+    // are the same number, and applying it once per window rather than once per
+    // component leaves the inner loop the plain multiply-accumulate it was.
+    let w = weight(i, emb).ldexp(shift);
     for (a, &e) in acc.iter_mut().zip(emb.iter()) {
       *a = *a + w * e;
     }
   }
-  if l2_renorm(&mut acc).is_ok() {
-    return Ok(acc);
-  }
-  // The direct accumulation left the scalar's range. [`SaliencyWeighted`] weights
-  // by magnitude, so a single `1e20_f32` input reaches `1e40` here even with the
-  // norm itself computed safely. Only the accumulator's direction survives the
-  // renormalization that follows, so it is recomputed with both scales divided
-  // out rather than surrendered as `NonFinite`.
-  let mut acc = rescaled_weighted_sum(embeddings, dim, weight);
   l2_renorm(&mut acc)?;
   Ok(acc)
 }
 
-/// `sum_i weight(i, emb_i) * emb_i` with the weights and the components each
-/// divided by their own largest magnitude first.
+/// The power-of-two exponent to fold into every weight so that
+/// `sum_i w_i * emb_ij` neither overflows nor is flushed to zero.
 ///
-/// Every product is then at most one, so the sum cannot overflow for any
-/// embedding count the scalar can express. Dropping the two scales changes the
-/// accumulator's length but not its direction, which is all that survives
-/// [`l2_renorm`].
-fn rescaled_weighted_sum<C: Real>(
-  embeddings: &[&[C]],
-  dim: usize,
-  weight: impl Fn(usize, &[C]) -> C,
-) -> Vec<C> {
-  let mut w_scale = C::ZERO;
+/// Zero — the ordinary case, and every case whose direct fold was already in
+/// range — leaves the accumulation exactly the fold it has always been. Both
+/// bounds are deliberately tight rather than normalizing: `[[1e30], [-1e30],
+/// [1e-30]]` spans the f32 range internally and is shifted by nothing, so the
+/// `1e-30` that survives the cancellation survives here too. A shift that always
+/// brought the largest product to one would flush it away and report a zero
+/// vector for a sequence that has a direction.
+fn accumulation_shift<C: Real>(embeddings: &[&[C]], weight: &impl Fn(usize, &[C]) -> C) -> i32 {
+  let mut w_max = C::ZERO;
+  let mut e_max = C::ZERO;
   for (i, emb) in embeddings.iter().enumerate() {
-    let m = weight(i, emb).abs();
-    if m > w_scale {
-      w_scale = m;
+    let w = weight(i, emb).abs();
+    if w > w_max {
+      w_max = w;
     }
-  }
-  let mut e_scale = C::ZERO;
-  for emb in embeddings {
     let m = max_magnitude(emb);
-    if m > e_scale {
-      e_scale = m;
+    if m > e_max {
+      e_max = m;
     }
   }
-  let mut acc = vec![C::ZERO; dim];
-  // A zero scale means every weight, or every component, is zero: the sum is the
-  // zero vector either way, which `l2_renorm` rejects exactly as the direct path
-  // did. A non-finite scale divides into a NaN that reaches the same rejection.
-  if w_scale == C::ZERO || e_scale == C::ZERO {
-    return acc;
+  // Nothing a shift can do: a zero on either side makes the accumulator the zero
+  // vector and a non-finite one makes it non-finite, and `l2_renorm` rejects
+  // both. A NaN never becomes a maximum, so it leaves these bounds finite and
+  // reaches that same rejection through the fold instead.
+  if w_max == C::ZERO || e_max == C::ZERO || !w_max.is_finite() || !e_max.is_finite() {
+    return 0;
   }
-  for (i, emb) in embeddings.iter().enumerate() {
-    let w = weight(i, emb) / w_scale;
-    for (a, &e) in acc.iter_mut().zip(emb.iter()) {
-      *a = *a + w * (e / e_scale);
-    }
-  }
-  acc
+  let product = w_max.exponent() + e_max.exponent();
+  // `|acc_j| <= count * w_max * e_max`, and each factor is under twice its own
+  // power of two, so the accumulation stays under `2^(product + count_bits + 2)`.
+  // Holding that a binade below `2^MAX_EXP` — the first power of two the scalar
+  // cannot represent — keeps every product and every partial sum finite.
+  let count_bits = (usize::BITS - embeddings.len().leading_zeros()) as i32;
+  let highest = C::MAX_EXP - 3 - count_bits - product;
+  // At the other end the largest product must stay normal, or an accumulation of
+  // uniformly tiny magnitudes — `1e-30_f32` weighted by its own norm — underflows
+  // to the zero vector that means "no direction".
+  let lowest = (C::MIN_EXP - 1) - product;
+  // `highest - lowest` is `MAX_EXP - MIN_EXP - 2 - count_bits`, positive at both
+  // scalars for every count a slice can hold, so this is the value nearest zero
+  // within a range that is never empty.
+  lowest.max(0).min(highest)
 }
 
-/// `sum_i v_i^2`, as an explicit left fold from `ZERO`.
+/// The power-of-two exponent an EMA folds its state in.
 ///
-/// Spelled out rather than through `Iterator::sum`, which would cost a `Sum`
-/// supertrait on [`Real`] for a syntax preference. The association order is
-/// identical, so the f32 result is unchanged.
-fn sum_of_squares<C: Real>(v: &[C]) -> C {
-  let mut sum = C::ZERO;
-  for &x in v {
-    sum = sum + x * x;
+/// Non-zero only when every component is subnormal, and then only by enough to
+/// make the largest of them normal. `alpha * e` halves a subnormal toward zero —
+/// `0.5 * f32::from_bits(1)` rounds to nothing — so a state assembled from such
+/// components flushes to the zero vector and is reported as a direction that
+/// does not exist. A convex combination never grows past its largest input, so
+/// there is nothing to shift down and no overflow to guard; ordinary magnitudes
+/// shift by nothing and fold exactly as they did.
+fn ema_shift<C: Real>(embeddings: &[&[C]]) -> i32 {
+  let mut e_max = C::ZERO;
+  for emb in embeddings {
+    let m = max_magnitude(emb);
+    if m > e_max {
+      e_max = m;
+    }
   }
-  sum
+  if e_max == C::ZERO || !e_max.is_finite() {
+    return 0;
+  }
+  ((C::MIN_EXP - 1) - e_max.exponent()).max(0)
+}
+
+/// The power-of-two exponent every saliency weight is scaled by, so that no
+/// window's norm has to be representable on its own.
+///
+/// `[3e38_f32, 3e38]` is a finite vector with an infinite norm. Weighting by
+/// that infinity and then dividing it back out gives NaN, which is how the one
+/// policy that reads magnitudes came to reject vectors every other policy
+/// normalized. Scaling every norm by one shared exact factor keeps them in range
+/// and leaves their ratios — the only thing a weight means here — untouched; the
+/// common factor divides out again in the renormalization that ends the policy.
+/// Zero, the ordinary case, leaves each weight the window's own L2 norm.
+fn saliency_shift<C: Real>(embeddings: &[&[C]], dim: usize) -> i32 {
+  let mut e_max = C::ZERO;
+  for emb in embeddings {
+    let m = max_magnitude(emb);
+    if m > e_max {
+      e_max = m;
+    }
+  }
+  if e_max == C::ZERO || !e_max.is_finite() {
+    return 0;
+  }
+  // A norm is under `2 * sqrt(dim)` times its vector's largest component, so it
+  // lands under `2^(exponent + 2 + dim_bits / 2)`. Halved as an unsigned count
+  // because `i32::div_ceil` is not stable at this crate's MSRV.
+  let dim_bits = usize::BITS - dim.leading_zeros();
+  let excess = e_max.exponent() + 2 + dim_bits.div_ceil(2) as i32 - C::MAX_EXP;
+  if excess > 0 {
+    -excess
+  } else {
+    0
+  }
 }
 
 /// The largest absolute component of `v`, or `ZERO` for an empty one.
@@ -482,30 +565,60 @@ fn max_magnitude<C: Real>(v: &[C]) -> C {
   max
 }
 
-/// The L2 norm of `v`, via [`Real::sqrt`] (core has no `f32::sqrt`).
+/// The exponent of the power of two a reduction over `v` divides by: that of
+/// `v`'s largest component.
 ///
-/// The direct sum of squares is the answer whenever it lands in range, which is
-/// what keeps every normal-magnitude result bit-for-bit what it has always been.
-/// Only when squaring leaves the scalar — `1e20_f32` squares to infinity,
-/// `1e-30_f32` to zero — is the norm recomputed against the largest component,
-/// since a vector being unrepresentable *squared* says nothing about the vector.
-fn l2_norm<C: Real>(v: &[C]) -> C {
-  let sum = sum_of_squares(v);
-  if sum.is_finite() && sum != C::ZERO {
-    return sum.sqrt();
+/// `None` when `v` has no scale to speak of — it is empty or all zero — or when
+/// a component is infinite. Both are conditions to reject rather than reduce.
+fn scale_exponent<C: Real>(v: &[C]) -> Option<i32> {
+  let m = max_magnitude(v);
+  if m == C::ZERO || !m.is_finite() {
+    return None;
   }
-  let scale = max_magnitude(v);
-  // Zero (an all-zero vector) and non-finite (an infinite component) are both
-  // returned as they are: each is already the norm the caller must reject.
-  if scale == C::ZERO || !scale.is_finite() {
-    return scale;
-  }
+  Some(m.exponent())
+}
+
+/// `sum_i (v_i / 2^exp)^2`, as an explicit left fold from `ZERO`.
+///
+/// With `exp` from [`scale_exponent`] every ratio is under two, so the sum is
+/// under `4 * v.len()` and cannot overflow for any slice that fits in memory;
+/// nor can it be zero, since the largest component divides to at least one.
+/// Both bounds hold however far the unscaled squares would have left the scalar.
+/// Dividing by a power of two is exact, so this is not an approximation of the
+/// unscaled sum of squares but that same sum with its exponent moved by
+/// `-2 * exp`.
+///
+/// Spelled out rather than through `Iterator::sum`, which would cost a `Sum`
+/// supertrait on [`Real`] for a syntax preference.
+fn scaled_sum_of_squares<C: Real>(v: &[C], exp: i32) -> C {
+  let scale = C::ONE.ldexp(exp);
   let mut sum = C::ZERO;
   for &x in v {
-    let t = x / scale;
-    sum = sum + t * t;
+    let r = x / scale;
+    sum = sum + r * r;
   }
-  scale * sum.sqrt()
+  sum
+}
+
+/// The L2 norm of `v`, scaled by `2^shift`, via [`Real::sqrt`] (core has no
+/// `f32::sqrt`).
+///
+/// Taken against `v`'s own power-of-two scale and shifted back afterwards, so
+/// the sum of squares never leaves the scalar. At `shift == 0` the result is
+/// `sqrt(sum(v_i^2))` to the bit wherever that direct computation was valid, and
+/// the vector's actual norm wherever it was not.
+///
+/// `shift` exists because a norm can be unrepresentable although every component
+/// is ordinary; see [`saliency_shift`], its only caller.
+///
+/// A vector with no scale returns its own largest magnitude: zero when it is all
+/// zero, and the non-finite component itself when one is infinite. Each is
+/// already the weight — and then the accumulator — that the caller must reject.
+fn scaled_l2_norm<C: Real>(v: &[C], shift: i32) -> C {
+  let Some(exp) = scale_exponent(v) else {
+    return max_magnitude(v);
+  };
+  scaled_sum_of_squares(v, exp).sqrt().ldexp(exp + shift)
 }
 
 /// Normalize `v` to unit L2 length in place.
@@ -515,36 +628,27 @@ fn l2_norm<C: Real>(v: &[C]) -> C {
 /// [`WinditError::NonFinite`] if `v` cannot be normalized to a finite unit
 /// vector: it is all zero, or some component is not finite.
 fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
-  let sum = sum_of_squares(v);
-  if sum.is_finite() && sum != C::ZERO {
-    let norm = sum.sqrt();
-    for x in v.iter_mut() {
-      *x = *x / norm;
-    }
-    return Ok(());
-  }
-  // The direct sum left the scalar's range even though the unit vector need not
-  // have: `[1e20_f32, 0.0]` and `[1e-30_f32, 0.0]` both normalize to exactly
-  // [1, 0]. Dividing by the largest component first cannot overflow -- every
-  // ratio is at most one -- and leaves a remaining norm between 1 and
-  // sqrt(dim), always in range.
-  let scale = max_magnitude(v);
-  if scale == C::ZERO || !scale.is_finite() {
+  // The one rejection, and a property of the input rather than of some
+  // intermediate leaving range: an all-zero vector has no direction to normalize
+  // to, and neither has one with an infinite component.
+  let Some(exp) = scale_exponent(v) else {
+    return Err(WinditError::NonFinite);
+  };
+  let scale = C::ONE.ldexp(exp);
+  // `unit` is the norm divided by `scale`, which puts it in [1, 2*sqrt(len)]:
+  // always representable, and always at least one, even for a vector whose norm
+  // is not representable at all (`[3e38_f32, 3e38]`). Dividing by `scale` and by
+  // `unit` separately is what avoids ever forming that norm. Both divisors are
+  // exact power-of-two relatives of the direct computation's, so the quotient is
+  // `v_i / norm` to the bit wherever the direct computation was valid.
+  let unit = scaled_sum_of_squares(v, exp).sqrt();
+  // Only a NaN component reaches this: it never becomes the maximum, so it
+  // passes the scale check above and surfaces in the sum instead. Nothing is
+  // written until every rejection is past, so a rejected vector is left as it
+  // was.
+  if !unit.is_finite() {
     return Err(WinditError::NonFinite);
   }
-  let mut sum = C::ZERO;
-  for &x in v.iter() {
-    let t = x / scale;
-    sum = sum + t * t;
-  }
-  let unit = sum.sqrt();
-  if !unit.is_finite() || unit == C::ZERO {
-    return Err(WinditError::NonFinite);
-  }
-  // Divided twice rather than once by `scale * unit`, which itself overflows for
-  // a vector whose norm is not representable although its normalization is
-  // (`[3e38_f32, 3e38]`). Nothing is written until every rejection is past, so a
-  // rejected vector is left as it was.
   for x in v.iter_mut() {
     *x = (*x / scale) / unit;
   }

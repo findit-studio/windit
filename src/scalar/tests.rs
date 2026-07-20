@@ -56,6 +56,110 @@ fn abs_drops_the_sign_and_keeps_the_magnitude() {
 }
 
 #[test]
+fn exponent_brackets_the_magnitude() {
+  // The contract the scale-aware reductions divide by: `2^e <= |x| < 2^(e+1)`,
+  // so `x / 2^e` always lands in [1, 2) and a sum of such ratios can neither
+  // overflow nor vanish.
+  for x in [
+    1.0f32,
+    1.5,
+    2.0,
+    3.0,
+    0.5,
+    0.75,
+    1e20,
+    1e-30,
+    f32::MAX,
+    f32::MIN_POSITIVE,
+  ] {
+    let e = <f32 as Real>::exponent(x);
+    assert!(
+      <f32 as Real>::ldexp(1.0, e) <= x && x < <f32 as Real>::ldexp(1.0, e + 1),
+      "f32 {x:e} is not bracketed by 2^{e}"
+    );
+    assert_eq!(
+      <f32 as Real>::exponent(-x),
+      e,
+      "the sign must not move the exponent of {x:e}"
+    );
+  }
+  for x in [1.0f64, 3.0, 1e200, 1e-300, f64::MAX, f64::MIN_POSITIVE] {
+    let e = <f64 as Real>::exponent(x);
+    assert!(
+      <f64 as Real>::ldexp(1.0, e) <= x && x < <f64 as Real>::ldexp(1.0, e + 1),
+      "f64 {x:e} is not bracketed by 2^{e}"
+    );
+  }
+
+  // Subnormals report their true exponent rather than a flushed one, which is
+  // what lets an embedding of `f32::from_bits(1)` be normalized rather than
+  // divided by a zero scale and rejected.
+  assert_eq!(<f32 as Real>::exponent(f32::from_bits(1)), -149);
+  assert_eq!(<f32 as Real>::exponent(f32::MIN_POSITIVE), -126);
+  assert_eq!(<f64 as Real>::exponent(f64::from_bits(1)), -1074);
+  assert_eq!(<f64 as Real>::exponent(f64::MIN_POSITIVE), -1022);
+}
+
+#[test]
+fn ldexp_is_an_exact_power_of_two_rescale() {
+  // The property the whole scale-aware design rests on: a power of two moves the
+  // exponent and leaves the significand, so shifting and shifting back recovers
+  // the value bit for bit. An approximate rescale is exactly what turns a
+  // cancelling sum into a small non-zero residue with an arbitrary direction.
+  for x in [
+    1.0f32,
+    0.6,
+    3.0,
+    -2.5,
+    1e20,
+    1e-30,
+    f32::MAX,
+    f32::from_bits(1),
+  ] {
+    for n in [-40i32, -1, 1, 40] {
+      let there = <f32 as Real>::ldexp(x, n);
+      // Only a normal intermediate round-trips: a shift into the subnormals
+      // discards significand bits, which is why the aggregation sizes its shifts
+      // to keep the magnitudes it cares about normal.
+      if there.is_finite() && <f32 as Real>::abs(there) >= f32::MIN_POSITIVE {
+        assert_eq!(
+          <f32 as Real>::ldexp(there, -n),
+          x,
+          "f32 {x:e} shifted by {n} must round-trip"
+        );
+      }
+    }
+  }
+
+  // `n == 0` is the identity, which is what lets the accumulation apply its
+  // shift unconditionally and still leave the ordinary case the fold it was.
+  for x in [0.0f32, 1.0, -2.5, f32::MAX, f32::MIN_POSITIVE] {
+    assert_eq!(<f32 as Real>::ldexp(x, 0).to_bits(), x.to_bits());
+    let wide = f64::from(x);
+    assert_eq!(<f64 as Real>::ldexp(wide, 0).to_bits(), wide.to_bits());
+  }
+}
+
+#[test]
+fn exponent_bounds_delimit_the_representable_powers_of_two() {
+  // The accumulation sizes its shifts against these two constants, so what they
+  // mean is asserted rather than restated: `MAX_EXP` is one past the largest
+  // representable power of two, and `MIN_EXP - 1` is the smallest normal one.
+  assert!(<f32 as Real>::ldexp(1.0, <f32 as Real>::MAX_EXP - 1).is_finite());
+  assert!(!<f32 as Real>::ldexp(1.0, <f32 as Real>::MAX_EXP).is_finite());
+  assert_eq!(
+    <f32 as Real>::ldexp(1.0, <f32 as Real>::MIN_EXP - 1),
+    f32::MIN_POSITIVE
+  );
+  assert!(<f64 as Real>::ldexp(1.0, <f64 as Real>::MAX_EXP - 1).is_finite());
+  assert!(!<f64 as Real>::ldexp(1.0, <f64 as Real>::MAX_EXP).is_finite());
+  assert_eq!(
+    <f64 as Real>::ldexp(1.0, <f64 as Real>::MIN_EXP - 1),
+    f64::MIN_POSITIVE
+  );
+}
+
+#[test]
 fn is_finite_rejects_infinities_and_nan() {
   // Also the guard against `Real::is_finite` resolving to itself: a recursive
   // implementation would overflow the stack here rather than return.

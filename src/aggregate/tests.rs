@@ -311,11 +311,13 @@ fn saliency_magnitude_weights_survive_their_own_scale() {
 
 #[test]
 fn normal_magnitude_normalization_stays_bit_identical() {
-  // The scale-aware path is a fallback, not a replacement: whenever the direct
-  // sum of squares lands in range it is still the answer, so every pinned f32
-  // value keeps its exact bits. Asserted against the naive computation with
-  // `assert_eq!` rather than a tolerance, since a tolerance is precisely what
-  // would hide a changed rounding.
+  // The scale-aware path is the only path, and it still owes the naive
+  // computation every bit. It can, because it divides by a power of two: the
+  // scaled sum of squares is the unscaled one with its exponent moved, its root
+  // is the unscaled root with the exponent moved back, and dividing by the two
+  // exactly-scaled factors is dividing by the norm. Asserted against the naive
+  // computation with `assert_eq!` rather than a tolerance, since a tolerance is
+  // precisely what would hide a changed rounding.
   let raw = [0.6_f32, 0.8, 0.1, 3.0, -2.5];
   let mut naive = 0.0_f32;
   for x in raw {
@@ -354,6 +356,255 @@ fn normal_magnitude_normalization_stays_bit_identical() {
       .aggregate_values(&embeddings, &[1.0], 5)
       .unwrap(),
     want_saliency
+  );
+}
+
+/// Every ordering of four indices, so a cancellation fixture can be asserted
+/// independently of the association order the fold happens to use.
+fn permutations4() -> Vec<[usize; 4]> {
+  let mut out = Vec::new();
+  for a in 0..4 {
+    for b in 0..4 {
+      if b == a {
+        continue;
+      }
+      for c in 0..4 {
+        if c == a || c == b {
+          continue;
+        }
+        out.push([a, b, c, 6 - a - b - c]);
+      }
+    }
+  }
+  out
+}
+
+#[test]
+fn exact_cancellation_is_rejected_at_f32() {
+  // 0.18359375 + 5.0625 + 0.220703125 - 5.466796875, written over the common
+  // denominator that makes the cancellation visible: 94 + 2592 + 113 - 2799 is
+  // zero, and every value is a multiple of 2^-9 below 8, so every partial sum
+  // is exact in f32. The fold lands on zero at all 24 association orders, not
+  // merely at one. A vector that cancels has no direction, and the only honest
+  // answer is a rejection.
+  //
+  // Recomputing the fold with the components divided by their own largest
+  // magnitude -- an arbitrary, non-dyadic divisor -- rounds the sum to -2^-24
+  // and normalizes that to -1, fabricating a direction out of nothing. Powers
+  // of two are the only divisors that leave a cancelling sum cancelling.
+  let raw = [
+    94.0_f32 / 512.0,
+    2592.0 / 512.0,
+    113.0 / 512.0,
+    -2799.0 / 512.0,
+  ];
+  let coverages = [1.0_f32; 4];
+  for order in permutations4() {
+    let cols = [
+      [raw[order[0]]],
+      [raw[order[1]]],
+      [raw[order[2]]],
+      [raw[order[3]]],
+    ];
+    let embeddings: [&[f32]; 4] = [&cols[0], &cols[1], &cols[2], &cols[3]];
+    let mean = MeanRenormalized.aggregate_values(&embeddings, &coverages, 1);
+    assert!(
+      matches!(mean, Err(WinditError::NonFinite)),
+      "MeanRenormalized at order {order:?} must reject exact cancellation, got {mean:?}"
+    );
+    // Uniform coverage widens to an exactly-1.0 weight, so the coverage policy
+    // folds the same values and must reach the same verdict.
+    let cov = CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 1);
+    assert!(
+      matches!(cov, Err(WinditError::NonFinite)),
+      "CoverageWeightedMean at order {order:?} must reject exact cancellation, got {cov:?}"
+    );
+  }
+}
+
+#[test]
+fn exact_cancellation_is_rejected_at_f64() {
+  // The same dyadic fixture at the other shipped scalar: the values are exact in
+  // f64 too, so the fold cancels there identically and the rejection must not
+  // depend on which scalar the math ran in.
+  let raw = [
+    94.0_f64 / 512.0,
+    2592.0 / 512.0,
+    113.0 / 512.0,
+    -2799.0 / 512.0,
+  ];
+  let coverages = [1.0_f32; 4];
+  for order in permutations4() {
+    let cols = [
+      [raw[order[0]]],
+      [raw[order[1]]],
+      [raw[order[2]]],
+      [raw[order[3]]],
+    ];
+    let embeddings: [&[f64]; 4] = [&cols[0], &cols[1], &cols[2], &cols[3]];
+    let mean = MeanRenormalized.aggregate_values(&embeddings, &coverages, 1);
+    assert!(
+      matches!(mean, Err(WinditError::NonFinite)),
+      "MeanRenormalized at order {order:?} must reject exact cancellation, got {mean:?}"
+    );
+    let cov = CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 1);
+    assert!(
+      matches!(cov, Err(WinditError::NonFinite)),
+      "CoverageWeightedMean at order {order:?} must reject exact cancellation, got {cov:?}"
+    );
+  }
+}
+
+#[test]
+fn every_builtin_policy_normalizes_extreme_finite_vectors_at_f32() {
+  // A magnitude that leaves the scalar when squared, or a norm that is not
+  // representable at all, is a property of the *arithmetic*, not of the vector:
+  // each of these is an ordinary finite f32 pair with an ordinary unit vector.
+  // Whether a policy reads magnitudes must not decide whether the caller gets
+  // one.
+  //
+  // `[3e38, 3e38]` is the case that separates them: its norm is sqrt(2) * 3e38,
+  // infinite in f32. Weighting by that infinity and then dividing it out gives
+  // NaN, so the one policy that weights by magnitude rejected what every other
+  // policy normalized.
+  let coverages = [1.0];
+  for (raw, want) in [
+    ([3e38_f32, 3e38], [0.70710677_f32, 0.70710677]),
+    ([1e20, 0.0], [1.0, 0.0]),
+    ([f32::MAX, 0.0], [1.0, 0.0]),
+    ([1e-30, 0.0], [1.0, 0.0]),
+    ([f32::from_bits(1), 0.0], [1.0, 0.0]),
+  ] {
+    let embeddings: [&[f32]; 1] = [&raw];
+    for (name, got) in [
+      (
+        "MeanRenormalized",
+        MeanRenormalized.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "CoverageWeightedMean",
+        CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "EmaRenormalized",
+        EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "SaliencyWeighted",
+        SaliencyWeighted.aggregate_values(&embeddings, &coverages, 2),
+      ),
+    ] {
+      let got = got.unwrap_or_else(|e| panic!("{name} rejected the finite vector {raw:?}: {e:?}"));
+      assert_close(&got, &want);
+    }
+  }
+}
+
+#[test]
+fn every_builtin_policy_normalizes_extreme_finite_vectors_at_f64() {
+  // The same class at f64, at the exponents that reach its range: 1.5e308
+  // squares to infinity and its norm, sqrt(2) * 1.5e308, is likewise not
+  // representable.
+  let coverages = [1.0];
+  for (raw, want) in [
+    (
+      [1.5e308_f64, 1.5e308],
+      [core::f64::consts::FRAC_1_SQRT_2; 2],
+    ),
+    ([1e200, 0.0], [1.0, 0.0]),
+    ([f64::MAX, 0.0], [1.0, 0.0]),
+    ([1e-300, 0.0], [1.0, 0.0]),
+    ([f64::from_bits(1), 0.0], [1.0, 0.0]),
+  ] {
+    let embeddings: [&[f64]; 1] = [&raw];
+    for (name, got) in [
+      (
+        "MeanRenormalized",
+        MeanRenormalized.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "CoverageWeightedMean",
+        CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "EmaRenormalized",
+        EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "SaliencyWeighted",
+        SaliencyWeighted.aggregate_values(&embeddings, &coverages, 2),
+      ),
+    ] {
+      let got = got.unwrap_or_else(|e| panic!("{name} rejected the finite vector {raw:?}: {e:?}"));
+      assert_close_f64(&got, &want);
+    }
+  }
+}
+
+#[test]
+fn every_builtin_policy_normalizes_extreme_finite_sequences_at_f32() {
+  // A single window never exercises a policy's fold. Two do, and the fold is
+  // where the remaining magnitude hazards live: an accumulation that overflows
+  // at the top, and — `EmaRenormalized` halving a subnormal toward zero — one
+  // that is flushed away at the bottom. Two windows already pointing the same
+  // way must combine to that direction whatever their magnitude.
+  let coverages = [1.0, 1.0];
+  for raw in [
+    [[3e38_f32, 0.0], [3e38, 0.0]],
+    [[f32::MAX, 0.0], [f32::MAX, 0.0]],
+    [[1e-30, 0.0], [1e-30, 0.0]],
+    [[f32::from_bits(1), 0.0], [f32::from_bits(1), 0.0]],
+  ] {
+    let embeddings: [&[f32]; 2] = [&raw[0], &raw[1]];
+    for (name, got) in [
+      (
+        "MeanRenormalized",
+        MeanRenormalized.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "CoverageWeightedMean",
+        CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "EmaRenormalized",
+        EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "SaliencyWeighted",
+        SaliencyWeighted.aggregate_values(&embeddings, &coverages, 2),
+      ),
+    ] {
+      let got =
+        got.unwrap_or_else(|e| panic!("{name} rejected the finite sequence {raw:?}: {e:?}"));
+      assert_close(&got, &[1.0, 0.0]);
+    }
+  }
+}
+
+#[test]
+fn saliency_ranks_by_magnitude_across_the_whole_scalar_range() {
+  // The weights only ever matter by ratio, so scaling them to keep every norm
+  // representable must not reorder them. A 1e38 window against a 1e-38 one
+  // spans the f32 range end to end: the larger has to dominate, and the smaller
+  // still has to survive as a non-zero contribution.
+  let embeddings: [&[f32]; 2] = [&[3e38, 0.0], &[0.0, 1e-38]];
+  let out = SaliencyWeighted
+    .aggregate_values(&embeddings, &[1.0, 1.0], 2)
+    .unwrap();
+  assert!(
+    out[0] > 0.999_999 && out[1] >= 0.0,
+    "the 3e38 window must dominate, got {out:?}"
+  );
+
+  // Reversing the magnitudes reverses which axis dominates, which is what makes
+  // the assertion above about the weighting rather than about the order.
+  let flipped: [&[f32]; 2] = [&[1e-38, 0.0], &[0.0, 3e38]];
+  let out_flipped = SaliencyWeighted
+    .aggregate_values(&flipped, &[1.0, 1.0], 2)
+    .unwrap();
+  assert!(
+    out_flipped[1] > 0.999_999 && out_flipped[0] >= 0.0,
+    "the 3e38 window must dominate, got {out_flipped:?}"
   );
 }
 
