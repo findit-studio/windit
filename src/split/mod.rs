@@ -103,8 +103,25 @@ const _: () = {
     /// a lone `char` whose own measure exceeds the window is emitted as-is,
     /// because it cannot be split further. In the oversized-sentence word
     /// fallback, punctuation lying outside word boundaries (a trailing period,
-    /// say) is not covered by any chunk. If `opts` is not valid — a zero window,
-    /// or an overlap at least the window — no chunks are produced.
+    /// say) is not covered by any chunk.
+    ///
+    /// # Cost
+    ///
+    /// `len_fn` is called `O(a log a)` times for `a` atoms, each call measuring
+    /// at most one window's worth of text: the packing never re-measures a range
+    /// whose measure it already knows, and it locates each overlap boundary by
+    /// probing rather than by walking one atom at a time. Set
+    /// [`WindowOptions::max_windows`] to bound the chunk count — and with it the
+    /// total work — ahead of time when the text is untrusted.
+    ///
+    /// # Errors
+    ///
+    /// - Whatever [`WindowOptions::validate`] rejects — [`WinditError::ZeroWindow`]
+    ///   for a zero window, [`WinditError::OverlapGeWindow`] for an overlap at or
+    ///   above it — since neither can produce a range that honours the window.
+    /// - [`WinditError::TooManyWindows`] if the packing exceeds
+    ///   [`WindowOptions::max_windows`], reported exactly as [`WindowPlan::spans`]
+    ///   reports it.
     ///
     /// ```
     /// use windit::plan::WindowOptions;
@@ -115,17 +132,18 @@ const _: () = {
     /// let chunker = ContentAware::new(&count);
     ///
     /// let text = "a b c d e f g h i j k l";
-    /// let chunks = chunker.chunk(text, &WindowOptions::new(4));
+    /// let chunks = chunker.chunk(text, &WindowOptions::new(4)).unwrap();
     /// assert_eq!(chunks.len(), 3);
     /// for (start, end) in chunks {
     ///   assert!(count(&text[start..end]) <= 4);
     /// }
     /// ```
-    #[must_use]
-    pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Vec<(usize, usize)> {
-      if opts.validate().is_err() {
-        return Vec::new();
-      }
+    pub fn chunk(
+      &self,
+      text: &str,
+      opts: &WindowOptions,
+    ) -> Result<Vec<(usize, usize)>, WinditError> {
+      opts.validate()?;
       let atoms = split_range(
         text,
         0,
@@ -134,7 +152,7 @@ const _: () = {
         self.len_fn,
         Level::Paragraph,
       );
-      pack(text, &atoms, opts.window(), opts.overlap(), self.len_fn)
+      pack(text, &atoms, opts, self.len_fn)
     }
   }
 
@@ -250,23 +268,40 @@ const _: () = {
   }
 
   /// Greedily pack `atoms` into chunks no longer than the window, repeating at
-  /// most `overlap` tokens' worth of trailing whole atoms between consecutive
-  /// chunks (`overlap` is a token budget measured by `len_fn`, not an atom count).
+  /// most `opts.overlap()` tokens' worth of trailing whole atoms between
+  /// consecutive chunks (the overlap is a token budget measured by `len_fn`, not
+  /// an atom count).
   ///
   /// `atoms` must be in order; each is assumed to fit the window on its own.
+  ///
+  /// Every boundary emitted here is decided by a `len_fn` measurement of the
+  /// exact contiguous text it delimits, never by adding up per-atom measurements:
+  /// a BPE or wordpiece tokenizer is not additive, so `len_fn("a b")` is not
+  /// generally `len_fn("a") + len_fn("b")` and a per-atom cache would silently
+  /// move chunk boundaries. What the two searches drop is only measurement that
+  /// cannot change an answer — a range whose measure is already known, and
+  /// interior positions of a bracket the search is narrowing.
   fn pack(
     text: &str,
     atoms: &[(usize, usize)],
-    window: usize,
-    overlap: usize,
+    opts: &WindowOptions,
     len_fn: &dyn Fn(&str) -> usize,
-  ) -> Vec<(usize, usize)> {
+  ) -> Result<Vec<(usize, usize)>, WinditError> {
+    let (window, overlap) = (opts.window(), opts.overlap());
     let mut chunks = Vec::new();
     let mut i = 0usize;
+    // One atom past the end of the block the previous chunk's overlap probe
+    // measured against the current `i`, or `0` when nothing was repeated. That
+    // probe measured `text[atoms[i].0..atoms[carried - 1].1]` at no more than the
+    // overlap, and the overlap is strictly below the window, so the block is
+    // already known to fit and the forward walk resumes past it instead of
+    // re-measuring every prefix inside it. `len_fn` is an `Fn` of the text alone,
+    // so re-measuring that identical range could only return the same answer.
+    let mut carried = 0usize;
     while i < atoms.len() {
       let chunk_start = atoms[i].0;
-      let mut chunk_end = atoms[i].1;
-      let mut j = i + 1;
+      let mut j = if carried > i + 1 { carried } else { i + 1 };
+      let mut chunk_end = atoms[j - 1].1;
       while j < atoms.len() {
         let candidate_end = atoms[j].1;
         if len_fn(&text[chunk_start..candidate_end]) <= window {
@@ -277,19 +312,65 @@ const _: () = {
         }
       }
       chunks.push((chunk_start, chunk_end));
+      if let Some(max) = opts.max_windows() {
+        if chunks.len() > max {
+          return Err(WinditError::TooManyWindows {
+            got: chunks.len(),
+            max,
+          });
+        }
+      }
       if j >= atoms.len() {
         break;
       }
       // Back up for the next chunk by TOKEN budget, not atom count: repeat as many
-      // trailing whole atoms as fit in `overlap` tokens (measured over the real
-      // contiguous text, so it is robust to non-additive tokenizers), but always
-      // advance at least one atom so packing terminates.
-      let mut next = j;
-      while next > i + 1 && len_fn(&text[atoms[next - 1].0..atoms[j - 1].1]) <= overlap {
-        next -= 1;
-      }
+      // trailing whole atoms as fit in the overlap, but always advance at least
+      // one atom so packing terminates. `i + 1` is that floor; `j` repeats nothing.
+      let next = first_accepted(i + 1, j, |t| {
+        len_fn(&text[atoms[t].0..chunk_end]) <= overlap
+      });
+      carried = if next < j { j } else { 0 };
       i = next;
     }
-    chunks
+    Ok(chunks)
+  }
+
+  /// The smallest `t` in `lo..=hi` that `accepts` admits, taking `hi` — the
+  /// "repeat nothing" sentinel — as admitted by definition.
+  ///
+  /// Probes outward from `lo` in doubling steps, then bisects the bracket that
+  /// establishes. A budget wide enough to repeat the whole chunk therefore costs
+  /// one measurement and a budget that repeats a few trailing atoms costs a few,
+  /// where walking one atom at a time cost one measurement per repeated atom —
+  /// each over a substring that grew with it, which is what made packing at a
+  /// near-window overlap quadratic per chunk.
+  ///
+  /// `accepts` is consulted only at real candidates, and the returned `t` is
+  /// either `hi` or a candidate it admitted, so the block finally repeated has
+  /// always been measured directly however the search reached it.
+  fn first_accepted(lo: usize, hi: usize, accepts: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (lo, hi);
+    let mut step = 1usize;
+    while low < high {
+      let probe = low.saturating_add(step - 1);
+      if probe >= high {
+        break;
+      }
+      if accepts(probe) {
+        high = probe;
+        break;
+      }
+      low = probe + 1;
+      step = step.saturating_mul(2);
+    }
+    while low < high {
+      let mid = low + (high - low) / 2;
+      if accepts(mid) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+    low
   }
 };

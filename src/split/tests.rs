@@ -25,21 +25,113 @@ fn fixed_window_propagates_plan_errors() {
 
 #[cfg(feature = "text")]
 mod content_aware {
+  use core::cell::Cell;
   use std::string::String;
 
   use super::super::ContentAware;
-  use crate::plan::WindowOptions;
+  use crate::{plan::WindowOptions, WinditError};
 
   /// The mock tokenizer: whitespace-delimited word count.
   fn word_count(s: &str) -> usize {
     s.split_whitespace().count()
   }
 
+  /// `n` single-token words, the shape the high-overlap packing bound is stated
+  /// over.
+  fn words(n: usize) -> String {
+    let mut text = String::new();
+    for i in 0..n {
+      if i > 0 {
+        text.push(' ');
+      }
+      text.push('w');
+    }
+    text
+  }
+
+  /// A `len_fn` that tallies how often it is called and how much text it is
+  /// handed, so a packing bound can be asserted rather than described.
+  struct Meter {
+    calls: Cell<usize>,
+    units: Cell<usize>,
+  }
+
+  impl Meter {
+    fn new() -> Self {
+      Self {
+        calls: Cell::new(0),
+        units: Cell::new(0),
+      }
+    }
+
+    fn measure(&self, s: &str) -> usize {
+      let n = word_count(s);
+      self.calls.set(self.calls.get() + 1);
+      self.units.set(self.units.get() + n);
+      n
+    }
+  }
+
+  #[test]
+  fn high_overlap_packing_stays_within_its_measurement_budget() {
+    // 1000 one-token words, window 500, overlap 499. Advancing one atom per
+    // chunk is the geometry the caller asked for, so ~501 chunks is the correct
+    // output; the defect was the work spent producing it. Both packing loops
+    // re-measured every growing prefix and every growing suffix, which a
+    // loop-exact model puts at 499_999 `len_fn` calls over 125_375_249
+    // token-units -- cubic once the window and overlap scale with the input.
+    let text = words(1000);
+    let meter = Meter::new();
+    let counting = |s: &str| meter.measure(s);
+    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let opts = WindowOptions::new(500).with_overlap(499);
+
+    let chunks = ContentAware::new(len_fn).chunk(&text, &opts).unwrap();
+
+    assert_eq!(chunks.len(), 501, "the packing itself must not change");
+    assert!(
+      meter.calls.get() < 10_000,
+      "packing 1000 atoms at overlap 499 took {} len_fn calls",
+      meter.calls.get()
+    );
+    assert!(
+      meter.units.get() < 2_000_000,
+      "packing 1000 atoms at overlap 499 rescanned {} token-units",
+      meter.units.get()
+    );
+  }
+
+  #[test]
+  fn chunk_enforces_the_window_cap() {
+    // `WindowOptions::max_windows` is honoured by `WindowPlan::spans` but was
+    // ignored here, so the one configured bound on how much work a chunking may
+    // cost did not reach the chunker at all.
+    let text = "a b c d e f g h i j k l";
+    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+
+    // Twelve words at window 4 want three chunks; a cap of two aborts as soon as
+    // it is first exceeded, reporting the same `got` / `max` pair the planner does.
+    let capped = WindowOptions::new(4).with_max_windows(2);
+    assert_eq!(
+      ContentAware::new(len_fn).chunk(text, &capped),
+      Err(WinditError::TooManyWindows { got: 3, max: 2 })
+    );
+
+    // A cap the packing stays within leaves the chunks untouched.
+    let roomy = WindowOptions::new(4).with_max_windows(3);
+    assert_eq!(
+      ContentAware::new(len_fn).chunk(text, &roomy).unwrap().len(),
+      3
+    );
+  }
+
   #[test]
   fn packs_words_within_window() {
     let text = "a b c d e f g h";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn)
+      .chunk(text, &WindowOptions::new(5))
+      .unwrap();
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a b c d e", "f g h"]);
@@ -57,7 +149,9 @@ mod content_aware {
     // breaks at the sentence boundary rather than mid-sentence.
     let text = "One two. Three four five six.";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn)
+      .chunk(text, &WindowOptions::new(5))
+      .unwrap();
 
     assert_eq!(chunks.len(), 2);
     let first = &text[chunks[0].0..chunks[0].1];
@@ -76,7 +170,7 @@ mod content_aware {
     let text = "a b c d e f g h";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(5).with_overlap(1);
-    let chunks = ContentAware::new(len_fn).chunk(text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a b c d e", "e f g h"]);
@@ -108,7 +202,7 @@ mod content_aware {
     let text = "Aa bb cc. Dd ee ff. Gg hh ii. Jj kk ll. Mm nn oo. Pp qq rr.";
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(12).with_overlap(4);
-    let chunks = ContentAware::new(len_fn).chunk(text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
 
     assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
     let repeats = repeated_tokens(text, &chunks);
@@ -129,7 +223,7 @@ mod content_aware {
     let text = [para; 5].join("\n\n");
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     let opts = WindowOptions::new(24).with_overlap(6);
-    let chunks = ContentAware::new(len_fn).chunk(&text, &opts);
+    let chunks = ContentAware::new(len_fn).chunk(&text, &opts).unwrap();
 
     assert_eq!(chunks.len(), 2, "token-budget packing yields 2 chunks");
     let repeats = repeated_tokens(&text, &chunks);
@@ -141,11 +235,18 @@ mod content_aware {
 
   #[test]
   fn chunk_rejects_invalid_window() {
-    // A zero window is invalid geometry; chunk short-circuits to no chunks rather
-    // than emitting per-atom ranges that all violate the "<= window" guarantee.
+    // Invalid geometry cannot produce a range that honours the window, so it is
+    // reported rather than answered with per-atom ranges that all violate the
+    // "<= window" guarantee.
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware::new(len_fn).chunk("hello world", &WindowOptions::new(0));
-    assert!(chunks.is_empty());
+    assert_eq!(
+      ContentAware::new(len_fn).chunk("hello world", &WindowOptions::new(0)),
+      Err(WinditError::ZeroWindow)
+    );
+    assert!(matches!(
+      ContentAware::new(len_fn).chunk("hello world", &WindowOptions::new(4).with_overlap(4)),
+      Err(WinditError::OverlapGeWindow { .. })
+    ));
   }
 
   #[test]
@@ -156,7 +257,9 @@ mod content_aware {
     let text = "ab";
     let len3 = |s: &str| s.chars().count() * 3; // each char measures 3 tokens
     let len_fn: &dyn Fn(&str) -> usize = &len3;
-    let chunks = ContentAware::new(len_fn).chunk(text, &WindowOptions::new(2));
+    let chunks = ContentAware::new(len_fn)
+      .chunk(text, &WindowOptions::new(2))
+      .unwrap();
 
     let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
     assert_eq!(slices, std::vec!["a", "b"]);
@@ -180,7 +283,9 @@ mod content_aware {
       text.push('x');
     }
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
-    let chunks = ContentAware::new(len_fn).chunk(&text, &WindowOptions::new(5));
+    let chunks = ContentAware::new(len_fn)
+      .chunk(&text, &WindowOptions::new(5))
+      .unwrap();
 
     assert_eq!(chunks.len(), 20);
     for &(s, e) in &chunks {
@@ -195,9 +300,11 @@ mod content_aware {
     let len_fn: &dyn Fn(&str) -> usize = &word_count;
     assert!(ContentAware::new(len_fn)
       .chunk("", &WindowOptions::new(5))
+      .unwrap()
       .is_empty());
     assert!(ContentAware::new(len_fn)
       .chunk("   \n\n  ", &WindowOptions::new(5))
+      .unwrap()
       .is_empty());
   }
 }
