@@ -229,10 +229,10 @@ fn content_aware_chunk_is_window_config_driven() {
   let text = "a b c d e f g h i j k l";
 
   // The same chunker over two window sizes — only the configuration differs.
-  let wide = chunker.chunk(text, &WindowOptions::new(12));
+  let wide = chunker.chunk(text, &WindowOptions::new(12)).unwrap();
   assert_eq!(wide.len(), 1); // all twelve words fit one window
 
-  let narrow = chunker.chunk(text, &WindowOptions::new(4));
+  let narrow = chunker.chunk(text, &WindowOptions::new(4)).unwrap();
   assert_eq!(narrow.len(), 3); // twelve words, four per window
   for (start, end) in narrow {
     assert!(count(&text[start..end]) <= 4);
