@@ -24,12 +24,14 @@ path = "benches/windit.rs"
 name = "windit"
 harness = false
 
-# Hierarchical, not independent: `std` implies `alloc`. The heap tier owns the
-# sqrt dependency (`alloc = ["dep:libm"]`) because every sqrt call lives in the
-# alloc-gated aggregation code, so a `std`-without-`alloc` build would compile
-# that code with no `libm::sqrtf` to call. Decoupling to `std = []` would force
-# `std` to either pull libm anyway or carry a second, std-only sqrt path — the
-# duplicate implementation an independent feature model invites.
+# Hierarchical, not independent: `std` implies `alloc`. Decoupling to `std = []`
+# would force `std` to either pull `alloc` in anyway or carry a second, std-only
+# copy of every `Vec`-returning algorithm — the duplicate implementation an
+# independent feature model invites.
+#
+# No feature owns the sqrt dependency. `Real::sqrt` is a method on the ungated
+# `scalar` tier, so `libm` is an unconditional dependency rather than an `alloc`
+# implication; see the note in `[dependencies]`.
 #
 # Because `std` implies `alloc`, the crate's `any(feature = "std", feature =
 # "alloc")` gates are today exactly equivalent to gating on `alloc` alone. They
@@ -37,20 +39,24 @@ harness = false
 # ever decoupled.
 [features]
 default = ["alloc"]
-alloc = ["dep:libm"]
+alloc = []
 std = ["alloc"]
 text = ["alloc", "dep:unicode-segmentation"]
 serde = ["dep:serde"]
 
 [dependencies]
-# `libm` supplies `sqrtf` for the L2 renormalization in `aggregate`, which core
-# cannot provide (`f32::sqrt` is std-only). Pulled in with `alloc` because every
-# sqrt use lives in the alloc-gated aggregation code. Default features are kept
-# (no `default-features = false`) deliberately: libm's only default feature is
-# `arch` (architecture-specific intrinsics), and libm is `#![no_std]`
-# unconditionally regardless of that feature, so the default is already
-# no_std-safe — do not "fix" this.
-libm = { version = "0.2", optional = true }
+# `libm` supplies `sqrtf` / `sqrt` for `Real::sqrt`, which core cannot provide
+# (`f32::sqrt` is std-only). Non-optional because `Real` lives in the ungated
+# `scalar` module: a `--no-default-features` build gets the trait and so needs
+# its implementation, and gating this behind `alloc` would leave the core tier
+# with a sqrt it cannot call. libm is `#![no_std]` and pulls in nothing itself,
+# so that tier pays only the code size of the sqrt it actually calls. Default
+# features are kept (no `default-features = false`) deliberately: libm's only
+# default feature is `arch` (architecture-specific intrinsics), which is both
+# no_std-safe and what lowers `sqrtf` to the hardware square-root instruction,
+# so the generic path costs nothing against std's `f32::sqrt` — do not "fix"
+# this.
+libm = "0.2"
 # Word and sentence boundaries for the `text` feature. Unbounded within 1.x: the
 # newest release (1.13.3) declares `rust-version = 1.85`, well under this crate's
 # 1.95 MSRV, so the version ceiling this dependency used to carry is obsolete.
