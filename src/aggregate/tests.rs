@@ -48,12 +48,12 @@ fn saliency_weights_higher_norm_more() {
   let embeddings: [&[f32]; 2] = [&[3.0, 0.0], &[0.0, 1.0]];
   let coverages = [1.0, 1.0];
   let sal = SaliencyWeighted
-    .aggregate_f32(&embeddings, &coverages, 2)
+    .aggregate_values(&embeddings, &coverages, 2)
     .unwrap();
   assert_close(&sal, &[0.9938837, 0.1104315]);
 
   let mean = MeanRenormalized
-    .aggregate_f32(&embeddings, &coverages, 2)
+    .aggregate_values(&embeddings, &coverages, 2)
     .unwrap();
   assert!(
     sal[0] > mean[0],
@@ -68,13 +68,13 @@ fn ema_renormalized_recency() {
   let coverages = [1.0, 1.0, 1.0];
   let fwd: [&[f32]; 3] = [&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]];
   let out = EmaRenormalized::new(0.5)
-    .aggregate_f32(&fwd, &coverages, 3)
+    .aggregate_values(&fwd, &coverages, 3)
     .unwrap();
   assert_close(&out, &[0.4082483, 0.4082483, 0.8164966]);
 
   let rev: [&[f32]; 3] = [&[0.0, 0.0, 1.0], &[0.0, 1.0, 0.0], &[1.0, 0.0, 0.0]];
   let out_rev = EmaRenormalized::new(0.5)
-    .aggregate_f32(&rev, &coverages, 3)
+    .aggregate_values(&rev, &coverages, 3)
     .unwrap();
   assert_close(&out_rev, &[0.8164966, 0.4082483, 0.4082483]);
 }
@@ -85,25 +85,25 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
   let coverages = [1.0, 1.0];
   // alpha 2.0 previously produced a sign-flipping "average" silently; now typed.
   assert!(matches!(
-    EmaRenormalized::new(2.0).aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(2.0).aggregate_values(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // A negative alpha is likewise rejected.
   assert!(matches!(
-    EmaRenormalized::new(-0.5).aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(-0.5).aggregate_values(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // NaN alpha is out of range and is caught before it can yield a NaN vector.
   assert!(matches!(
-    EmaRenormalized::new(f32::NAN).aggregate_f32(&embeddings, &coverages, 2),
+    EmaRenormalized::new(f32::NAN).aggregate_values(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // The closed-interval endpoints stay valid.
   assert!(EmaRenormalized::new(0.0)
-    .aggregate_f32(&embeddings, &coverages, 2)
+    .aggregate_values(&embeddings, &coverages, 2)
     .is_ok());
   assert!(EmaRenormalized::new(1.0)
-    .aggregate_f32(&embeddings, &coverages, 2)
+    .aggregate_values(&embeddings, &coverages, 2)
     .is_ok());
 }
 
@@ -127,8 +127,12 @@ fn empty_windows_errors() {
     aggregate(&CoverageWeightedMean, &windows),
     Err(WinditError::Empty)
   ));
+  // Two empty slices pin no compute scalar on their own, so the element type is
+  // named here. This is the one place the generalization adds inference
+  // friction, and it is confined to a fully-empty call.
+  let empty: [&[f32]; 0] = [];
   assert!(matches!(
-    CoverageWeightedMean.aggregate_f32(&[], &[], 2),
+    CoverageWeightedMean.aggregate_values(&empty, &[], 2),
     Err(WinditError::Empty)
   ));
 }

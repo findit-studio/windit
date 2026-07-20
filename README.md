@@ -75,8 +75,9 @@ own by implementing the trait.
 - **aggregate** — collapse a sequence of window embeddings into one embedding.
   Built-ins: [`CoverageWeightedMean`] (default), [`MeanRenormalized`],
   [`EmaRenormalized`], [`SaliencyWeighted`], plus `keep_separate` for the
-  multi-vector path. Embeddings live in f32 space and are reconstructed through
-  the minimal [`Vector`] trait, so any 384-, 512-, or 768-dimension type fits.
+  multi-vector path. Embeddings are reconstructed through the minimal [`Vector`]
+  trait, so any 384-, 512-, or 768-dimension type fits, at either shipped
+  [`Scalar`] (`f32` or `f64`).
 - **smooth** — rewrite each window's value while preserving its span. Built-ins:
   [`Ema`] (temporal low-pass) and [`Hysteresis`] (a latching two-threshold gate
   for binary VAD).
@@ -137,7 +138,7 @@ use windit::WinditError;
 struct FirstWindow;
 
 impl AggregatePolicy for FirstWindow {
-    fn aggregate_f32(
+    fn aggregate_values(
         &self,
         embeddings: &[&[f32]],
         _coverages: &[f32],
@@ -152,9 +153,25 @@ impl AggregatePolicy for FirstWindow {
 }
 ```
 
-The aggregate trait works entirely in f32 space, which keeps it object-safe
-(`&dyn AggregatePolicy`) while embedding reconstruction stays generic through
-the free `aggregate` function.
+The aggregate trait takes its compute scalar as a type parameter defaulting to
+`f32`, so it stays object-safe (`&dyn AggregatePolicy` is the `f32` policy
+object) while embedding reconstruction stays generic through the free
+`aggregate` function. The example above is `f32`-only because it leaves the
+parameter at its default; `impl<C: Real> AggregatePolicy<C> for FirstWindow`,
+with `&[&[C]]` and `Vec<C>`, serves every scalar instead.
+
+## Scalars
+
+Embeddings declare what they store through [`Vector`]'s associated `Scalar`
+type. `f32` and `f64` are implemented, neither behind a feature flag — both are
+`core` types, and monomorphization already makes an unused one free.
+
+[`Scalar`] and [`Real`] are **sealed**: name them, bound on them, but only this
+crate implements them. The aggregation math depends on invariants those
+implementations uphold, and sealing also means a scalar added later is not a
+breaking change. Bare integers are deliberately excluded — an `i8` has no value
+without a per-tensor quantization scale this crate cannot know — and `f16` is
+the intended next addition. See the [`scalar`] module docs.
 
 ## `no_std`
 
@@ -194,6 +211,9 @@ dual licensed as above, without any additional terms or conditions.
 [`Span`]: https://docs.rs/windit/latest/windit/plan/struct.Span.html
 [`Windowed<V>`]: https://docs.rs/windit/latest/windit/windowed/struct.Windowed.html
 [`Vector`]: https://docs.rs/windit/latest/windit/windowed/trait.Vector.html
+[`scalar`]: https://docs.rs/windit/latest/windit/scalar/index.html
+[`Scalar`]: https://docs.rs/windit/latest/windit/scalar/trait.Scalar.html
+[`Real`]: https://docs.rs/windit/latest/windit/scalar/trait.Real.html
 [`CoverageWeightedMean`]: https://docs.rs/windit/latest/windit/aggregate/struct.CoverageWeightedMean.html
 [`MeanRenormalized`]: https://docs.rs/windit/latest/windit/aggregate/struct.MeanRenormalized.html
 [`EmaRenormalized`]: https://docs.rs/windit/latest/windit/aggregate/struct.EmaRenormalized.html

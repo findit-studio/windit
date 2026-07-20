@@ -18,6 +18,8 @@ use windit::prelude::*;
 struct TestEmbedding(Vec<f32>);
 
 impl Vector for TestEmbedding {
+  type Scalar = f32;
+
   fn as_slice(&self) -> &[f32] {
     &self.0
   }
@@ -47,7 +49,11 @@ fn assert_unit_norm(v: &[f32]) {
 /// This is the ONE helper every embedding acceptance case shares. Nothing in it
 /// names a concrete window size, unit, or embedding dimension — the cases differ
 /// only by the arguments they pass.
-fn run<E: Vector>(unit_window: usize, input_len: usize, embed: impl Fn(&Span) -> E) -> usize {
+fn run<E: Vector<Scalar = f32>>(
+  unit_window: usize,
+  input_len: usize,
+  embed: impl Fn(&Span) -> E,
+) -> usize {
   let opts = WindowOptions::new(unit_window);
   let spans = WindowPlan::spans(&opts, input_len).expect("plan spans");
   let windows: Vec<WindowEmbedding<E>> = spans

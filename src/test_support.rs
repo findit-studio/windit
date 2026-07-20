@@ -18,6 +18,8 @@ use crate::{error::WinditError, windowed::Vector};
 pub(crate) struct TestVec(pub(crate) Vec<f32>);
 
 impl Vector for TestVec {
+  type Scalar = f32;
+
   fn as_slice(&self) -> &[f32] {
     &self.0
   }

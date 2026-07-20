@@ -2,25 +2,48 @@
 //!
 //! [`Windowed<V>`] pairs a per-window value with the [`Span`] it covers, generic
 //! over `V` (an embedding, a probability, a logit). Embeddings additionally
-//! implement [`Vector`], the minimal f32-slice trait through which the crate
-//! aggregates and reconstructs them.
+//! implement [`Vector`], the minimal slice trait through which the crate
+//! aggregates and reconstructs them, generic over the [`Scalar`] they store.
 
-use crate::{error::WinditError, plan::Span};
+use crate::{error::WinditError, plan::Span, scalar::Scalar};
 
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
-/// A fixed-dimension embedding living in f32 space.
+/// The compute type behind an embedding: the floating-point domain its
+/// aggregation runs in.
+///
+/// For every scalar this crate ships this is just `V::Scalar` again; it differs
+/// only for a storage type narrower than the arithmetic performed on it. See the
+/// [`scalar`](crate::scalar) module.
+pub type ComputeOf<V> = <<V as Vector>::Scalar as Scalar>::Compute;
+
+/// A fixed-dimension embedding stored as a slice of some [`Scalar`].
 ///
 /// The crate aggregates, compares, and reconstructs embeddings only through this
 /// trait, so any 384-, 512-, or 768-dimension type fits unchanged. Implementors
 /// decide what "normalized" means — L2 unit length is typical — inside
 /// [`from_unnormalized`](Vector::from_unnormalized).
+///
+/// An `f32` embedding — which is every embedding in practice — writes
+/// `type Scalar = f32;` and nothing else changes: [`ComputeOf<Self>`](ComputeOf)
+/// is then `f32` too.
 pub trait Vector: Sized {
-  /// The embedding as a contiguous f32 slice.
-  fn as_slice(&self) -> &[f32];
+  /// The scalar type this embedding stores.
+  type Scalar: Scalar;
 
-  /// Build a normalized embedding from a raw (unnormalized) f32 slice.
+  /// The embedding as a contiguous slice of its stored scalar.
+  fn as_slice(&self) -> &[Self::Scalar];
+
+  /// Build a normalized embedding from raw (unnormalized) values in the
+  /// embedding's compute domain.
+  ///
+  /// Aggregation runs in [`ComputeOf<Self>`](ComputeOf) and hands its result
+  /// here, so an implementor whose storage is narrower than its compute type
+  /// does its own conversion — including any rounding or saturation — in this
+  /// method. That keeps the "normalize to a finite unit vector" contract stated
+  /// where it is true, in the float domain, and leaves the quantization scale
+  /// with the only code that knows it.
   ///
   /// # Errors
   ///
@@ -28,7 +51,7 @@ pub trait Vector: Sized {
   /// for example [`WinditError::Empty`] for an empty slice, or
   /// [`WinditError::NonFinite`] when it cannot be normalized to a finite unit
   /// vector.
-  fn from_unnormalized(v: &[f32]) -> Result<Self, WinditError>;
+  fn from_unnormalized(v: &[ComputeOf<Self>]) -> Result<Self, WinditError>;
 
   /// The embedding dimension: the length of [`as_slice`](Vector::as_slice).
   fn dim(&self) -> usize {
