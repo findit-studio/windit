@@ -17,7 +17,12 @@ embeddings, VAD, and ASR.
   both enforce their invariants — `0 < len <= window` with a representable
   `Span::end`, and `start <= end` — identically in debug and release.
 - Pre-processing: `slice_pad_mask` / `try_slice_pad_mask` to slice, right-pad,
-  and mask a span into a fixed-width window.
+  and mask a span into a fixed-width window. A window is a caller-supplied count
+  that need not correspond to memory that exists, so `try_slice_pad_mask`
+  reserves it fallibly and reports `WinditError::AllocFailed` where the
+  infallible variant documents a panic. `WindowPlan::spans` reserves its plan the
+  same way, so an untrusted `input_len` is answered rather than approached one
+  `push` at a time.
 - Scalars: the sealed `Scalar` and `Real` traits and the `ComputeOf` alias,
   implemented for `f32` and `f64` (neither feature-gated). `Vector` carries an
   associated `Scalar`, so embeddings are generic over what they store, while

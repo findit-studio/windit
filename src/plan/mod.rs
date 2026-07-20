@@ -283,9 +283,15 @@ const _: () = {
     ///
     /// # Errors
     ///
-    /// Propagates [`WindowOptions::validate`], and returns
+    /// Propagates [`WindowOptions::validate`], returns
     /// [`WinditError::TooManyWindows`] if the plan would exceed
-    /// [`WindowOptions::max_windows`].
+    /// [`WindowOptions::max_windows`], and returns
+    /// [`WinditError::AllocFailed`] if the plan itself cannot be allocated.
+    ///
+    /// `input_len` is a count, not a slice length: nothing ties it to memory
+    /// that exists, so an untrusted one can name more windows than can be held.
+    /// Setting [`WindowOptions::max_windows`] converts that into the sharper
+    /// `TooManyWindows` at a bound of the caller's choosing.
     pub fn spans(opts: &WindowOptions, input_len: usize) -> Result<Vec<Span>, WinditError> {
       opts.validate()?;
       let (w, hop) = (opts.window(), opts.hop());
@@ -293,6 +299,31 @@ const _: () = {
       if input_len == 0 {
         return Ok(out);
       }
+      // Reserving the plan up front is what keeps an unservable one from being
+      // approached a `push` at a time: `usize::MAX` elements at hop 1 is a well
+      // formed request no allocator can answer, and walking toward it is neither
+      // faster to fail nor more informative than saying so.
+      //
+      // The loop visits `start` at 0, hop, 2*hop, ... and stops at the first one
+      // that leaves at most a window of input (`input_len - start <= w`), so the
+      // count is the hops strictly below `input_len - w`, plus that final tail
+      // window. Deriving it from the hop alone would be wildly loose in exactly
+      // the geometry that matters -- a window near `usize::MAX` with a small hop
+      // places two spans, while `ceil(input_len / hop)` would ask for 1e17.
+      // Capping the reservation at `max + 1` keeps `TooManyWindows` the answer
+      // wherever the cap is what the plan actually runs into.
+      let planned = if input_len <= w {
+        1
+      } else {
+        ((input_len - w - 1) / hop).saturating_add(2)
+      };
+      let reserve = match opts.max_windows() {
+        Some(max) => core::cmp::min(planned, max.saturating_add(1)),
+        None => planned,
+      };
+      out
+        .try_reserve_exact(reserve)
+        .map_err(|_| WinditError::AllocFailed { elements: reserve })?;
       let mut start = 0usize;
       loop {
         // Reachable only when `hop > w` (a stride wider than the window); keeps

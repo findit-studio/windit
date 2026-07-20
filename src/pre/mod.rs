@@ -34,6 +34,13 @@ mod tests;
 /// Panics via a debug assertion (debug builds only) if `span.end() >
 /// elements.len()`. Release builds panic on the slice index instead, which is
 /// bounds-checked regardless.
+///
+/// Panics, in every build, if two `span.window()`-element buffers cannot be
+/// allocated. A window is a caller-supplied count that need not correspond to
+/// memory that exists — `WindowOptions::new(usize::MAX)` plans a perfectly valid
+/// span over a one-element input — so this is reachable from a well-formed
+/// geometry rather than only from a bug. [`try_slice_pad_mask`] reports it as
+/// [`WinditError::AllocFailed`] instead.
 pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, Vec<u8>) {
   debug_assert!(
     span.end() <= elements.len(),
@@ -65,7 +72,16 @@ pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, 
 /// `expected = span.end()`. Returns [`WinditError::InvalidSpan`] if the span's
 /// end is not representable — which [`Span`]'s constructors already rule out,
 /// so this arm exists only to keep the checked entry point total on its own
-/// terms rather than by appeal to a distant invariant.
+/// terms rather than by appeal to a distant invariant. Returns
+/// [`WinditError::AllocFailed`] if the two `span.window()`-element buffers
+/// cannot be allocated.
+///
+/// The allocation arm is the one that makes this variant worth calling. A span
+/// is bounded by the elements it is applied to, but its *window* is not: a plan
+/// built from `WindowOptions::new(usize::MAX)` over a one-element input yields
+/// `(start 0, len 1, window usize::MAX)`, which satisfies every span invariant
+/// and passes every check above. [`slice_pad_mask`] would then panic on a
+/// capacity overflow; here the window is asked for rather than assumed.
 pub fn try_slice_pad_mask<T: Copy>(
   elements: &[T],
   span: &Span,
@@ -84,5 +100,24 @@ pub fn try_slice_pad_mask<T: Copy>(
       expected: required,
     });
   }
-  Ok(slice_pad_mask(elements, span, pad))
+  let window = span.window();
+  let too_large = || WinditError::AllocFailed { elements: window };
+
+  // Reserved rather than delegated to `slice_pad_mask`: the infallible variant
+  // reaches the window through `Vec::with_capacity`, which aborts the process on
+  // a capacity overflow instead of returning. Both vectors are grown to exactly
+  // `window` afterwards, and `span.len() <= window` holds by the span invariant,
+  // so neither `extend_from_slice` nor `resize` can reallocate past what was
+  // reserved here.
+  let mut values = Vec::new();
+  values.try_reserve_exact(window).map_err(|_| too_large())?;
+  values.extend_from_slice(&elements[span.start()..span.end()]);
+  values.resize(window, pad);
+
+  let mut mask = Vec::new();
+  mask.try_reserve_exact(window).map_err(|_| too_large())?;
+  mask.resize(span.len(), 1u8);
+  mask.resize(window, 0u8);
+
+  Ok((values, mask))
 }

@@ -73,6 +73,21 @@ pub enum WinditError {
   AlphaOutOfRange,
   /// The input sequence was empty where at least one element was required.
   Empty,
+  /// A buffer whose size is set by the caller's geometry could not be allocated:
+  /// the requested element count exceeded what the allocator can address, or the
+  /// allocation was refused.
+  ///
+  /// This is what keeps the checked entry points checked. A window size and a
+  /// planned input length are both caller-controlled counts that need not
+  /// correspond to memory that exists, so a geometry can be entirely well formed
+  /// — every [`InvalidSpan`](WinditError::InvalidSpan) condition satisfied, every
+  /// span in bounds — and still name more elements than can be buffered. The
+  /// `try_` entry points report that here rather than panicking on a capacity
+  /// overflow; the infallible ones document the panic instead.
+  AllocFailed {
+    /// The number of elements the buffer would have held.
+    elements: usize,
+  },
 }
 
 impl core::fmt::Display for WinditError {
@@ -103,6 +118,9 @@ impl core::fmt::Display for WinditError {
       Self::NonFinite => f.write_str("embedding could not be normalized to a finite unit vector"),
       Self::AlphaOutOfRange => f.write_str("EMA smoothing factor alpha must be in [0, 1]"),
       Self::Empty => f.write_str("input sequence was empty"),
+      Self::AllocFailed { elements } => {
+        write!(f, "could not allocate a buffer of {elements} elements")
+      }
     }
   }
 }

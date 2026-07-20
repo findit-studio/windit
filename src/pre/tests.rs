@@ -1,6 +1,53 @@
 use super::*;
 use std::vec;
 
+use crate::plan::{WindowOptions, WindowPlan};
+
+#[test]
+fn planner_window_beyond_the_allocator_is_a_typed_error() {
+  // `WindowPlan::spans` with window `usize::MAX` over a one-element input is a
+  // legal plan: the sole span is (start 0, len 1, window usize::MAX), which
+  // satisfies every `Span` invariant and is in bounds for the slice it is then
+  // applied to. So the checked entry point is reached with nothing left to
+  // reject -- and buffering `usize::MAX` elements is what it must not do by
+  // panicking, since returning `Result` instead of panicking is the whole point
+  // of the `try_` variant.
+  //
+  // Debug and release both run this: the failure was `Vec::with_capacity`'s
+  // capacity overflow, which is not a debug assertion.
+  let spans = WindowPlan::spans(&WindowOptions::new(usize::MAX), 1).unwrap();
+  assert_eq!(spans, vec![Span::new(0, 1, usize::MAX)]);
+
+  assert_eq!(
+    try_slice_pad_mask(&[42u8], &spans[0], 0),
+    Err(WinditError::AllocFailed {
+      elements: usize::MAX
+    })
+  );
+}
+
+#[test]
+fn plan_longer_than_the_allocator_is_a_typed_error() {
+  // The same class one step earlier: `input_len` is a caller-supplied count, not
+  // a slice length, so an untrusted one drives the plan's own `Vec`. Uncapped,
+  // this walked toward `usize::MAX` spans one `push` at a time; the plan length
+  // is now computed and reserved up front, so an unservable one is reported
+  // rather than approached.
+  assert_eq!(
+    WindowPlan::spans(&WindowOptions::new(1), usize::MAX),
+    Err(WinditError::AllocFailed {
+      elements: usize::MAX
+    })
+  );
+
+  // A cap keeps its own error: planning aborts at the cap, so it never asks the
+  // allocator for the full (unservable) plan in the first place.
+  assert_eq!(
+    WindowPlan::spans(&WindowOptions::new(1).with_max_windows(10), usize::MAX),
+    Err(WinditError::TooManyWindows { got: 11, max: 10 })
+  );
+}
+
 #[test]
 fn full_window_all_real() {
   let s = Span::new(0, 4, 4);
