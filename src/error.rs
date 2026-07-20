@@ -50,6 +50,17 @@ pub enum WinditError {
     /// The rejected end, in input elements.
     end: usize,
   },
+  /// A chunk was inverted: its start byte offset lay past its end.
+  ///
+  /// Distinct from [`InvalidRange`](WinditError::InvalidRange): a chunk counts
+  /// UTF-8 bytes, not input elements, so the two must not share a variant
+  /// despite the identical shape.
+  InvalidChunk {
+    /// The rejected start, as a UTF-8 byte offset.
+    start: usize,
+    /// The rejected end, as a UTF-8 byte offset.
+    end: usize,
+  },
   /// Two quantities that had to share a dimension did not — for example an
   /// embedding whose length differed from its peers, or a span that ran past
   /// the elements it was applied to.
@@ -111,6 +122,9 @@ impl core::fmt::Display for WinditError {
       }
       Self::InvalidRange { start, end } => {
         write!(f, "range start {start} must not exceed its end {end}")
+      }
+      Self::InvalidChunk { start, end } => {
+        write!(f, "chunk start {start} must not exceed its end {end}")
       }
       Self::DimMismatch { got, expected } => {
         write!(f, "dimension {got} does not match the expected {expected}")

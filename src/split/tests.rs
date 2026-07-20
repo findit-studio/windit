@@ -28,7 +28,7 @@ mod content_aware {
   use core::cell::Cell;
   use std::string::String;
 
-  use super::super::ContentAware;
+  use super::super::{Chunk, ContentAware};
   use crate::{plan::WindowOptions, WinditError};
 
   /// The mock tokenizer: whitespace-delimited word count.
@@ -133,14 +133,14 @@ mod content_aware {
       .chunk(text, &WindowOptions::new(5))
       .unwrap();
 
-    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
     assert_eq!(slices, std::vec!["a b c d e", "f g h"]);
-    for &(s, e) in &chunks {
-      assert!(word_count(&text[s..e]) <= 5);
+    for c in &chunks {
+      assert!(word_count(c.as_str(text).unwrap()) <= 5);
     }
     // Full coverage of the token span: first chunk at the start, last at the end.
-    assert_eq!(chunks[0].0, 0);
-    assert_eq!(chunks.last().unwrap().1, text.len());
+    assert_eq!(chunks[0].start(), 0);
+    assert_eq!(chunks.last().unwrap().end(), text.len());
   }
 
   #[test]
@@ -154,8 +154,8 @@ mod content_aware {
       .unwrap();
 
     assert_eq!(chunks.len(), 2);
-    let first = &text[chunks[0].0..chunks[0].1];
-    let second = &text[chunks[1].0..chunks[1].1];
+    let first = chunks[0].as_str(text).unwrap();
+    let second = chunks[1].as_str(text).unwrap();
     assert_eq!(word_count(first), 2);
     assert_eq!(word_count(second), 4);
     assert!(first.contains("two"));
@@ -172,17 +172,17 @@ mod content_aware {
     let opts = WindowOptions::new(5).with_overlap(1);
     let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
 
-    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
     assert_eq!(slices, std::vec!["a b c d e", "e f g h"]);
   }
 
   /// Measure the tokens repeated between each pair of consecutive chunks.
-  fn repeated_tokens(text: &str, chunks: &[(usize, usize)]) -> std::vec::Vec<usize> {
+  fn repeated_tokens(text: &str, chunks: &[Chunk]) -> std::vec::Vec<usize> {
     chunks
       .windows(2)
       .map(|w| {
-        let (_, e0) = w[0];
-        let (s1, _) = w[1];
+        let e0 = w[0].end();
+        let s1 = w[1].start();
         if s1 < e0 {
           word_count(&text[s1..e0])
         } else {
@@ -261,11 +261,11 @@ mod content_aware {
       .chunk(text, &WindowOptions::new(2))
       .unwrap();
 
-    let slices: std::vec::Vec<&str> = chunks.iter().map(|&(s, e)| &text[s..e]).collect();
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
     assert_eq!(slices, std::vec!["a", "b"]);
-    for &(s, e) in &chunks {
+    for c in &chunks {
       assert!(
-        len3(&text[s..e]) > 2,
+        len3(c.as_str(text).unwrap()) > 2,
         "the oversize char is emitted despite exceeding the window"
       );
     }
@@ -288,11 +288,11 @@ mod content_aware {
       .unwrap();
 
     assert_eq!(chunks.len(), 20);
-    for &(s, e) in &chunks {
-      assert!(word_count(&text[s..e]) <= 5);
+    for c in &chunks {
+      assert!(word_count(c.as_str(&text).unwrap()) <= 5);
     }
-    assert_eq!(chunks[0].0, 0);
-    assert_eq!(chunks.last().unwrap().1, text.len());
+    assert_eq!(chunks[0].start(), 0);
+    assert_eq!(chunks.last().unwrap().end(), text.len());
   }
 
   #[test]

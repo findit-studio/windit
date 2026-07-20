@@ -57,7 +57,11 @@ embeddings, VAD, and ASR.
   one atom at a time — which keeps a near-window overlap over untrusted text off
   the cubic path. Boundaries are still decided by measuring the real contiguous
   text, never by summing per-atom measurements, so a non-additive (BPE,
-  wordpiece) `len_fn` keeps its exact chunk boundaries.
+  wordpiece) `len_fn` keeps its exact chunk boundaries. `chunk` returns
+  `Vec<Chunk>`, not raw `(usize, usize)` byte offsets: `Chunk` is a half-open
+  UTF-8 byte range with an `as_str` accessor, kept a distinct type from
+  `segment::Range` (input-element units) so a byte offset and an element index
+  cannot silently trade places at a call site.
 - `no_std + alloc` support with optional `std`, `text`, and `serde` features;
   minimum supported Rust version 1.95. `libm` is an unconditional dependency:
   `Real::sqrt` lives on the ungated core tier, so even a `--no-default-features`

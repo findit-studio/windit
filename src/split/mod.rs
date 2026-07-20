@@ -9,7 +9,8 @@
 //! packs text into chunks that respect paragraph, sentence, and word boundaries,
 //! measuring length through a caller-supplied `len_fn` so the caller's own
 //! tokenizer defines "how long". It is a separate surface from `SplitPolicy`
-//! because it returns byte-offset ranges into the text rather than element spans.
+//! because it returns `Chunk`s — half-open UTF-8 byte ranges — rather than
+//! element `Span`s.
 
 use std::vec::Vec;
 
@@ -46,6 +47,28 @@ impl SplitPolicy for FixedWindow {
   }
 }
 
+/// A half-open UTF-8 byte range `[start, end)` into a source text (feature
+/// `text`).
+///
+/// [`ContentAware::chunk`] guarantees every `Chunk` it returns falls on `char`
+/// boundaries of the text it was cut from, so [`as_str`](Chunk::as_str) never
+/// returns `None` for that text. The guarantee belongs to the chunker: a
+/// `Chunk` is a bare pair of byte offsets, borrowing nothing, so nothing on
+/// this type itself can check it.
+///
+/// Deliberately not [`Range`](crate::segment::Range): `Range` counts *input
+/// elements* (samples, tokens, patches, frames), one per index, so it is
+/// independent of encoding. A `Chunk` counts UTF-8 *bytes*, several of which
+/// can make up one `char`. Sharing one type for both would let a byte offset
+/// and an element index trade places at a call site with no compiler error —
+/// the exact ambiguity this type exists to rule out.
+#[cfg(feature = "text")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Chunk {
+  start: usize,
+  end: usize,
+}
+
 /// A tokenizer-free, content-aware string chunker (feature `text`).
 ///
 /// [`chunk`](ContentAware::chunk) splits text on recursive boundaries —
@@ -65,10 +88,82 @@ pub struct ContentAware<'a> {
 const _: () = {
   use unicode_segmentation::UnicodeSegmentation;
 
+  impl Chunk {
+    /// The half-open byte range from `start` up to (but not including) `end`.
+    ///
+    /// The infallible counterpart to [`try_new`](Chunk::try_new), for the
+    /// callers that know their bounds and would only unwrap.
+    ///
+    /// # Panics
+    ///
+    /// Panics, in every build, if `start > end`. Use
+    /// [`try_new`](Chunk::try_new) to handle untrusted bounds instead.
+    #[must_use]
+    pub const fn new(start: usize, end: usize) -> Self {
+      match Self::try_new(start, end) {
+        Ok(chunk) => chunk,
+        Err(_) => panic!("a chunk must satisfy start <= end"),
+      }
+    }
+
+    /// The checked counterpart of [`new`](Chunk::new): validate the bounds
+    /// rather than panic on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WinditError::InvalidChunk`] if `start > end`.
+    pub const fn try_new(start: usize, end: usize) -> Result<Self, WinditError> {
+      if start > end {
+        return Err(WinditError::InvalidChunk { start, end });
+      }
+      Ok(Self { start, end })
+    }
+
+    /// The first byte offset covered by the chunk.
+    #[must_use]
+    pub const fn start(&self) -> usize {
+      self.start
+    }
+
+    /// One past the last byte offset covered by the chunk.
+    #[must_use]
+    pub const fn end(&self) -> usize {
+      self.end
+    }
+
+    /// The number of bytes the chunk covers (`end - start`).
+    ///
+    /// Never underflows: both constructors reject `start > end` in every
+    /// build.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+      self.end.saturating_sub(self.start)
+    }
+
+    /// Whether the chunk covers no bytes (`start >= end`).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+      self.start >= self.end
+    }
+
+    /// The slice of `text` this chunk names, or `None` if `text` does not have
+    /// `char` boundaries at both `start` and `end` — for instance because
+    /// `text` is not the string the chunk was cut from.
+    ///
+    /// A `Chunk` does not borrow the text it was produced from, so nothing
+    /// stops a caller from passing a different string here; `Option` makes
+    /// that honestly fallible rather than panicking the way indexing
+    /// (`&text[start..end]`) would.
+    #[must_use]
+    pub fn as_str<'a>(&self, text: &'a str) -> Option<&'a str> {
+      text.get(self.start..self.end)
+    }
+  }
+
   impl<'a> ContentAware<'a> {
     /// A chunker that measures text length with `len_fn`.
     ///
-    /// [`chunk`](ContentAware::chunk) guarantees every returned range measures
+    /// [`chunk`](ContentAware::chunk) guarantees every returned chunk measures
     /// at most the window under this function, save for a single `char` that
     /// alone exceeds the window (it cannot be split further).
     #[must_use]
@@ -83,27 +178,28 @@ const _: () = {
       self.len_fn
     }
 
-    /// Chunk `text` into byte-offset ranges, each measuring at most
+    /// Chunk `text` into [`Chunk`]s, each measuring at most
     /// [`WindowOptions::window`] under `len_fn`.
     ///
-    /// Each returned `(start, end)` is a byte range on `char` boundaries, usable
-    /// directly as `&text[start..end]`. Boundaries are preferred coarse-to-fine:
-    /// a paragraph, sentence, or word that fits is kept whole, and only a unit
-    /// that overflows the window on its own is split further — a long sentence
-    /// into words, a long word into `len_fn`-measured character slices. Chunks are
-    /// packed greedily; when [`WindowOptions::overlap`] is non-zero, consecutive
-    /// chunks repeat at most that many trailing tokens' worth of whole boundary
-    /// units (as measured by `len_fn`).
+    /// Each returned [`Chunk`] falls on `char` boundaries, so
+    /// [`Chunk::as_str`] applied to this same `text` never returns `None`.
+    /// Boundaries are preferred coarse-to-fine: a paragraph, sentence, or word
+    /// that fits is kept whole, and only a unit that overflows the window on
+    /// its own is split further — a long sentence into words, a long word
+    /// into `len_fn`-measured character slices. Chunks are packed greedily;
+    /// when [`WindowOptions::overlap`] is non-zero, consecutive chunks repeat
+    /// at most that many trailing tokens' worth of whole boundary units (as
+    /// measured by `len_fn`).
     ///
-    /// Ranges cover the tokenized content in order; inter-token whitespace falls
-    /// inside a chunk's span but is never a chunk of its own. An empty or
-    /// whitespace-only input yields no chunks.
+    /// Chunks cover the tokenized content in order; inter-token whitespace
+    /// falls inside a chunk's range but is never a chunk of its own. An empty
+    /// or whitespace-only input yields no chunks.
     ///
-    /// Every returned range measures at most the window, with a single exception:
-    /// a lone `char` whose own measure exceeds the window is emitted as-is,
-    /// because it cannot be split further. In the oversized-sentence word
-    /// fallback, punctuation lying outside word boundaries (a trailing period,
-    /// say) is not covered by any chunk.
+    /// Every returned chunk measures at most the window, with a single
+    /// exception: a lone `char` whose own measure exceeds the window is
+    /// emitted as-is, because it cannot be split further. In the
+    /// oversized-sentence word fallback, punctuation lying outside word
+    /// boundaries (a trailing period, say) is not covered by any chunk.
     ///
     /// # Cost
     ///
@@ -118,7 +214,7 @@ const _: () = {
     ///
     /// - Whatever [`WindowOptions::validate`] rejects — [`WinditError::ZeroWindow`]
     ///   for a zero window, [`WinditError::OverlapGeWindow`] for an overlap at or
-    ///   above it — since neither can produce a range that honours the window.
+    ///   above it — since neither can produce a chunk that honours the window.
     /// - [`WinditError::TooManyWindows`] if the packing exceeds
     ///   [`WindowOptions::max_windows`], reported exactly as [`WindowPlan::spans`]
     ///   reports it.
@@ -134,15 +230,11 @@ const _: () = {
     /// let text = "a b c d e f g h i j k l";
     /// let chunks = chunker.chunk(text, &WindowOptions::new(4)).unwrap();
     /// assert_eq!(chunks.len(), 3);
-    /// for (start, end) in chunks {
-    ///   assert!(count(&text[start..end]) <= 4);
+    /// for chunk in &chunks {
+    ///   assert!(count(chunk.as_str(text).unwrap()) <= 4);
     /// }
     /// ```
-    pub fn chunk(
-      &self,
-      text: &str,
-      opts: &WindowOptions,
-    ) -> Result<Vec<(usize, usize)>, WinditError> {
+    pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Result<Vec<Chunk>, WinditError> {
       opts.validate()?;
       let atoms = split_range(
         text,
@@ -173,23 +265,37 @@ const _: () = {
     window: usize,
     len_fn: &dyn Fn(&str) -> usize,
     level: Level,
-  ) -> Vec<(usize, usize)> {
+  ) -> Vec<Chunk> {
     if text[start..end].trim().is_empty() {
       return Vec::new();
     }
     if len_fn(&text[start..end]) <= window {
-      return std::vec![(start, end)];
+      return std::vec![Chunk::new(start, end)];
     }
     let mut out = Vec::new();
     match level {
       Level::Paragraph => {
-        for (s, e) in paragraph_ranges(text, start, end) {
-          out.extend(split_range(text, s, e, window, len_fn, Level::Sentence));
+        for p in paragraph_ranges(text, start, end) {
+          out.extend(split_range(
+            text,
+            p.start(),
+            p.end(),
+            window,
+            len_fn,
+            Level::Sentence,
+          ));
         }
       }
       Level::Sentence => {
-        for (s, e) in sentence_ranges(text, start, end) {
-          out.extend(split_range(text, s, e, window, len_fn, Level::Word));
+        for s in sentence_ranges(text, start, end) {
+          out.extend(split_range(
+            text,
+            s.start(),
+            s.end(),
+            window,
+            len_fn,
+            Level::Word,
+          ));
         }
       }
       Level::Word => {
@@ -197,11 +303,11 @@ const _: () = {
         if words.is_empty() {
           out.extend(split_chars(text, start, end, window, len_fn));
         } else {
-          for (s, e) in words {
-            if len_fn(&text[s..e]) <= window {
-              out.push((s, e));
+          for w in words {
+            if len_fn(&text[w.start()..w.end()]) <= window {
+              out.push(w);
             } else {
-              out.extend(split_chars(text, s, e, window, len_fn));
+              out.extend(split_chars(text, w.start(), w.end(), window, len_fn));
             }
           }
         }
@@ -211,32 +317,32 @@ const _: () = {
   }
 
   /// Byte ranges of the `\n\n`-separated paragraphs within `text[start..end]`.
-  fn paragraph_ranges(text: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+  fn paragraph_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
     let slice = &text[start..end];
     let mut out = Vec::new();
     let mut last = 0usize;
     for (pos, sep) in slice.match_indices("\n\n") {
-      out.push((start + last, start + pos));
+      out.push(Chunk::new(start + last, start + pos));
       last = pos + sep.len();
     }
-    out.push((start + last, end));
+    out.push(Chunk::new(start + last, end));
     out
   }
 
   /// Byte ranges of the Unicode sentences within `text[start..end]`.
-  fn sentence_ranges(text: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+  fn sentence_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
     text[start..end]
       .split_sentence_bound_indices()
-      .map(|(off, sent)| (start + off, start + off + sent.len()))
+      .map(|(off, sent)| Chunk::new(start + off, start + off + sent.len()))
       .collect()
   }
 
   /// Byte ranges of the Unicode words within `text[start..end]` (whitespace and
   /// punctuation between words are excluded).
-  fn word_ranges(text: &str, start: usize, end: usize) -> Vec<(usize, usize)> {
+  fn word_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
     text[start..end]
       .unicode_word_indices()
-      .map(|(off, word)| (start + off, start + off + word.len()))
+      .map(|(off, word)| Chunk::new(start + off, start + off + word.len()))
       .collect()
   }
 
@@ -255,7 +361,7 @@ const _: () = {
     end: usize,
     window: usize,
     len_fn: &dyn Fn(&str) -> usize,
-  ) -> Vec<(usize, usize)> {
+  ) -> Vec<Chunk> {
     let mut out = Vec::new();
     let mut seg_start = start;
     for (i, ch) in text[start..end].char_indices() {
@@ -264,12 +370,12 @@ const _: () = {
       // Close the current slice before the char that would overflow it, but only
       // once it holds at least one char, so a single oversized char still emits.
       if abs > seg_start && len_fn(&text[seg_start..next]) > window {
-        out.push((seg_start, abs));
+        out.push(Chunk::new(seg_start, abs));
         seg_start = abs;
       }
     }
     if seg_start < end {
-      out.push((seg_start, end));
+      out.push(Chunk::new(seg_start, end));
     }
     out
   }
@@ -290,27 +396,28 @@ const _: () = {
   /// interior positions of a bracket the search is narrowing.
   fn pack(
     text: &str,
-    atoms: &[(usize, usize)],
+    atoms: &[Chunk],
     opts: &WindowOptions,
     len_fn: &dyn Fn(&str) -> usize,
-  ) -> Result<Vec<(usize, usize)>, WinditError> {
+  ) -> Result<Vec<Chunk>, WinditError> {
     let (window, overlap) = (opts.window(), opts.overlap());
     let mut chunks = Vec::new();
     let mut i = 0usize;
     // One atom past the end of the block the previous chunk's overlap probe
     // measured against the current `i`, or `0` when nothing was repeated. That
-    // probe measured `text[atoms[i].0..atoms[carried - 1].1]` at no more than the
-    // overlap, and the overlap is strictly below the window, so the block is
-    // already known to fit and the forward walk resumes past it instead of
-    // re-measuring every prefix inside it. `len_fn` is an `Fn` of the text alone,
-    // so re-measuring that identical range could only return the same answer.
+    // probe measured `text[atoms[i].start()..atoms[carried - 1].end()]` at no
+    // more than the overlap, and the overlap is strictly below the window, so
+    // the block is already known to fit and the forward walk resumes past it
+    // instead of re-measuring every prefix inside it. `len_fn` is an `Fn` of
+    // the text alone, so re-measuring that identical range could only return
+    // the same answer.
     let mut carried = 0usize;
     while i < atoms.len() {
-      let chunk_start = atoms[i].0;
+      let chunk_start = atoms[i].start();
       let mut j = if carried > i + 1 { carried } else { i + 1 };
-      let mut chunk_end = atoms[j - 1].1;
+      let mut chunk_end = atoms[j - 1].end();
       while j < atoms.len() {
-        let candidate_end = atoms[j].1;
+        let candidate_end = atoms[j].end();
         if len_fn(&text[chunk_start..candidate_end]) <= window {
           chunk_end = candidate_end;
           j += 1;
@@ -318,7 +425,7 @@ const _: () = {
           break;
         }
       }
-      chunks.push((chunk_start, chunk_end));
+      chunks.push(Chunk::new(chunk_start, chunk_end));
       if let Some(max) = opts.max_windows() {
         if chunks.len() > max {
           return Err(WinditError::TooManyWindows {
@@ -334,7 +441,7 @@ const _: () = {
       // trailing whole atoms as fit in the overlap, but always advance at least
       // one atom so packing terminates. `i + 1` is that floor; `j` repeats nothing.
       let next = first_accepted(i + 1, j, |t| {
-        len_fn(&text[atoms[t].0..chunk_end]) <= overlap
+        len_fn(&text[atoms[t].start()..chunk_end]) <= overlap
       });
       carried = if next < j { j } else { 0 };
       i = next;

@@ -234,8 +234,8 @@ fn content_aware_chunk_is_window_config_driven() {
 
   let narrow = chunker.chunk(text, &WindowOptions::new(4)).unwrap();
   assert_eq!(narrow.len(), 3); // twelve words, four per window
-  for (start, end) in narrow {
-    assert!(count(&text[start..end]) <= 4);
+  for chunk in &narrow {
+    assert!(count(chunk.as_str(text).unwrap()) <= 4);
   }
 }
 
