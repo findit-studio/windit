@@ -104,8 +104,8 @@ pub fn try_slice_pad_mask<T: Copy>(
   let too_large = || WinditError::AllocFailed { elements: window };
 
   // Reserved rather than delegated to `slice_pad_mask`: the infallible variant
-  // reaches the window through `Vec::with_capacity`, which aborts the process on
-  // a capacity overflow instead of returning. Both vectors are grown to exactly
+  // reaches the window through `Vec::with_capacity`, which panics on a capacity
+  // overflow instead of returning. Both vectors are grown to exactly
   // `window` afterwards, and `span.len() <= window` holds by the span invariant,
   // so neither `extend_from_slice` nor `resize` can reallocate past what was
   // reserved here.
