@@ -76,7 +76,7 @@ pub trait Real:
   + core::ops::Sub<Output = Self>
   + core::ops::Mul<Output = Self>
   + core::ops::Div<Output = Self>
-  + PartialEq
+  + PartialOrd
 {
   /// The additive identity.
   const ZERO: Self;
@@ -92,6 +92,14 @@ pub trait Real:
 
   /// The square root, for L2 norms.
   fn sqrt(self) -> Self;
+
+  /// The magnitude, ignoring sign.
+  ///
+  /// Aggregation uses this to find a vector's largest component and normalize
+  /// against it, which is what lets an embedding whose *squares* leave the
+  /// scalar's range — `1e20_f32` squares to infinity, `1e-30_f32` to zero — still
+  /// be normalized rather than rejected.
+  fn abs(self) -> Self;
 
   /// Whether the value is finite: neither infinite nor NaN.
   fn is_finite(self) -> bool;
@@ -119,6 +127,12 @@ impl Real for f32 {
 
   fn sqrt(self) -> Self {
     libm::sqrtf(self)
+  }
+
+  // Through libm for the same reason as `sqrt`: `f32::abs` is std-only, and
+  // libm's `arch` feature lowers this to the hardware instruction anyway.
+  fn abs(self) -> Self {
+    libm::fabsf(self)
   }
 
   // Inherent-first path resolution picks `core`'s `f32::is_finite`, not this
@@ -151,6 +165,10 @@ impl Real for f64 {
 
   fn sqrt(self) -> Self {
     libm::sqrt(self)
+  }
+
+  fn abs(self) -> Self {
+    libm::fabs(self)
   }
 
   fn is_finite(self) -> bool {

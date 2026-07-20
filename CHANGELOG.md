@@ -23,6 +23,13 @@ embeddings, VAD, and ASR.
   infallible variant documents a panic. `WindowPlan::spans` reserves its plan the
   same way, so an untrusted `input_len` is answered rather than approached one
   `push` at a time.
+- Normalization is scale-aware: a vector whose squares leave the scalar's range
+  (`[1e20_f32, 0.0]` squares to infinity, `[1e-30_f32, 0.0]` to zero) is
+  normalized against its largest component instead of being rejected as
+  `NonFinite`, as is one whose norm is not representable at all
+  (`[3e38_f32, 3e38]`). `SaliencyWeighted` rescales its magnitude weights the
+  same way. This is a fallback only: a sum of squares that lands in range is
+  still the answer, bit for bit, so no ordinary-magnitude result moves.
 - Scalars: the sealed `Scalar` and `Real` traits and the `ComputeOf` alias,
   implemented for `f32` and `f64` (neither feature-gated). `Vector` carries an
   associated `Scalar`, so embeddings are generic over what they store, while
