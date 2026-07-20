@@ -86,7 +86,13 @@ pub struct ContentAware<'a> {
 #[cfg(feature = "text")]
 #[cfg_attr(docsrs, doc(cfg(feature = "text")))]
 const _: () = {
-  use unicode_segmentation::UnicodeSegmentation;
+  use core::iter::Peekable;
+
+  use std::collections::VecDeque;
+  use unicode_segmentation::{USentenceBoundIndices, UnicodeSegmentation, UnicodeWordIndices};
+
+  /// The paragraph separator the coarsest boundary level splits on.
+  const PARAGRAPH_SEPARATOR: &str = "\n\n";
 
   impl Chunk {
     /// The half-open byte range from `start` up to (but not including) `end`.
@@ -206,9 +212,15 @@ const _: () = {
     /// `len_fn` is called `O(a log a)` times for `a` atoms, each call measuring
     /// at most one window's worth of text: the packing never re-measures a range
     /// whose measure it already knows, and it locates each overlap boundary by
-    /// probing rather than by walking one atom at a time. Set
-    /// [`WindowOptions::max_windows`] to bound the chunk count — and with it the
-    /// total work — ahead of time when the text is untrusted.
+    /// probing rather than by walking one atom at a time.
+    ///
+    /// `a` counts the atoms the emitted chunks are built from, not the atoms the
+    /// whole text contains. Atoms are produced on demand and packed as they are
+    /// produced, so [`WindowOptions::max_windows`] bounds the tokenization and
+    /// the memory as well as the chunk count: a capped chunking stops at the
+    /// first chunk past the cap and never splits the text beyond it. Peak memory
+    /// is one chunk's worth of atoms — the block the overlap search probes
+    /// backwards through — plus the chunks emitted so far.
     ///
     /// # Errors
     ///
@@ -218,6 +230,11 @@ const _: () = {
     /// - [`WinditError::TooManyWindows`] if the packing exceeds
     ///   [`WindowOptions::max_windows`], reported exactly as [`WindowPlan::spans`]
     ///   reports it.
+    /// - [`WinditError::AllocFailed`] if the chunk list or the packer's atom
+    ///   buffer cannot be grown. Neither size is known before packing runs, so
+    ///   neither can be reserved up front the way [`WindowPlan::spans`] reserves
+    ///   its plan; both grow fallibly instead, so an allocator that refuses is
+    ///   reported here rather than aborting a call that returns `Result`.
     ///
     /// ```
     /// use windit::plan::WindowOptions;
@@ -236,15 +253,7 @@ const _: () = {
     /// ```
     pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Result<Vec<Chunk>, WinditError> {
       opts.validate()?;
-      let atoms = split_range(
-        text,
-        0,
-        text.len(),
-        opts.window(),
-        self.len_fn,
-        Level::Paragraph,
-      );
-      pack(text, &atoms, opts, self.len_fn)
+      pack(text, opts, self.len_fn)
     }
   }
 
@@ -256,136 +265,362 @@ const _: () = {
     Word,
   }
 
-  /// Split `text[start..end]` into atoms that each fit the window, descending
-  /// through boundary levels only for the parts that overflow.
-  fn split_range(
-    text: &str,
-    start: usize,
-    end: usize,
-    window: usize,
-    len_fn: &dyn Fn(&str) -> usize,
-    level: Level,
-  ) -> Vec<Chunk> {
-    if text[start..end].trim().is_empty() {
-      return Vec::new();
-    }
-    if len_fn(&text[start..end]) <= window {
-      return std::vec![Chunk::new(start, end)];
-    }
-    let mut out = Vec::new();
-    match level {
-      Level::Paragraph => {
-        for p in paragraph_ranges(text, start, end) {
-          out.extend(split_range(
-            text,
-            p.start(),
-            p.end(),
-            window,
-            len_fn,
-            Level::Sentence,
-          ));
-        }
-      }
-      Level::Sentence => {
-        for s in sentence_ranges(text, start, end) {
-          out.extend(split_range(
-            text,
-            s.start(),
-            s.end(),
-            window,
-            len_fn,
-            Level::Word,
-          ));
-        }
-      }
-      Level::Word => {
-        let words = word_ranges(text, start, end);
-        if words.is_empty() {
-          out.extend(split_chars(text, start, end, window, len_fn));
-        } else {
-          for w in words {
-            if len_fn(&text[w.start()..w.end()]) <= window {
-              out.push(w);
-            } else {
-              out.extend(split_chars(text, w.start(), w.end(), window, len_fn));
+  /// What advancing one level of the descent produced.
+  enum Step {
+    /// An atom, ready to be packed.
+    Atom(Chunk),
+    /// A sub-range, to be divided at `level` if it overflows the window.
+    Split {
+      start: usize,
+      end: usize,
+      level: Level,
+    },
+    /// One Unicode word: an atom if it fits the window, `char`-aligned slices if
+    /// it does not.
+    Word { start: usize, end: usize },
+    /// The level has no ranges left.
+    Done,
+  }
+
+  /// One boundary level of the descent, suspended at the position it has
+  /// reached.
+  enum Frame<'a> {
+    /// Walk the `\n\n`-separated paragraphs of a range.
+    Paragraphs {
+      cursor: usize,
+      end: usize,
+      done: bool,
+    },
+    /// Walk the Unicode sentences of a paragraph.
+    Sentences {
+      iter: USentenceBoundIndices<'a>,
+      base: usize,
+    },
+    /// Walk the Unicode words of a sentence (whitespace and punctuation between
+    /// words are excluded).
+    ///
+    /// Peekable because the level's fallback turns on whether the sentence has
+    /// any word at all, which is settled before the frame is suspended; the
+    /// peeked word is still the frame's next item, so no boundary is walked
+    /// twice.
+    Words {
+      iter: Peekable<UnicodeWordIndices<'a>>,
+      base: usize,
+    },
+    /// Walk one oversized unit as maximal `char`-aligned slices that fit the
+    /// window.
+    Chars {
+      seg_start: usize,
+      cursor: usize,
+      end: usize,
+    },
+  }
+
+  impl Frame<'_> {
+    /// Advance to this level's next range, without descending into it.
+    ///
+    /// The `Chars` arm is the crate's other `len_fn` walk over a growing
+    /// substring, and it is left as a walk deliberately. Each slice is measured
+    /// from its own start, so the measurement resets at every emitted boundary:
+    /// the cost is the range's length times one window, not times itself, which
+    /// is the same shape the packing bound has. Probing instead would need
+    /// `len_fn` to be monotone over a growing prefix, and a BPE tokenizer is not.
+    fn advance(&mut self, text: &str, window: usize, len_fn: &dyn Fn(&str) -> usize) -> Step {
+      match self {
+        Self::Paragraphs { cursor, end, done } => {
+          if *done {
+            return Step::Done;
+          }
+          let start = *cursor;
+          // Searching from the cursor rather than over the whole range is what
+          // makes the paragraph level lazy, and it matches the non-overlapping
+          // scan it replaces: the cursor sits just past the previous separator,
+          // exactly where that scan would have resumed.
+          let para_end = match text[start..*end].find(PARAGRAPH_SEPARATOR) {
+            Some(off) => {
+              let para_end = start + off;
+              *cursor = para_end + PARAGRAPH_SEPARATOR.len();
+              para_end
             }
+            None => {
+              *done = true;
+              *end
+            }
+          };
+          Step::Split {
+            start,
+            end: para_end,
+            level: Level::Sentence,
+          }
+        }
+        Self::Sentences { iter, base } => match iter.next() {
+          Some((off, sentence)) => Step::Split {
+            start: *base + off,
+            end: *base + off + sentence.len(),
+            level: Level::Word,
+          },
+          None => Step::Done,
+        },
+        Self::Words { iter, base } => match iter.next() {
+          Some((off, word)) => Step::Word {
+            start: *base + off,
+            end: *base + off + word.len(),
+          },
+          None => Step::Done,
+        },
+        Self::Chars {
+          seg_start,
+          cursor,
+          end,
+        } => {
+          while let Some(ch) = text[*cursor..*end].chars().next() {
+            let abs = *cursor;
+            let next = abs + ch.len_utf8();
+            *cursor = next;
+            // Close the current slice before the char that would overflow it, but
+            // only once it holds at least one char, so a single oversized char
+            // still emits.
+            if abs > *seg_start && len_fn(&text[*seg_start..next]) > window {
+              let atom = Chunk::new(*seg_start, abs);
+              *seg_start = abs;
+              return Step::Atom(atom);
+            }
+          }
+          if *seg_start < *end {
+            let atom = Chunk::new(*seg_start, *end);
+            *seg_start = *end;
+            return Step::Atom(atom);
+          }
+          Step::Done
+        }
+      }
+    }
+  }
+
+  /// The atom producer: the boundary descent, suspended between atoms.
+  ///
+  /// Descending recursively would settle every atom of the input before the
+  /// first one could be packed, which is how a bound on the chunk count came to
+  /// be checked only after the work it bounds had been done. Holding the
+  /// recursion as an explicit stack instead lets each `next` advance the descent
+  /// by the least it can: nothing past the current position exists yet, so a
+  /// packing that stops early leaves the rest of the text unsplit and
+  /// unmeasured.
+  ///
+  /// Which ranges are visited, and in what order, is unchanged — so is the
+  /// `len_fn` call that each visit makes. An uncapped chunking therefore returns
+  /// the same chunks at the same cost as the recursion did.
+  struct Atoms<'a> {
+    text: &'a str,
+    window: usize,
+    len_fn: &'a dyn Fn(&str) -> usize,
+    /// The whole-input descent, held until the first `next` so that construction
+    /// stays infallible.
+    root: Option<(usize, usize)>,
+    stack: Vec<Frame<'a>>,
+  }
+
+  impl<'a> Atoms<'a> {
+    fn new(text: &'a str, window: usize, len_fn: &'a dyn Fn(&str) -> usize) -> Self {
+      Self {
+        text,
+        window,
+        len_fn,
+        root: Some((0, text.len())),
+        stack: Vec::new(),
+      }
+    }
+
+    /// The next atom in input order, or `None` once the text has no more.
+    ///
+    /// # Errors
+    ///
+    /// [`WinditError::AllocFailed`] if the descent stack cannot be grown. It
+    /// holds at most one frame per boundary level, so this is the allocator
+    /// refusing a handful of bytes rather than a size the input can drive.
+    fn next(&mut self) -> Result<Option<Chunk>, WinditError> {
+      if let Some((start, end)) = self.root.take() {
+        if let Some(atom) = self.split(start, end, Level::Paragraph)? {
+          return Ok(Some(atom));
+        }
+      }
+      let (text, window, len_fn) = (self.text, self.window, self.len_fn);
+      loop {
+        let step = match self.stack.last_mut() {
+          Some(frame) => frame.advance(text, window, len_fn),
+          None => return Ok(None),
+        };
+        match step {
+          Step::Atom(atom) => return Ok(Some(atom)),
+          Step::Split { start, end, level } => {
+            if let Some(atom) = self.split(start, end, level)? {
+              return Ok(Some(atom));
+            }
+          }
+          Step::Word { start, end } => {
+            if let Some(atom) = self.word(start, end)? {
+              return Ok(Some(atom));
+            }
+          }
+          Step::Done => {
+            self.stack.pop();
           }
         }
       }
     }
-    out
-  }
 
-  /// Byte ranges of the `\n\n`-separated paragraphs within `text[start..end]`.
-  fn paragraph_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
-    let slice = &text[start..end];
-    let mut out = Vec::new();
-    let mut last = 0usize;
-    for (pos, sep) in slice.match_indices("\n\n") {
-      out.push(Chunk::new(start + last, start + pos));
-      last = pos + sep.len();
+    /// Take `text[start..end]` whole when it fits the window, drop it when it
+    /// holds no content, and otherwise suspend the level that divides it.
+    fn split(
+      &mut self,
+      start: usize,
+      end: usize,
+      level: Level,
+    ) -> Result<Option<Chunk>, WinditError> {
+      let text: &'a str = self.text;
+      if text[start..end].trim().is_empty() {
+        return Ok(None);
+      }
+      if (self.len_fn)(&text[start..end]) <= self.window {
+        return Ok(Some(Chunk::new(start, end)));
+      }
+      let frame = match level {
+        Level::Paragraph => Frame::Paragraphs {
+          cursor: start,
+          end,
+          done: false,
+        },
+        Level::Sentence => Frame::Sentences {
+          iter: text[start..end].split_sentence_bound_indices(),
+          base: start,
+        },
+        Level::Word => {
+          // A range the word level cannot divide at all — no Unicode word in it —
+          // goes straight to the `char` fallback, as it did when the word ranges
+          // were collected and found empty.
+          let mut iter: Peekable<UnicodeWordIndices<'a>> =
+            text[start..end].unicode_word_indices().peekable();
+          if iter.peek().is_none() {
+            Frame::Chars {
+              seg_start: start,
+              cursor: start,
+              end,
+            }
+          } else {
+            Frame::Words { iter, base: start }
+          }
+        }
+      };
+      try_push(&mut self.stack, frame)?;
+      Ok(None)
     }
-    out.push(Chunk::new(start + last, end));
-    out
+
+    /// Take one Unicode word whole when it fits the window, and otherwise
+    /// suspend the `char`-aligned fallback over it.
+    fn word(&mut self, start: usize, end: usize) -> Result<Option<Chunk>, WinditError> {
+      if (self.len_fn)(&self.text[start..end]) <= self.window {
+        return Ok(Some(Chunk::new(start, end)));
+      }
+      try_push(
+        &mut self.stack,
+        Frame::Chars {
+          seg_start: start,
+          cursor: start,
+          end,
+        },
+      )?;
+      Ok(None)
+    }
   }
 
-  /// Byte ranges of the Unicode sentences within `text[start..end]`.
-  fn sentence_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
-    text[start..end]
-      .split_sentence_bound_indices()
-      .map(|(off, sent)| Chunk::new(start + off, start + off + sent.len()))
-      .collect()
-  }
-
-  /// Byte ranges of the Unicode words within `text[start..end]` (whitespace and
-  /// punctuation between words are excluded).
-  fn word_ranges(text: &str, start: usize, end: usize) -> Vec<Chunk> {
-    text[start..end]
-      .unicode_word_indices()
-      .map(|(off, word)| Chunk::new(start + off, start + off + word.len()))
-      .collect()
-  }
-
-  /// Split `text[start..end]` into maximal `char`-aligned slices that each fit the
-  /// window: the hard fallback for a single unit longer than the window.
+  /// Random access over the atoms of the chunk being packed.
   ///
-  /// This is the crate's other `len_fn` walk over a growing substring, and it is
-  /// left as a walk deliberately. Each slice is measured from its own start, so
-  /// the measurement resets at every emitted boundary: the cost is the range's
-  /// length times one window, not times itself, which is the same shape the
-  /// packing bound has. Probing instead would need `len_fn` to be monotone over
-  /// a growing prefix, and a BPE tokenizer is not.
-  fn split_chars(
-    text: &str,
-    start: usize,
-    end: usize,
-    window: usize,
-    len_fn: &dyn Fn(&str) -> usize,
-  ) -> Vec<Chunk> {
-    let mut out = Vec::new();
-    let mut seg_start = start;
-    for (i, ch) in text[start..end].char_indices() {
-      let abs = start + i;
-      let next = abs + ch.len_utf8();
-      // Close the current slice before the char that would overflow it, but only
-      // once it holds at least one char, so a single oversized char still emits.
-      if abs > seg_start && len_fn(&text[seg_start..next]) > window {
-        out.push(Chunk::new(seg_start, abs));
-        seg_start = abs;
+  /// The packer reads atoms by absolute index and probes backwards within the
+  /// chunk it has just closed, so that block must stay addressable; everything
+  /// before it is dropped as the packing advances. Peak occupancy is therefore
+  /// one chunk's worth of atoms rather than the whole input's — and one chunk's
+  /// worth is what producing even a single chunk costs.
+  struct AtomWindow<'a> {
+    atoms: Atoms<'a>,
+    buf: VecDeque<Chunk>,
+    /// The absolute index of `buf`'s front.
+    base: usize,
+  }
+
+  impl<'a> AtomWindow<'a> {
+    fn new(text: &'a str, window: usize, len_fn: &'a dyn Fn(&str) -> usize) -> Self {
+      Self {
+        atoms: Atoms::new(text, window, len_fn),
+        buf: VecDeque::new(),
+        base: 0,
       }
     }
-    if seg_start < end {
-      out.push(Chunk::new(seg_start, end));
+
+    /// The atom at absolute index `idx`, produced if it does not exist yet, or
+    /// `None` once the text has no atom there.
+    ///
+    /// Production stops at the first atom the caller does not ask for, which is
+    /// what keeps a capped packing from splitting text past its last chunk.
+    fn get(&mut self, idx: usize) -> Result<Option<Chunk>, WinditError> {
+      while self.base + self.buf.len() <= idx {
+        let Some(atom) = self.atoms.next()? else {
+          return Ok(None);
+        };
+        self
+          .buf
+          .try_reserve(1)
+          .map_err(|_| WinditError::AllocFailed {
+            elements: self.buf.len().saturating_add(1),
+          })?;
+        self.buf.push_back(atom);
+      }
+      Ok(Some(self.buf[idx - self.base]))
     }
-    out
+
+    /// The atom at absolute index `idx`, which must already have been produced
+    /// by [`get`](AtomWindow::get) and not yet discarded.
+    fn buffered(&self, idx: usize) -> Chunk {
+      self.buf[idx - self.base]
+    }
+
+    /// Drop every atom below absolute index `idx`.
+    fn discard_before(&mut self, idx: usize) {
+      // `idx` is the next chunk's first atom, always at least one past the
+      // current chunk's, so the subtraction is exact. Saturating keeps a future
+      // caller that moved it backwards from wrapping into a drain of everything
+      // buffered, and advancing `base` by what was dropped keeps the two
+      // consistent whatever it was handed.
+      let dropped = idx.saturating_sub(self.base);
+      self.buf.drain(..dropped);
+      self.base += dropped;
+    }
   }
 
-  /// Greedily pack `atoms` into chunks no longer than the window, repeating at
-  /// most `opts.overlap()` tokens' worth of trailing whole atoms between
-  /// consecutive chunks (the overlap is a token budget measured by `len_fn`, not
-  /// an atom count).
+  /// Push `value`, growing `out` fallibly.
   ///
-  /// `atoms` must be in order; each is assumed to fit the window on its own.
+  /// Neither the chunk count nor the atom count is known before packing runs, so
+  /// neither collection can be sized up front the way [`WindowPlan::spans`] sizes
+  /// its plan. `try_reserve` grows them amortized all the same, and — unlike
+  /// `push` — reports an allocator that refuses instead of aborting a call whose
+  /// signature promises a `Result`.
+  fn try_push<T>(out: &mut Vec<T>, value: T) -> Result<(), WinditError> {
+    out.try_reserve(1).map_err(|_| WinditError::AllocFailed {
+      elements: out.len().saturating_add(1),
+    })?;
+    out.push(value);
+    Ok(())
+  }
+
+  /// Greedily pack `text`'s atoms into chunks no longer than the window,
+  /// repeating at most `opts.overlap()` tokens' worth of trailing whole atoms
+  /// between consecutive chunks (the overlap is a token budget measured by
+  /// `len_fn`, not an atom count).
+  ///
+  /// Atoms arrive in input order, each already known to fit the window on its
+  /// own, and are produced only as this loop asks for them. Asking is what
+  /// splits the text, so the cap below bounds the tokenization rather than
+  /// merely reporting on it: the loop stops at the first chunk past the cap, and
+  /// no atom beyond that chunk is ever built.
   ///
   /// Every boundary emitted here is decided by a `len_fn` measurement of the
   /// exact contiguous text it delimits, never by adding up per-atom measurements:
@@ -396,11 +631,11 @@ const _: () = {
   /// interior positions of a bracket the search is narrowing.
   fn pack(
     text: &str,
-    atoms: &[Chunk],
     opts: &WindowOptions,
     len_fn: &dyn Fn(&str) -> usize,
   ) -> Result<Vec<Chunk>, WinditError> {
     let (window, overlap) = (opts.window(), opts.overlap());
+    let mut atoms = AtomWindow::new(text, window, len_fn);
     let mut chunks = Vec::new();
     let mut i = 0usize;
     // One atom past the end of the block the previous chunk's overlap probe
@@ -412,20 +647,22 @@ const _: () = {
     // the text alone, so re-measuring that identical range could only return
     // the same answer.
     let mut carried = 0usize;
-    while i < atoms.len() {
-      let chunk_start = atoms[i].start();
+    while let Some(first) = atoms.get(i)? {
+      let chunk_start = first.start();
       let mut j = if carried > i + 1 { carried } else { i + 1 };
-      let mut chunk_end = atoms[j - 1].end();
-      while j < atoms.len() {
-        let candidate_end = atoms[j].end();
-        if len_fn(&text[chunk_start..candidate_end]) <= window {
-          chunk_end = candidate_end;
-          j += 1;
-        } else {
-          break;
+      let mut chunk_end = atoms.buffered(j - 1).end();
+      let exhausted = loop {
+        let Some(atom) = atoms.get(j)? else {
+          break true;
+        };
+        let candidate_end = atom.end();
+        if len_fn(&text[chunk_start..candidate_end]) > window {
+          break false;
         }
-      }
-      chunks.push(Chunk::new(chunk_start, chunk_end));
+        chunk_end = candidate_end;
+        j += 1;
+      };
+      try_push(&mut chunks, Chunk::new(chunk_start, chunk_end))?;
       if let Some(max) = opts.max_windows() {
         if chunks.len() > max {
           return Err(WinditError::TooManyWindows {
@@ -434,16 +671,17 @@ const _: () = {
           });
         }
       }
-      if j >= atoms.len() {
+      if exhausted {
         break;
       }
       // Back up for the next chunk by TOKEN budget, not atom count: repeat as many
       // trailing whole atoms as fit in the overlap, but always advance at least
       // one atom so packing terminates. `i + 1` is that floor; `j` repeats nothing.
       let next = first_accepted(i + 1, j, |t| {
-        len_fn(&text[atoms[t].start()..chunk_end]) <= overlap
+        len_fn(&text[atoms.buffered(t).start()..chunk_end]) <= overlap
       });
       carried = if next < j { j } else { 0 };
+      atoms.discard_before(next);
       i = next;
     }
     Ok(chunks)
