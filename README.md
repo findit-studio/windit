@@ -153,10 +153,10 @@ struct FirstWindow;
 impl AggregatePolicy for FirstWindow {
     fn aggregate_values(
         &self,
-        embeddings: &[&[f32]],
+        embeddings: &[&[f64]],
         _coverages: &[f32],
         dim: usize,
-    ) -> Result<Vec<f32>, WinditError> {
+    ) -> Result<Vec<f64>, WinditError> {
         let first = embeddings.first().ok_or(WinditError::Empty)?;
         if first.len() != dim {
             return Err(WinditError::DimMismatch { got: first.len(), expected: dim });
@@ -167,11 +167,12 @@ impl AggregatePolicy for FirstWindow {
 ```
 
 The aggregate trait takes its compute scalar as a type parameter defaulting to
-`f32`, so it stays object-safe (`&dyn AggregatePolicy` is the `f32` policy
-object) while embedding reconstruction stays generic through the free
-`aggregate` function. The example above is `f32`-only because it leaves the
-parameter at its default; `impl<C: Real> AggregatePolicy<C> for FirstWindow`,
-with `&[&[C]]` and `Vec<C>`, serves every scalar instead.
+`f64` — the domain both shipped scalars compute in — so it stays object-safe
+(`&dyn AggregatePolicy` is the `f64` policy object) while embedding
+reconstruction stays generic through the free `aggregate` function. The example
+above serves the default `f64` domain by leaving the parameter off;
+`impl<C: Real> AggregatePolicy<C> for FirstWindow`, with `&[&[C]]` and `Vec<C>`,
+serves every compute scalar instead.
 
 ## Scalars
 

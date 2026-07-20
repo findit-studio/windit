@@ -15,6 +15,9 @@ use windit::prelude::*;
 /// for a real 384/512/768-dimension model embedding. Integration tests see only
 /// the public API, so the suite carries its own [`Vector`] implementor rather
 /// than reaching for the crate-internal test double.
+///
+/// It stores `f32` but computes in `f64` (`f32`'s compute type), so
+/// `from_unnormalized` takes `&[f64]` and narrows into storage.
 struct TestEmbedding(Vec<f32>);
 
 impl Vector for TestEmbedding {
@@ -24,15 +27,15 @@ impl Vector for TestEmbedding {
     &self.0
   }
 
-  fn from_unnormalized(v: &[f32]) -> Result<Self, WinditError> {
+  fn from_unnormalized(v: &[f64]) -> Result<Self, WinditError> {
     if v.is_empty() {
       return Err(WinditError::Empty);
     }
-    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
     if !norm.is_finite() || norm == 0.0 {
       return Err(WinditError::NonFinite);
     }
-    Ok(Self(v.iter().map(|x| x / norm).collect()))
+    Ok(Self(v.iter().map(|x| (x / norm) as f32).collect()))
   }
 }
 
@@ -107,8 +110,8 @@ fn run<E: Vector>(
 /// vector. The dimension is fixed at 4 across every case; window size is what
 /// varies.
 fn embed(span: &Span) -> TestEmbedding {
-  let base = (span.start() % 7) as f32 + 1.0;
-  let raw: Vec<f32> = (0..4).map(|i| base + i as f32 + 1.0).collect();
+  let base = (span.start() % 7) as f64 + 1.0;
+  let raw: Vec<f64> = (0..4).map(|i| base + f64::from(i) + 1.0).collect();
   TestEmbedding::from_unnormalized(&raw).expect("valid embedding")
 }
 
@@ -157,9 +160,11 @@ fn clap_sample_window() {
 
 #[test]
 fn dyn_policy_is_object_safe_at_both_scalars() {
-  // `AggregatePolicy` gained a compute-scalar type parameter, but it defaults to
-  // f32, so the bare `dyn` spellings that existed before must still compile
-  // verbatim — as a reference, as a box, and as a struct field.
+  // `AggregatePolicy` has a compute-scalar type parameter defaulting to `f64` —
+  // the domain both shipped scalars compute in — so the bare `dyn` spellings
+  // still compile verbatim, and now aggregate the ordinary `f32`-stored
+  // embedding (which computes in `f64`) directly, as a reference, a box, and a
+  // struct field.
   let by_ref: &dyn AggregatePolicy = &CoverageWeightedMean;
   let boxed: Box<dyn AggregatePolicy> = Box::new(MeanRenormalized);
 
@@ -179,8 +184,9 @@ fn dyn_policy_is_object_safe_at_both_scalars() {
     assert_unit_norm(&aggregate(policy, &windows).expect("aggregate"));
   }
 
-  // A non-default scalar names the parameter, and the trait stays object-safe
-  // there too.
+  // Naming the scalar explicitly (here `f64`, the default) compiles to the same
+  // object and drives an f64-stored embedding, so the trait stays object-safe
+  // whether the parameter is spelled or left off.
   let p64: Box<dyn AggregatePolicy<f64>> = Box::new(CoverageWeightedMean);
   let windows64: Vec<WindowEmbedding<TestEmbedding64>> = spans
     .iter()

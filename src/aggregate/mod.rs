@@ -32,38 +32,62 @@
 //!
 //! # Scale
 //!
-//! Every policy ends in an L2 renormalization, and the arithmetic can leave the
-//! scalar's range long before the vector does. A vector's squares go first:
-//! `[1e20_f32, 0.0]` squares to infinity and `[1e-30_f32, 0.0]` to zero, though
-//! both normalize to exactly `[1, 0]`. A vector's norm can follow while the unit
-//! vector stays ordinary: `[3e38_f32, 3e38]` has a norm of `sqrt(2) * 3e38`.
-//! None of that is a property of the vector, and none of it is grounds to reject
-//! one.
+//! Aggregation runs in [`ComputeOf<E>`](crate::windowed::ComputeOf), which is
+//! `f64` for both shipped scalars: an `f32` embedding widens to `f64` before a
+//! single value is folded. That is what disarms the whole class of magnitude
+//! hazard for `f32` inputs — every `f32` is exact in `f64`, every `f32`
+//! subnormal is a normal `f64`, and `f32::MAX` squared is ~1.2e77 against
+//! `f64`'s ~1.8e308 ceiling — so a sum that would have overflowed, flushed a
+//! subnormal, or lost a cancellation in `f32` does none of those here. No power
+//! of-two prescaling of the fold is applied, and none is needed.
 //!
-//! Every reduction here is therefore taken in a domain shifted by a power of
-//! two, chosen from the inputs' own exponents before any of them is folded.
-//! Scaling by a power of two moves the exponent and leaves the significand
-//! alone, so the shifted reduction is the unshifted one to the bit — same
-//! direction, same rounding — wherever the unshifted one was valid, and the
-//! shift divides back out of a renormalized result. What it buys is range: each
-//! shift is the one nearest zero that keeps every product, partial sum, and sum
-//! of squares clear of both ends of the scalar.
+//! Two hazards survive into `f64` itself, because `f64` is the widest domain
+//! there is, and both are handled where they arise rather than by a blanket
+//! shift:
+//!
+//! - **Cancellation across a wide exponent spread.** A weighted sum whose exact
+//!   value is zero can fold to an order-dependent non-zero residue once a small
+//!   term is absorbed into a large partial sum and the large term is later
+//!   subtracted away. The accumulation is therefore a compensated
+//!   (Neumaier's variant of Kahan-Babuška) sum: it carries the low-order bits every naive
+//!   fold discards, so an exactly cancelling sum lands at exactly zero
+//!   regardless of association order, and [`WinditError::NonFinite`] keeps
+//!   meaning "no direction" rather than "the fold happened to round to a
+//!   residue".
+//! - **A norm that is not representable although the vector is.**
+//!   `[f64::MAX, f64::MAX]` is an ordinary diagonal whose norm, `sqrt(2) *
+//!   f64::MAX`, overflows. The renormalization divides each component by its own
+//!   `2^exponent` power-of-two scale and by the scaled norm separately, so it
+//!   never forms that norm; dividing by a power of two is exact, so the quotient
+//!   is the direct `v_i / norm` to the bit wherever the direct computation was
+//!   valid. A vector's squares leaving the range (`[f64::MAX, 0.0]` squares to
+//!   infinity, `[f64::MIN_POSITIVE, 0.0]` to zero) is the same mechanism and the
+//!   same fix.
 //!
 //! There is no second attempt anywhere, which is what keeps
-//! [`WinditError::NonFinite`] meaning what it says: an all-zero vector, or a
-//! component that is itself not finite. A retry cannot tell those from a norm
-//! that merely overflowed, and a vector whose components cancel exactly is not a
-//! vector whose norm was unrepresentable — it is a vector with no direction.
-//! Because every scale is a power of two, a cancelling sum stays exactly zero
-//! and is rejected on the only path there is, rather than rounding to some
-//! arbitrary residue that normalizes to an arbitrary answer.
+//! [`WinditError::NonFinite`] meaning what it says: an all-zero (or exactly
+//! cancelling) vector, or a component that is itself not finite. A retry cannot
+//! tell those from a norm that merely overflowed, and a vector whose components
+//! cancel exactly is not a vector whose norm was unrepresentable — it is a
+//! vector with no direction.
+//!
+//! One magnitude window is irreducible, because `f64` is the widest domain there
+//! is. [`SaliencyWeighted`] weights each window by its L2 norm, so it forms the
+//! square of a magnitude where the other policies stay linear in it. Past about
+//! `1.3e154` (roughly `sqrt(f64::MAX)`) that square overflows, and below about
+//! `1.5e-162` it underflows to zero — and no power-of-two prescaling can pull
+//! either back without the subnormal-flushing fabrication a scaled fold
+//! reintroduces, so that one policy returns [`WinditError::NonFinite`] outside
+//! the window rather than invent a direction. The three linear policies have no
+//! such window, and every realistic embedding magnitude (unit-ish, and never
+//! past `~1e38`) sits more than a hundred orders of magnitude inside it.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
 //! [`Span`]: crate::plan::Span
 //! [`Span::coverage`]: crate::plan::Span::coverage
 
-use std::{vec, vec::Vec};
+use std::vec::Vec;
 
 use crate::{
   error::WinditError,
@@ -80,19 +104,20 @@ mod tests;
 /// object-safe (`&dyn AggregatePolicy` works). Embedding reconstruction lives in
 /// the generic free function [`aggregate`], not here.
 ///
-/// `C` is the compute scalar — the [`Real`] domain the math
-/// runs in — and defaults to `f32`. The default is what keeps `dyn
-/// AggregatePolicy` and `Box<dyn AggregatePolicy>` spelling the `f32` policy
-/// object; a policy used at another scalar names it, as in
-/// `Box<dyn AggregatePolicy<f64>>`. Note that trait objects are per-scalar: an
-/// `AggregatePolicy<f32>` object and an `AggregatePolicy<f64>` object are
-/// unrelated types and cannot share one collection.
+/// `C` is the compute scalar — the [`Real`] domain the math runs in — and
+/// defaults to `f64`. Because both shipped scalars compute in `f64` (an `f32`
+/// embedding widens to it), that default is the domain every built-in
+/// aggregation actually uses, and it keeps `dyn AggregatePolicy` and
+/// `Box<dyn AggregatePolicy>` spelling the object every ordinary embedding
+/// needs. A custom compute scalar names it, as in `Box<dyn AggregatePolicy<C>>`.
+/// Note that trait objects are per-scalar: two `AggregatePolicy` objects over
+/// different `C` are unrelated types and cannot share one collection.
 ///
 /// # Custom policies
 ///
 /// Implement [`aggregate_values`](AggregatePolicy::aggregate_values) to add a
-/// strategy. This one keeps the first window unchanged, and stays `f32`-only by
-/// leaving the type parameter at its default:
+/// strategy. This one keeps the first window unchanged, and serves the default
+/// `f64` compute domain by leaving the type parameter off:
 ///
 /// ```
 /// use windit::aggregate::AggregatePolicy;
@@ -103,10 +128,10 @@ mod tests;
 /// impl AggregatePolicy for FirstWindow {
 ///   fn aggregate_values(
 ///     &self,
-///     embeddings: &[&[f32]],
+///     embeddings: &[&[f64]],
 ///     _coverages: &[f32],
 ///     dim: usize,
-///   ) -> Result<Vec<f32>, WinditError> {
+///   ) -> Result<Vec<f64>, WinditError> {
 ///     let first = embeddings.first().ok_or(WinditError::Empty)?;
 ///     if first.len() != dim {
 ///       return Err(WinditError::DimMismatch { got: first.len(), expected: dim });
@@ -117,8 +142,8 @@ mod tests;
 /// ```
 ///
 /// Writing `impl<C: Real> AggregatePolicy<C> for FirstWindow` instead — with
-/// `&[&[C]]` and `Vec<C>` — makes the same policy serve every scalar.
-pub trait AggregatePolicy<C: Real = f32> {
+/// `&[&[C]]` and `Vec<C>` — makes the same policy serve every compute scalar.
+pub trait AggregatePolicy<C: Real = f64> {
   /// Combine `embeddings` (each a `dim`-length slice of the compute scalar)
   /// with their matching `coverages` into a single `dim`-length vector.
   ///
@@ -164,32 +189,72 @@ where
     return Err(WinditError::Empty);
   }
   let dim = windows[0].value.dim();
-  let mut coverages = Vec::with_capacity(windows.len());
+  let mut coverages = try_vec_with_capacity(windows.len())?;
   for w in windows {
     coverages.push(w.span.coverage());
   }
 
-  // Fast path: the stored scalar already is the compute scalar (true of every
-  // scalar this crate ships), so borrow the storage rather than widen it into
-  // fresh buffers. The collect short-circuits on the first `None`, making this
-  // one `Option` check per window — without it, every f32 aggregation would
-  // gain an allocation and a full copy.
-  let borrowed: Option<Vec<&[ComputeOf<E>]>> = windows
-    .iter()
-    .map(|w| <E::Scalar as Scalar>::as_compute_slice(w.value.as_slice()))
-    .collect();
+  // Fast path: borrow the storage when it already is the compute scalar (true of
+  // `f64` storage) rather than widen it into fresh buffers. `f32` storage
+  // computes in `f64`, so its `as_compute_slice` returns `None` and a single
+  // one sends the whole aggregation down the widening branch below.
+  let mut borrowed: Vec<&[ComputeOf<E>]> = try_vec_with_capacity(windows.len())?;
+  let mut all_borrowable = true;
+  for w in windows {
+    match <E::Scalar as Scalar>::as_compute_slice(w.value.as_slice()) {
+      Some(s) => borrowed.push(s),
+      None => {
+        all_borrowable = false;
+        break;
+      }
+    }
+  }
 
-  let raw = if let Some(embeddings) = borrowed {
-    policy.aggregate_values(&embeddings, &coverages, dim)?
+  let raw = if all_borrowable {
+    policy.aggregate_values(&borrowed, &coverages, dim)?
   } else {
-    let widened: Vec<Vec<ComputeOf<E>>> = windows
-      .iter()
-      .map(|w| w.value.as_slice().iter().map(|s| s.to_compute()).collect())
-      .collect();
-    let embeddings: Vec<&[ComputeOf<E>]> = widened.iter().map(Vec::as_slice).collect();
+    let mut widened: Vec<Vec<ComputeOf<E>>> = try_vec_with_capacity(windows.len())?;
+    for w in windows {
+      let stored = w.value.as_slice();
+      let mut col = try_vec_with_capacity(stored.len())?;
+      for s in stored {
+        col.push(s.to_compute());
+      }
+      widened.push(col);
+    }
+    let mut embeddings: Vec<&[ComputeOf<E>]> = try_vec_with_capacity(widened.len())?;
+    for col in &widened {
+      embeddings.push(col.as_slice());
+    }
     policy.aggregate_values(&embeddings, &coverages, dim)?
   };
   E::from_unnormalized(&raw)
+}
+
+/// A `Vec` that can hold `n` elements, or [`WinditError::AllocFailed`] when the
+/// allocator cannot (or refuses to) provide the space.
+///
+/// The fallible counterpart to `Vec::with_capacity` for the growing buffers on
+/// these `Result`-returning paths. Every buffer an aggregation grows is sized by
+/// the caller's window count or embedding dimension — counts that need not
+/// correspond to memory that exists — so a refused allocation must surface as a
+/// typed error rather than abort the process. `try_reserve_exact` because each
+/// buffer is then filled to exactly `n` and never grown again.
+fn try_vec_with_capacity<T>(n: usize) -> Result<Vec<T>, WinditError> {
+  let mut v = Vec::new();
+  v.try_reserve_exact(n)
+    .map_err(|_| WinditError::AllocFailed { elements: n })?;
+  Ok(v)
+}
+
+/// A `dim`-length vector of [`Real::ZERO`], or [`WinditError::AllocFailed`].
+///
+/// The accumulator every weighted sum folds into; [`try_vec_with_capacity`]
+/// reserves it and `resize` fills the reserved space without growing again.
+fn try_zeroed<C: Real>(dim: usize) -> Result<Vec<C>, WinditError> {
+  let mut v = try_vec_with_capacity(dim)?;
+  v.resize(dim, C::ZERO);
+  Ok(v)
 }
 
 /// The multi-vector path: return every window unchanged.
@@ -259,6 +324,14 @@ impl EmaRenormalized {
 /// ignored beyond the length check. This differs from the other strategies only
 /// when the inputs carry magnitude; [`aggregate`] feeds unit vectors, so use
 /// [`aggregate_values`](AggregatePolicy::aggregate_values) directly to exploit it.
+///
+/// Because it squares magnitudes (weight times component, and the weight is
+/// itself a norm), it is the one built-in with a bounded `f64` magnitude window:
+/// a component past about `sqrt(f64::MAX)` (`~1.3e154`) overflows and one below
+/// about `1.5e-162` underflows to zero, and either is rejected with
+/// [`WinditError::NonFinite`] rather than rescaled by the fabrication-prone shift
+/// that widening to `f64` exists to retire. Realistic magnitudes sit deep inside
+/// the window; see the module [Scale](self#scale) note.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SaliencyWeighted;
 
@@ -292,14 +365,16 @@ impl<C: Real> AggregatePolicy<C> for SaliencyWeighted {
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
     check_inputs(embeddings, coverages, dim)?;
-    // Materialized rather than recomputed inside the fold: `weighted_sum_renorm`
-    // reads each weight twice — once to size its shift, once to apply it — and a
-    // norm is a full pass over the window.
-    let shift = saliency_shift(embeddings, dim);
-    let weights: Vec<C> = embeddings
-      .iter()
-      .map(|emb| scaled_l2_norm(emb, shift))
-      .collect();
+    // Materialized rather than recomputed inside the fold: a norm is a full pass
+    // over a window, and `weighted_sum_renorm` reads each weight once per
+    // dimension. Each norm is taken against the window's own power-of-two scale
+    // ([`l2_norm`]), so a window whose norm is not representable still weighs in;
+    // the shared magnitude divides back out in the renormalization that ends the
+    // policy, leaving only the ratios a weight means here.
+    let mut weights = try_vec_with_capacity(embeddings.len())?;
+    for emb in embeddings {
+      weights.push(l2_norm(emb));
+    }
     weighted_sum_renorm(embeddings, coverages, dim, |i, _| weights[i])
   }
 }
@@ -324,21 +399,15 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     // f64 path gratuitously less accurate than its type promises.
     let alpha = C::from_f32(self.alpha);
     let complement = C::ONE - alpha;
-    let shift = ema_shift(embeddings);
-    let mut state = embeddings[0].to_vec();
-    if shift != 0 {
-      for s in &mut state {
-        *s = s.ldexp(shift);
-      }
-    }
-    // The shift rides on `alpha` rather than on each component: the state is
-    // already in the shifted domain, so `(alpha * 2^s) * e` is the incoming term
-    // scaled to match. At the ordinary `shift == 0` this is `alpha` itself and
-    // the fold is unchanged.
-    let scaled_alpha = alpha.ldexp(shift);
+    let mut state = try_vec_with_capacity(embeddings[0].len())?;
+    state.extend_from_slice(embeddings[0]);
+    // No prescaling of the state: computing in f64 keeps `alpha * e` exact for
+    // every f32-derived subnormal (`0.5 * f32::from_bits(1)` is `2^-150`, a
+    // normal f64), so the convex step never flushes the small component a
+    // power-of-two shift used to discard by pushing it below the subnormal floor.
     for emb in &embeddings[1..] {
       for (s, &e) in state.iter_mut().zip(emb.iter()) {
-        *s = scaled_alpha * e + complement * *s;
+        *s = alpha * e + complement * *s;
       }
     }
     l2_renorm(&mut state)?;
@@ -417,11 +486,14 @@ fn check_inputs<C: Real>(
 
 /// Accumulate `sum_i weight(i, emb_i) * emb_i` and L2-renormalize it.
 ///
-/// One pass, no retry. The power-of-two shift that keeps the accumulation in
-/// range is chosen from the inputs before any of them is folded, so there is no
-/// failure to recover from and nothing to recompute a second way. An
-/// accumulator that lands on the zero vector landed there because the inputs
-/// cancel, and [`l2_renorm`] says so.
+/// One pass, no retry, no prescaling: the compute scalar is `f64` (an `f32`
+/// embedding widened before this ran), which has the range to fold every `f32`
+/// derived product without overflow or underflow. The sum is *compensated*
+/// (Neumaier), so a wide exponent spread cannot fabricate a direction out of a
+/// sum that exactly cancels: the low-order bits a naive fold would drop when a
+/// small term meets a large partial sum are carried and added back, leaving an
+/// exactly cancelling accumulation at exactly zero for [`l2_renorm`] to reject
+/// as the directionless vector it is, whatever order the windows fold in.
 fn weighted_sum_renorm<C: Real>(
   embeddings: &[&[C]],
   coverages: &[f32],
@@ -429,124 +501,41 @@ fn weighted_sum_renorm<C: Real>(
   weight: impl Fn(usize, &[C]) -> C,
 ) -> Result<Vec<C>, WinditError> {
   // `dim` is caller-supplied, but this has just proved it is the length of an
-  // embedding that exists, so the accumulator below is bounded by real data.
+  // embedding that exists, so the accumulators below are bounded by real data.
   check_inputs(embeddings, coverages, dim)?;
-  let shift = accumulation_shift(embeddings, &weight);
-  let mut acc = vec![C::ZERO; dim];
+  let mut acc = try_zeroed(dim)?;
+  // The running Neumaier compensation, one term per dimension: the sum of the
+  // low-order bits `acc` could not hold as it grew.
+  let mut comp = try_zeroed::<C>(dim)?;
   for (i, emb) in embeddings.iter().enumerate() {
-    // The whole shift rides on the weight: `(w * 2^s) * e` and `w * (e * 2^s)`
-    // are the same number, and applying it once per window rather than once per
-    // component leaves the inner loop the plain multiply-accumulate it was.
-    let w = weight(i, emb).ldexp(shift);
-    for (a, &e) in acc.iter_mut().zip(emb.iter()) {
-      *a = *a + w * e;
+    let w = weight(i, emb);
+    for ((a, c), &e) in acc.iter_mut().zip(comp.iter_mut()).zip(emb.iter()) {
+      neumaier_add(a, c, w * e);
     }
+  }
+  for (a, &c) in acc.iter_mut().zip(comp.iter()) {
+    *a = *a + c;
   }
   l2_renorm(&mut acc)?;
   Ok(acc)
 }
 
-/// The power-of-two exponent to fold into every weight so that
-/// `sum_i w_i * emb_ij` neither overflows nor is flushed to zero.
+/// Add `term` into the running sum `acc` with Neumaier compensation `comp`.
 ///
-/// Zero — the ordinary case, and every case whose direct fold was already in
-/// range — leaves the accumulation exactly the fold it has always been. Both
-/// bounds are deliberately tight rather than normalizing: `[[1e30], [-1e30],
-/// [1e-30]]` spans the f32 range internally and is shifted by nothing, so the
-/// `1e-30` that survives the cancellation survives here too. A shift that always
-/// brought the largest product to one would flush it away and report a zero
-/// vector for a sequence that has a direction.
-fn accumulation_shift<C: Real>(embeddings: &[&[C]], weight: &impl Fn(usize, &[C]) -> C) -> i32 {
-  let mut w_max = C::ZERO;
-  let mut e_max = C::ZERO;
-  for (i, emb) in embeddings.iter().enumerate() {
-    let w = weight(i, emb).abs();
-    if w > w_max {
-      w_max = w;
-    }
-    let m = max_magnitude(emb);
-    if m > e_max {
-      e_max = m;
-    }
-  }
-  // Nothing a shift can do: a zero on either side makes the accumulator the zero
-  // vector and a non-finite one makes it non-finite, and `l2_renorm` rejects
-  // both. A NaN never becomes a maximum, so it leaves these bounds finite and
-  // reaches that same rejection through the fold instead.
-  if w_max == C::ZERO || e_max == C::ZERO || !w_max.is_finite() || !e_max.is_finite() {
-    return 0;
-  }
-  let product = w_max.exponent() + e_max.exponent();
-  // `|acc_j| <= count * w_max * e_max`, and each factor is under twice its own
-  // power of two, so the accumulation stays under `2^(product + count_bits + 2)`.
-  // Holding that a binade below `2^MAX_EXP` — the first power of two the scalar
-  // cannot represent — keeps every product and every partial sum finite.
-  let count_bits = (usize::BITS - embeddings.len().leading_zeros()) as i32;
-  let highest = C::MAX_EXP - 3 - count_bits - product;
-  // At the other end the largest product must stay normal, or an accumulation of
-  // uniformly tiny magnitudes — `1e-30_f32` weighted by its own norm — underflows
-  // to the zero vector that means "no direction".
-  let lowest = (C::MIN_EXP - 1) - product;
-  // `highest - lowest` is `MAX_EXP - MIN_EXP - 2 - count_bits`, positive at both
-  // scalars for every count a slice can hold, so this is the value nearest zero
-  // within a range that is never empty.
-  lowest.max(0).min(highest)
-}
-
-/// The power-of-two exponent an EMA folds its state in.
-///
-/// Non-zero only when every component is subnormal, and then only by enough to
-/// make the largest of them normal. `alpha * e` halves a subnormal toward zero —
-/// `0.5 * f32::from_bits(1)` rounds to nothing — so a state assembled from such
-/// components flushes to the zero vector and is reported as a direction that
-/// does not exist. A convex combination never grows past its largest input, so
-/// there is nothing to shift down and no overflow to guard; ordinary magnitudes
-/// shift by nothing and fold exactly as they did.
-fn ema_shift<C: Real>(embeddings: &[&[C]]) -> i32 {
-  let mut e_max = C::ZERO;
-  for emb in embeddings {
-    let m = max_magnitude(emb);
-    if m > e_max {
-      e_max = m;
-    }
-  }
-  if e_max == C::ZERO || !e_max.is_finite() {
-    return 0;
-  }
-  ((C::MIN_EXP - 1) - e_max.exponent()).max(0)
-}
-
-/// The power-of-two exponent every saliency weight is scaled by, so that no
-/// window's norm has to be representable on its own.
-///
-/// `[3e38_f32, 3e38]` is a finite vector with an infinite norm. Weighting by
-/// that infinity and then dividing it back out gives NaN, which is how the one
-/// policy that reads magnitudes came to reject vectors every other policy
-/// normalized. Scaling every norm by one shared exact factor keeps them in range
-/// and leaves their ratios — the only thing a weight means here — untouched; the
-/// common factor divides out again in the renormalization that ends the policy.
-/// Zero, the ordinary case, leaves each weight the window's own L2 norm.
-fn saliency_shift<C: Real>(embeddings: &[&[C]], dim: usize) -> i32 {
-  let mut e_max = C::ZERO;
-  for emb in embeddings {
-    let m = max_magnitude(emb);
-    if m > e_max {
-      e_max = m;
-    }
-  }
-  if e_max == C::ZERO || !e_max.is_finite() {
-    return 0;
-  }
-  // A norm is under `2 * sqrt(dim)` times its vector's largest component, so it
-  // lands under `2^(exponent + 2 + dim_bits / 2)`. Halved as an unsigned count
-  // because `i32::div_ceil` is not stable at this crate's MSRV.
-  let dim_bits = usize::BITS - dim.leading_zeros();
-  let excess = e_max.exponent() + 2 + dim_bits.div_ceil(2) as i32 - C::MAX_EXP;
-  if excess > 0 {
-    -excess
-  } else {
-    0
-  }
+/// The correction is `(larger - new_sum) + smaller`: the part of the smaller
+/// magnitude that `new_sum` could not represent, which is exactly what a naive
+/// `acc + term` discards. Accumulated into `comp` and folded back once at the
+/// end, it makes the total independent of association order — so an exactly
+/// cancelling set of terms totals exactly zero however the windows are ordered.
+fn neumaier_add<C: Real>(acc: &mut C, comp: &mut C, term: C) {
+  let sum = *acc + term;
+  *comp = *comp
+    + if acc.abs() >= term.abs() {
+      (*acc - sum) + term
+    } else {
+      (term - sum) + *acc
+    };
+  *acc = sum;
 }
 
 /// The largest absolute component of `v`, or `ZERO` for an empty one.
@@ -600,25 +589,28 @@ fn scaled_sum_of_squares<C: Real>(v: &[C], exp: i32) -> C {
   sum
 }
 
-/// The L2 norm of `v`, scaled by `2^shift`, via [`Real::sqrt`] (core has no
-/// `f32::sqrt`).
+/// The L2 norm of `v`, via [`Real::sqrt`] (core has no `f32::sqrt`).
 ///
 /// Taken against `v`'s own power-of-two scale and shifted back afterwards, so
-/// the sum of squares never leaves the scalar. At `shift == 0` the result is
-/// `sqrt(sum(v_i^2))` to the bit wherever that direct computation was valid, and
-/// the vector's actual norm wherever it was not.
+/// the sum of squares never leaves the compute scalar even when the norm itself
+/// would: `[f64::MAX, f64::MAX]` has norm `sqrt(2) * f64::MAX`, which overflows,
+/// yet this returns it (as an overflow to infinity) rather than by squaring into
+/// one. The result is `sqrt(sum(v_i^2))` to the bit wherever that direct
+/// computation was valid, and the vector's actual norm wherever it was not.
 ///
-/// `shift` exists because a norm can be unrepresentable although every component
-/// is ordinary; see [`saliency_shift`], its only caller.
+/// [`SaliencyWeighted`] weights each window by this, so a window whose norm is
+/// unrepresentable still contributes its direction: the shared magnitude divides
+/// back out in the final renormalization, and only the ratios between norms —
+/// what the weighting means — survive.
 ///
 /// A vector with no scale returns its own largest magnitude: zero when it is all
 /// zero, and the non-finite component itself when one is infinite. Each is
 /// already the weight — and then the accumulator — that the caller must reject.
-fn scaled_l2_norm<C: Real>(v: &[C], shift: i32) -> C {
+fn l2_norm<C: Real>(v: &[C]) -> C {
   let Some(exp) = scale_exponent(v) else {
     return max_magnitude(v);
   };
-  scaled_sum_of_squares(v, exp).sqrt().ldexp(exp + shift)
+  scaled_sum_of_squares(v, exp).sqrt().ldexp(exp)
 }
 
 /// Normalize `v` to unit L2 length in place.
@@ -637,8 +629,8 @@ fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
   let scale = C::ONE.ldexp(exp);
   // `unit` is the norm divided by `scale`, which puts it in [1, 2*sqrt(len)]:
   // always representable, and always at least one, even for a vector whose norm
-  // is not representable at all (`[3e38_f32, 3e38]`). Dividing by `scale` and by
-  // `unit` separately is what avoids ever forming that norm. Both divisors are
+  // is not representable at all (`[f64::MAX, f64::MAX]`). Dividing by `scale` and
+  // by `unit` separately is what avoids ever forming that norm. Both divisors are
   // exact power-of-two relatives of the direct computation's, so the quotient is
   // `v_i / norm` to the bit wherever the direct computation was valid.
   let unit = scaled_sum_of_squares(v, exp).sqrt();

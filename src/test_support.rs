@@ -3,10 +3,11 @@
 //! Two embedding doubles and one float-closeness assertion ([`assert_close`])
 //! serve every module's `tests.rs`, so the crate carries its test [`Vector`]
 //! implementations in one place instead of redefining them per module.
-//! [`TestVec`] is the ordinary f32 embedding; [`TestQuantVec`] stores a narrower
-//! scalar than it computes in, which is the only way to reach `aggregate`'s
-//! widening path. No helper needs `std`: they normalize through `libm::sqrtf`
-//! and avoid the std-only float methods.
+//! [`TestVec`] is the ordinary f32 embedding — which now computes in `f64`, so
+//! its `from_unnormalized` takes `&[f64]` and narrows on the way into storage;
+//! [`TestQuantVec`] stores an integer scalar narrower still. No helper needs
+//! `std`: they normalize through `libm::sqrt` and avoid the std-only float
+//! methods.
 
 use std::vec::Vec;
 
@@ -18,8 +19,10 @@ use crate::{
 
 /// A minimal embedding double that L2-normalizes on construction.
 ///
-/// `from_unnormalized` divides by the L2 norm (via `libm::sqrtf`), rejecting an
-/// empty slice with [`WinditError::Empty`] and a zero or non-finite norm with
+/// It stores `f32` but computes in `f64` (`f32`'s compute type), so
+/// `from_unnormalized` takes `&[f64]`, normalizes there, and narrows each
+/// component to `f32` on the way into storage. It rejects an empty slice with
+/// [`WinditError::Empty`] and a zero or non-finite norm with
 /// [`WinditError::NonFinite`].
 pub(crate) struct TestVec(pub(crate) Vec<f32>);
 
@@ -30,15 +33,15 @@ impl Vector for TestVec {
     &self.0
   }
 
-  fn from_unnormalized(v: &[f32]) -> Result<Self, WinditError> {
+  fn from_unnormalized(v: &[f64]) -> Result<Self, WinditError> {
     if v.is_empty() {
       return Err(WinditError::Empty);
     }
-    let norm = libm::sqrtf(v.iter().map(|x| x * x).sum::<f32>());
+    let norm = libm::sqrt(v.iter().map(|x| x * x).sum::<f64>());
     if !norm.is_finite() || norm == 0.0 {
       return Err(WinditError::NonFinite);
     }
-    Ok(Self(v.iter().map(|x| x / norm).collect()))
+    Ok(Self(v.iter().map(|x| (x / norm) as f32).collect()))
   }
 }
 
@@ -64,14 +67,14 @@ impl Vector for TestQuantVec {
     if v.is_empty() {
       return Err(WinditError::Empty);
     }
-    let norm = libm::sqrtf(v.iter().map(|x| x * x).sum::<f32>());
+    let norm = libm::sqrt(v.iter().map(|x| x * x).sum::<f64>());
     if !norm.is_finite() || norm == 0.0 {
       return Err(WinditError::NonFinite);
     }
     Ok(Self(
       v.iter()
         .map(|x| {
-          let scaled = libm::roundf(x / norm * 127.0);
+          let scaled = libm::round(x / norm * 127.0);
           TestQuant(scaled.clamp(-127.0, 127.0) as i8)
         })
         .collect(),
