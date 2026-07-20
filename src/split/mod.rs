@@ -7,10 +7,10 @@
 //!
 //! `ContentAware` (feature `text`) is the tokenizer-free string chunker: it
 //! packs text into chunks that respect paragraph, sentence, and word boundaries,
-//! measuring length through a caller-supplied `len_fn` so the caller's own
-//! tokenizer defines "how long". It is a separate surface from `SplitPolicy`
-//! because it returns `Chunk`s — half-open UTF-8 byte ranges — rather than
-//! element `Span`s.
+//! measuring length through a caller-supplied `MeasureText` — any
+//! `Fn(&str) -> usize` closure — so the caller's own tokenizer defines "how
+//! long". It is a separate surface from `SplitPolicy` because it returns
+//! `Chunk`s — half-open UTF-8 byte ranges — rather than element `Span`s.
 
 use std::vec::Vec;
 
@@ -69,18 +69,82 @@ pub struct Chunk {
   end: usize,
 }
 
+/// Measures text length in the caller's own units, with a bounded query that
+/// may stop early (feature `text`).
+///
+/// [`ContentAware`] measures every candidate range through this trait, so the
+/// caller defines what a "token" is — a word count, a tokenizer's id count, code
+/// points — without this crate depending on a tokenizer. Every
+/// `Fn(&str) -> usize` closure implements it through a blanket impl, so an
+/// ordinary caller writes a closure and nothing else; a tokenizer that wants to
+/// bound its work on untrusted input implements the trait directly.
+///
+/// # Bounding untrusted input
+///
+/// [`measure`](MeasureText::measure) measures a whole string and must run to
+/// completion, so on untrusted input it scans the entire text before the chunker
+/// can decide anything — including before [`WindowOptions::max_windows`] can
+/// reject it. [`measure_within`](MeasureText::measure_within) is the query the
+/// chunker actually makes: it may stop as soon as the count is known to exceed a
+/// `limit`, so a range many times longer than a window is rejected after
+/// measuring only about a window's worth of it. A measurer that counts
+/// incrementally overrides it to gain that bound; the blanket closure impl
+/// cannot, and falls back to a full [`measure`](MeasureText::measure).
+#[cfg(feature = "text")]
+#[cfg_attr(docsrs, doc(cfg(feature = "text")))]
+pub trait MeasureText {
+  /// Measure the whole of `text`, in the caller's units.
+  fn measure(&self, text: &str) -> usize;
+
+  /// Measure `text` only far enough to compare it against `limit`: return
+  /// `Some(n)` with `n` equal to [`measure`](MeasureText::measure) when that
+  /// count is at most `limit`, and `None` as soon as it is known to exceed
+  /// `limit`.
+  ///
+  /// The chunker asks this instead of [`measure`](MeasureText::measure) so a
+  /// range far longer than a window is not scanned in full merely to learn it
+  /// does not fit. An implementation that can count incrementally should stop at
+  /// the first unit past `limit` and return `None`; the default runs a full
+  /// [`measure`](MeasureText::measure) and then compares, which is correct but
+  /// unbounded — overriding it is what lets a large untrusted input be rejected
+  /// cheaply.
+  ///
+  /// An override must agree with [`measure`](MeasureText::measure): return
+  /// `Some(self.measure(text))` exactly when that value is `<= limit`, and
+  /// `None` otherwise. The chunker relies on this equivalence to place the same
+  /// boundaries a full measure would, so a disagreeing override moves chunk
+  /// boundaries rather than merely changing cost.
+  fn measure_within(&self, text: &str, limit: usize) -> Option<usize> {
+    let measured = self.measure(text);
+    (measured <= limit).then_some(measured)
+  }
+}
+
+/// Every `Fn(&str) -> usize` closure is a [`MeasureText`], measured in full with
+/// no early stop, so an ordinary caller supplies a closure without writing a
+/// trait impl. `?Sized` is not needed: closures and function pointers are
+/// `Sized`, and a pre-erased `&dyn Fn(&str) -> usize` cannot coerce to
+/// `&dyn MeasureText` regardless.
+#[cfg(feature = "text")]
+impl<F: Fn(&str) -> usize> MeasureText for F {
+  fn measure(&self, text: &str) -> usize {
+    self(text)
+  }
+}
+
 /// A tokenizer-free, content-aware string chunker (feature `text`).
 ///
 /// [`chunk`](ContentAware::chunk) splits text on recursive boundaries —
 /// paragraphs (`\n\n`), then sentences, then words — and greedily packs the
 /// pieces into chunks no longer than [`WindowOptions::window`], as measured by
-/// the caller's `len_fn`. Because length is whatever `len_fn` returns, the caller
-/// supplies its own notion of a token (word count, a tokenizer's id count, code
-/// points) without this crate depending on a tokenizer.
+/// the caller's [`MeasureText`]. Because length is whatever that measurer
+/// reports, the caller supplies its own notion of a token (word count, a
+/// tokenizer's id count, code points) without this crate depending on a
+/// tokenizer.
 #[cfg(feature = "text")]
 #[derive(Clone, Copy)]
 pub struct ContentAware<'a> {
-  len_fn: &'a dyn Fn(&str) -> usize,
+  measurer: &'a dyn MeasureText,
 }
 
 #[cfg(feature = "text")]
@@ -167,35 +231,36 @@ const _: () = {
   }
 
   impl<'a> ContentAware<'a> {
-    /// A chunker that measures text length with `len_fn`.
+    /// A chunker that measures text length with `measurer`.
     ///
-    /// [`chunk`](ContentAware::chunk) guarantees every returned chunk measures
-    /// at most the window under this function, save for a single `char` that
-    /// alone exceeds the window (it cannot be split further).
+    /// `measurer` is any [`MeasureText`], which every `Fn(&str) -> usize`
+    /// closure implements, so passing `&|s: &str| s.split_whitespace().count()`
+    /// is a whitespace-word chunker. [`chunk`](ContentAware::chunk) guarantees
+    /// every returned chunk measures at most the window under it, save for a
+    /// single `char` that alone exceeds the window (it cannot be split further).
     #[must_use]
-    pub const fn new(len_fn: &'a dyn Fn(&str) -> usize) -> Self {
-      Self { len_fn }
+    pub const fn new(measurer: &'a dyn MeasureText) -> Self {
+      Self { measurer }
     }
 
-    /// The caller-supplied length function, in whose units the window is
-    /// measured.
-    // No `#[must_use]`: the `Fn` trait object already carries one.
-    pub const fn len_fn(&self) -> &'a dyn Fn(&str) -> usize {
-      self.len_fn
+    /// The caller-supplied measurer, in whose units the window is measured.
+    #[must_use]
+    pub const fn measurer(&self) -> &'a dyn MeasureText {
+      self.measurer
     }
 
     /// Chunk `text` into [`Chunk`]s, each measuring at most
-    /// [`WindowOptions::window`] under `len_fn`.
+    /// [`WindowOptions::window`] under the [`MeasureText`].
     ///
     /// Each returned [`Chunk`] falls on `char` boundaries, so
     /// [`Chunk::as_str`] applied to this same `text` never returns `None`.
     /// Boundaries are preferred coarse-to-fine: a paragraph, sentence, or word
     /// that fits is kept whole, and only a unit that overflows the window on
     /// its own is split further — a long sentence into words, a long word
-    /// into `len_fn`-measured character slices. Chunks are packed greedily;
+    /// into measured character slices. Chunks are packed greedily;
     /// when [`WindowOptions::overlap`] is non-zero, consecutive chunks repeat
     /// at most that many trailing tokens' worth of whole boundary units (as
-    /// measured by `len_fn`).
+    /// measured over the exact repeated text).
     ///
     /// Chunks cover the tokenized content in order; inter-token whitespace
     /// falls inside a chunk's range but is never a chunk of its own. An empty
@@ -209,18 +274,28 @@ const _: () = {
     ///
     /// # Cost
     ///
-    /// `len_fn` is called `O(a log a)` times for `a` atoms, each call measuring
-    /// at most one window's worth of text: the packing never re-measures a range
-    /// whose measure it already knows, and it locates each overlap boundary by
-    /// probing rather than by walking one atom at a time.
+    /// Length is queried through [`MeasureText::measure_within`], `O(a log a)`
+    /// times for `a` atoms: the packing never re-measures a range whose measure
+    /// it already knows, and it locates each overlap boundary by probing rather
+    /// than by walking one atom at a time.
     ///
     /// `a` counts the atoms the emitted chunks are built from, not the atoms the
     /// whole text contains. Atoms are produced on demand and packed as they are
-    /// produced, so [`WindowOptions::max_windows`] bounds the tokenization and
-    /// the memory as well as the chunk count: a capped chunking stops at the
-    /// first chunk past the cap and never splits the text beyond it. Peak memory
-    /// is one chunk's worth of atoms — the block the overlap search probes
-    /// backwards through — plus the chunks emitted so far.
+    /// produced, so [`WindowOptions::max_windows`] bounds the number of atoms
+    /// produced, and the memory, as well as the chunk count: a capped chunking
+    /// stops at the first chunk past the cap and never splits the text beyond it.
+    /// Peak memory is one chunk's worth of atoms — the block the overlap search
+    /// probes backwards through — plus the chunks emitted so far.
+    ///
+    /// Whether the cap also bounds the *measurement* is up to the measurer. Each
+    /// descent level, down to the first atom, measures its whole range once, and
+    /// the first such range is the entire input. A measurer whose
+    /// [`measure_within`](MeasureText::measure_within) stops early reads only
+    /// about a window of any such range, so that measurement costs a window, not
+    /// the input length. A plain `Fn(&str) -> usize` closure cannot stop early
+    /// and measures each range in full, so an untrusted input is still scanned a
+    /// few times — once per descent level above the first atom — even under a
+    /// cap of zero; implement [`MeasureText`] with an early stop to bound that.
     ///
     /// # Errors
     ///
@@ -253,7 +328,7 @@ const _: () = {
     /// ```
     pub fn chunk(&self, text: &str, opts: &WindowOptions) -> Result<Vec<Chunk>, WinditError> {
       opts.validate()?;
-      pack(text, opts, self.len_fn)
+      pack(text, opts, self.measurer)
     }
   }
 
@@ -319,13 +394,13 @@ const _: () = {
   impl Frame<'_> {
     /// Advance to this level's next range, without descending into it.
     ///
-    /// The `Chars` arm is the crate's other `len_fn` walk over a growing
+    /// The `Chars` arm is the crate's other measurement walk over a growing
     /// substring, and it is left as a walk deliberately. Each slice is measured
     /// from its own start, so the measurement resets at every emitted boundary:
     /// the cost is the range's length times one window, not times itself, which
-    /// is the same shape the packing bound has. Probing instead would need
-    /// `len_fn` to be monotone over a growing prefix, and a BPE tokenizer is not.
-    fn advance(&mut self, text: &str, window: usize, len_fn: &dyn Fn(&str) -> usize) -> Step {
+    /// is the same shape the packing bound has. Probing instead would need the
+    /// measure to be monotone over a growing prefix, and a BPE tokenizer is not.
+    fn advance(&mut self, text: &str, window: usize, measurer: &dyn MeasureText) -> Step {
       match self {
         Self::Paragraphs { cursor, end, done } => {
           if *done {
@@ -380,7 +455,11 @@ const _: () = {
             // Close the current slice before the char that would overflow it, but
             // only once it holds at least one char, so a single oversized char
             // still emits.
-            if abs > *seg_start && len_fn(&text[*seg_start..next]) > window {
+            if abs > *seg_start
+              && measurer
+                .measure_within(&text[*seg_start..next], window)
+                .is_none()
+            {
               let atom = Chunk::new(*seg_start, abs);
               *seg_start = abs;
               return Step::Atom(atom);
@@ -408,12 +487,12 @@ const _: () = {
   /// unmeasured.
   ///
   /// Which ranges are visited, and in what order, is unchanged — so is the
-  /// `len_fn` call that each visit makes. An uncapped chunking therefore returns
+  /// measurement that each visit makes. An uncapped chunking therefore returns
   /// the same chunks at the same cost as the recursion did.
   struct Atoms<'a> {
     text: &'a str,
     window: usize,
-    len_fn: &'a dyn Fn(&str) -> usize,
+    measurer: &'a dyn MeasureText,
     /// The whole-input descent, held until the first `next` so that construction
     /// stays infallible.
     root: Option<(usize, usize)>,
@@ -421,11 +500,11 @@ const _: () = {
   }
 
   impl<'a> Atoms<'a> {
-    fn new(text: &'a str, window: usize, len_fn: &'a dyn Fn(&str) -> usize) -> Self {
+    fn new(text: &'a str, window: usize, measurer: &'a dyn MeasureText) -> Self {
       Self {
         text,
         window,
-        len_fn,
+        measurer,
         root: Some((0, text.len())),
         stack: Vec::new(),
       }
@@ -444,10 +523,10 @@ const _: () = {
           return Ok(Some(atom));
         }
       }
-      let (text, window, len_fn) = (self.text, self.window, self.len_fn);
+      let (text, window, measurer) = (self.text, self.window, self.measurer);
       loop {
         let step = match self.stack.last_mut() {
-          Some(frame) => frame.advance(text, window, len_fn),
+          Some(frame) => frame.advance(text, window, measurer),
           None => return Ok(None),
         };
         match step {
@@ -481,7 +560,15 @@ const _: () = {
       if text[start..end].trim().is_empty() {
         return Ok(None);
       }
-      if (self.len_fn)(&text[start..end]) <= self.window {
+      // The measurement that ends the descent's unbounded parent scan: a range
+      // far longer than the window — the whole input, at the first `next` — is
+      // only measured far enough to learn it does not fit, so an early-stopping
+      // measurer reads about a window of it rather than all of it.
+      if self
+        .measurer
+        .measure_within(&text[start..end], self.window)
+        .is_some()
+      {
         return Ok(Some(Chunk::new(start, end)));
       }
       let frame = match level {
@@ -518,7 +605,11 @@ const _: () = {
     /// Take one Unicode word whole when it fits the window, and otherwise
     /// suspend the `char`-aligned fallback over it.
     fn word(&mut self, start: usize, end: usize) -> Result<Option<Chunk>, WinditError> {
-      if (self.len_fn)(&self.text[start..end]) <= self.window {
+      if self
+        .measurer
+        .measure_within(&self.text[start..end], self.window)
+        .is_some()
+      {
         return Ok(Some(Chunk::new(start, end)));
       }
       try_push(
@@ -548,9 +639,9 @@ const _: () = {
   }
 
   impl<'a> AtomWindow<'a> {
-    fn new(text: &'a str, window: usize, len_fn: &'a dyn Fn(&str) -> usize) -> Self {
+    fn new(text: &'a str, window: usize, measurer: &'a dyn MeasureText) -> Self {
       Self {
-        atoms: Atoms::new(text, window, len_fn),
+        atoms: Atoms::new(text, window, measurer),
         buf: VecDeque::new(),
         base: 0,
       }
@@ -613,8 +704,8 @@ const _: () = {
 
   /// Greedily pack `text`'s atoms into chunks no longer than the window,
   /// repeating at most `opts.overlap()` tokens' worth of trailing whole atoms
-  /// between consecutive chunks (the overlap is a token budget measured by
-  /// `len_fn`, not an atom count).
+  /// between consecutive chunks (the overlap is a token budget measured over the
+  /// exact repeated text, not an atom count).
   ///
   /// Atoms arrive in input order, each already known to fit the window on its
   /// own, and are produced only as this loop asks for them. Asking is what
@@ -622,20 +713,24 @@ const _: () = {
   /// merely reporting on it: the loop stops at the first chunk past the cap, and
   /// no atom beyond that chunk is ever built.
   ///
-  /// Every boundary emitted here is decided by a `len_fn` measurement of the
-  /// exact contiguous text it delimits, never by adding up per-atom measurements:
-  /// a BPE or wordpiece tokenizer is not additive, so `len_fn("a b")` is not
-  /// generally `len_fn("a") + len_fn("b")` and a per-atom cache would silently
-  /// move chunk boundaries. What the two searches drop is only measurement that
-  /// cannot change an answer — a range whose measure is already known, and
-  /// interior positions of a bracket the search is narrowing.
+  /// Every boundary emitted here is decided by measuring the exact contiguous
+  /// text it delimits, never by adding up per-atom measurements: a BPE or
+  /// wordpiece tokenizer is not additive, so measuring `"a b"` is not generally
+  /// measuring `"a"` plus measuring `"b"`, and a per-atom cache would silently
+  /// move chunk boundaries. Each threshold check is a
+  /// [`MeasureText::measure_within`] over that exact range, so the measurer may
+  /// stop early without changing which boundary is chosen — the answer turns
+  /// only on whether the range fits, which is what `measure_within` reports.
+  /// What the two searches drop is only measurement that cannot change an answer
+  /// — a range whose measure is already known, and interior positions of a
+  /// bracket the search is narrowing.
   fn pack(
     text: &str,
     opts: &WindowOptions,
-    len_fn: &dyn Fn(&str) -> usize,
+    measurer: &dyn MeasureText,
   ) -> Result<Vec<Chunk>, WinditError> {
     let (window, overlap) = (opts.window(), opts.overlap());
-    let mut atoms = AtomWindow::new(text, window, len_fn);
+    let mut atoms = AtomWindow::new(text, window, measurer);
     let mut chunks = Vec::new();
     let mut i = 0usize;
     // One atom past the end of the block the previous chunk's overlap probe
@@ -643,8 +738,8 @@ const _: () = {
     // probe measured `text[atoms[i].start()..atoms[carried - 1].end()]` at no
     // more than the overlap, and the overlap is strictly below the window, so
     // the block is already known to fit and the forward walk resumes past it
-    // instead of re-measuring every prefix inside it. `len_fn` is an `Fn` of
-    // the text alone, so re-measuring that identical range could only return
+    // instead of re-measuring every prefix inside it. The measure is a function
+    // of the text alone, so re-measuring that identical range could only return
     // the same answer.
     let mut carried = 0usize;
     while let Some(first) = atoms.get(i)? {
@@ -656,7 +751,10 @@ const _: () = {
           break true;
         };
         let candidate_end = atom.end();
-        if len_fn(&text[chunk_start..candidate_end]) > window {
+        if measurer
+          .measure_within(&text[chunk_start..candidate_end], window)
+          .is_none()
+        {
           break false;
         }
         chunk_end = candidate_end;
@@ -678,7 +776,9 @@ const _: () = {
       // trailing whole atoms as fit in the overlap, but always advance at least
       // one atom so packing terminates. `i + 1` is that floor; `j` repeats nothing.
       let next = first_accepted(i + 1, j, |t| {
-        len_fn(&text[atoms.buffered(t).start()..chunk_end]) <= overlap
+        measurer
+          .measure_within(&text[atoms.buffered(t).start()..chunk_end], overlap)
+          .is_some()
       });
       carried = if next < j { j } else { 0 };
       atoms.discard_before(next);

@@ -21,7 +21,11 @@ use std::{
   sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use windit::{plan::WindowOptions, split::ContentAware, WinditError};
+use windit::{
+  plan::WindowOptions,
+  split::{ContentAware, MeasureText},
+  WinditError,
+};
 
 /// Refuse allocations of at least `limit` bytes while armed; defer everything
 /// else to the system allocator.
@@ -76,7 +80,7 @@ fn a_refused_output_growth_is_a_typed_error() {
     text.push('w');
   }
   let count = |s: &str| s.split_whitespace().count();
-  let len_fn: &dyn Fn(&str) -> usize = &count;
+  let len_fn: &dyn MeasureText = &count;
   let opts = WindowOptions::new(4);
   let chunker = ContentAware::new(len_fn);
 
