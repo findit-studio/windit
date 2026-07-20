@@ -36,10 +36,42 @@ impl Vector for TestEmbedding {
   }
 }
 
-/// Assert an f32 slice is L2 unit-norm within tolerance.
-fn assert_unit_norm(v: &[f32]) {
-  let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+/// The same double at f64 storage, so the acceptance cases below drive the SAME
+/// generic helpers over a second, genuinely different scalar. A genericity claim
+/// exercised at one scalar proves nothing.
+struct TestEmbedding64(Vec<f64>);
+
+impl Vector for TestEmbedding64 {
+  type Scalar = f64;
+
+  fn as_slice(&self) -> &[f64] {
+    &self.0
+  }
+
+  fn from_unnormalized(v: &[f64]) -> Result<Self, WinditError> {
+    if v.is_empty() {
+      return Err(WinditError::Empty);
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+      return Err(WinditError::NonFinite);
+    }
+    Ok(Self(v.iter().map(|x| x / norm).collect()))
+  }
+}
+
+/// Assert an f32 embedding is L2 unit-norm within tolerance.
+fn assert_unit_norm(e: &TestEmbedding) {
+  let norm = e.as_slice().iter().map(|x| x * x).sum::<f32>().sqrt();
   assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
+}
+
+/// Assert an f64 embedding is L2 unit-norm to a tolerance f32 arithmetic cannot
+/// reach, so passing is evidence the aggregation really ran in f64 rather than
+/// in f32 and widened afterwards.
+fn assert_unit_norm_64(e: &TestEmbedding64) {
+  let norm = e.as_slice().iter().map(|x| x * x).sum::<f64>().sqrt();
+  assert!((norm - 1.0).abs() < 1e-12, "expected unit norm, got {norm}");
 }
 
 /// Plan `input_len` elements into windows of `unit_window`, embed each span,
@@ -47,12 +79,17 @@ fn assert_unit_norm(v: &[f32]) {
 /// and return the number of windows planned.
 ///
 /// This is the ONE helper every embedding acceptance case shares. Nothing in it
-/// names a concrete window size, unit, or embedding dimension — the cases differ
-/// only by the arguments they pass.
-fn run<E: Vector<Scalar = f32>>(
+/// names a concrete window size, unit, embedding dimension, or scalar — the
+/// cases differ only by the arguments they pass. The unit-norm check is a
+/// parameter rather than a fixed `&[f32]` call because `Real` deliberately has
+/// no `PartialOrd`: comparing against a tolerance belongs to the caller, at the
+/// caller's concrete scalar, which is what keeps that bound off the sealed
+/// trait.
+fn run<E: Vector>(
   unit_window: usize,
   input_len: usize,
   embed: impl Fn(&Span) -> E,
+  assert_unit: impl Fn(&E),
 ) -> usize {
   let opts = WindowOptions::new(unit_window);
   let spans = WindowPlan::spans(&opts, input_len).expect("plan spans");
@@ -61,7 +98,7 @@ fn run<E: Vector<Scalar = f32>>(
     .map(|span| Windowed::new(embed(span), *span))
     .collect();
   let summary = aggregate(&CoverageWeightedMean, &windows).expect("aggregate");
-  assert_unit_norm(summary.as_slice());
+  assert_unit(&summary);
   spans.len()
 }
 
@@ -75,26 +112,81 @@ fn embed(span: &Span) -> TestEmbedding {
   TestEmbedding::from_unnormalized(&raw).expect("valid embedding")
 }
 
+/// [`embed`] at f64, mirroring it value for value so the two scalar cases differ
+/// in nothing but their scalar.
+fn embed64(span: &Span) -> TestEmbedding64 {
+  let base = (span.start() % 7) as f64 + 1.0;
+  let raw: Vec<f64> = (0..4).map(|i| base + f64::from(i) + 1.0).collect();
+  TestEmbedding64::from_unnormalized(&raw).expect("valid embedding")
+}
+
 #[test]
 fn granite_512_window() {
   // A short input fits in one window; a longer one tiles into three (two full
   // windows plus a ragged tail).
-  assert_eq!(run(512, 40, embed), 1);
-  assert_eq!(run(512, 1500, embed), 3);
+  assert_eq!(run(512, 40, embed, assert_unit_norm), 1);
+  assert_eq!(run(512, 1500, embed, assert_unit_norm), 3);
+}
+
+#[test]
+fn granite_512_window_f64() {
+  // Scalar-agnosticism: the SAME `run`, the same window sizes, the same span
+  // counts — only the embedding's scalar differs, and the tighter unit-norm
+  // tolerance proves the math ran at that scalar's precision.
+  assert_eq!(run(512, 40, embed64, assert_unit_norm_64), 1);
+  assert_eq!(run(512, 1500, embed64, assert_unit_norm_64), 3);
 }
 
 #[test]
 fn granite_large_window() {
   // The SAME `run`, only `unit_window` changes to a long-context size:
   // window-size-agnosticism.
-  assert_eq!(run(8192, 20_000, embed), 3);
+  assert_eq!(run(8192, 20_000, embed, assert_unit_norm), 3);
+  // And the same geometry again at f64, so window size and scalar are
+  // independently free.
+  assert_eq!(run(8192, 20_000, embed64, assert_unit_norm_64), 3);
 }
 
 #[test]
 fn clap_sample_window() {
   // Audio-sample units and a half-million-wide window: still the same `run`,
   // still config-only.
-  assert_eq!(run(480_000, 1_200_000, embed), 3);
+  assert_eq!(run(480_000, 1_200_000, embed, assert_unit_norm), 3);
+  assert_eq!(run(480_000, 1_200_000, embed64, assert_unit_norm_64), 3);
+}
+
+#[test]
+fn dyn_policy_is_object_safe_at_both_scalars() {
+  // `AggregatePolicy` gained a compute-scalar type parameter, but it defaults to
+  // f32, so the bare `dyn` spellings that existed before must still compile
+  // verbatim — as a reference, as a box, and as a struct field.
+  let by_ref: &dyn AggregatePolicy = &CoverageWeightedMean;
+  let boxed: Box<dyn AggregatePolicy> = Box::new(MeanRenormalized);
+
+  struct Holder {
+    policy: Box<dyn AggregatePolicy>,
+  }
+  let held = Holder {
+    policy: Box::new(CoverageWeightedMean),
+  };
+
+  let spans = WindowPlan::spans(&WindowOptions::new(512), 1500).expect("plan spans");
+  let windows: Vec<WindowEmbedding<TestEmbedding>> = spans
+    .iter()
+    .map(|span| Windowed::new(embed(span), *span))
+    .collect();
+  for policy in [by_ref, boxed.as_ref(), held.policy.as_ref()] {
+    assert_unit_norm(&aggregate(policy, &windows).expect("aggregate"));
+  }
+
+  // A non-default scalar names the parameter, and the trait stays object-safe
+  // there too.
+  let p64: Box<dyn AggregatePolicy<f64>> = Box::new(CoverageWeightedMean);
+  let windows64: Vec<WindowEmbedding<TestEmbedding64>> = spans
+    .iter()
+    .map(|span| Windowed::new(embed64(span), *span))
+    .collect();
+  assert_unit_norm_64(&aggregate(p64.as_ref(), &windows64).expect("aggregate"));
 }
 
 #[test]

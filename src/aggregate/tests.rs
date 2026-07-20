@@ -8,7 +8,8 @@ use super::{
 };
 use crate::{
   plan::Span,
-  test_support::{assert_close, TestVec},
+  scalar::TestQuant,
+  test_support::{assert_close, assert_close_f64, TestQuantVec, TestVec},
   windowed::{Vector, WindowEmbedding, Windowed},
   WinditError,
 };
@@ -28,6 +29,81 @@ fn coverage_weighted_mean_pinned() {
   let windows = [win(&[1.0, 0.0], 4, 4), win(&[0.0, 1.0], 2, 4)];
   let out = aggregate(&CoverageWeightedMean, &windows).unwrap();
   assert_close(out.as_slice(), &[0.8944272, 0.4472136]);
+}
+
+#[test]
+fn coverage_weighted_mean_f64_pinned() {
+  // The same fixture as `coverage_weighted_mean_pinned`, pinned to f64
+  // precision. The tolerance is the point: the f32 answer (0.894_427_2) sits
+  // about 1e-8 away from this value, so an implementation that computed in f32
+  // and widened afterwards fails here by four orders of magnitude.
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let coverages = [1.0, 0.5];
+  let out = CoverageWeightedMean
+    .aggregate_values(&embeddings, &coverages, 2)
+    .unwrap();
+  assert_close_f64(&out, &[0.894_427_190_999_915_9, 0.447_213_595_499_957_9]);
+
+  // Stated as a comparison rather than left implicit: the f32 result is not
+  // within the f64 tolerance, which is what makes the assertion above evidence.
+  let widened_f32 = f64::from(0.894_427_2_f32);
+  let diff = (widened_f32 - 0.894_427_190_999_915_9_f64).abs();
+  assert!(diff > 1e-12, "f32 precision must not satisfy the f64 pin");
+}
+
+#[test]
+fn ema_alpha_range_is_rejected_at_f64() {
+  // The alpha range check runs in f32 on the f32 configuration field, before
+  // widening, so it must fire identically at a non-f32 compute scalar.
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let coverages = [1.0, 1.0];
+  assert!(matches!(
+    EmaRenormalized::new(2.0).aggregate_values(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  assert!(matches!(
+    EmaRenormalized::new(-0.5).aggregate_values(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  assert!(matches!(
+    EmaRenormalized::new(f32::NAN).aggregate_values(&embeddings, &coverages, 2),
+    Err(WinditError::AlphaOutOfRange)
+  ));
+  assert!(EmaRenormalized::new(0.5)
+    .aggregate_values(&embeddings, &coverages, 2)
+    .is_ok());
+}
+
+#[test]
+fn quantized_storage_takes_widening_path() {
+  // `TestQuantVec` stores i8 and computes in f32, so `as_compute_slice` returns
+  // `None` and `aggregate` must widen elementwise instead of borrowing. The
+  // pinned output also documents the requantization contract: the aggregate
+  // unit vector [0.894_427_2, 0.447_213_6] scales to [113.59, 56.80], which
+  // rounds half away from zero to [114, 57].
+  let windows = [
+    Windowed::new(
+      TestQuantVec::from_unnormalized(&[1.0, 0.0]).unwrap(),
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      TestQuantVec::from_unnormalized(&[0.0, 1.0]).unwrap(),
+      Span::new(0, 2, 4),
+    ),
+  ];
+  let out = aggregate(&CoverageWeightedMean, &windows).unwrap();
+  assert_eq!(out.as_slice(), &[TestQuant(114), TestQuant(57)]);
+
+  // The same geometry through the f32 storage type agrees before quantization,
+  // proving the widening branch is not a different computation.
+  let f32_windows = [win(&[1.0, 0.0], 4, 4), win(&[0.0, 1.0], 2, 4)];
+  let f32_out = aggregate(&CoverageWeightedMean, &f32_windows).unwrap();
+  let requantized: Vec<TestQuant> = f32_out
+    .as_slice()
+    .iter()
+    .map(|x| TestQuant(libm::roundf(x * 127.0) as i8))
+    .collect();
+  assert_eq!(out.as_slice(), requantized.as_slice());
 }
 
 #[test]
@@ -174,6 +250,61 @@ fn kind_into_policy_matches_builtin() {
   .unwrap();
   let via_builtin = aggregate(&EmaRenormalized::new(0.5), &windows3).unwrap();
   assert_close(via_kind.as_slice(), via_builtin.as_slice());
+
+  // The selector is generic over the compute scalar too. Both calls above infer
+  // `C` from the embeddings with no turbofish; here nothing else pins it, which
+  // is the one case that needs the annotation.
+  let p64 = AggregatePolicyKind::CoverageWeightedMean.into_policy::<f64>();
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let out = p64.aggregate_values(&embeddings, &[1.0, 0.5], 2).unwrap();
+  assert_close_f64(&out, &[0.894_427_190_999_915_9, 0.447_213_595_499_957_9]);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn kind_serde_wire_format_is_pinned() {
+  // The compute scalar became generic, but `AggregatePolicyKind` did not:
+  // policy configuration stays f32 and is widened at use. These exact strings
+  // are the guarantee that persisted configurations keep deserializing — a
+  // renamed variant, a restructured payload, or an `alpha` widened to f64 would
+  // all fail here.
+  assert_eq!(
+    serde_json::to_string(&AggregatePolicyKind::CoverageWeightedMean).unwrap(),
+    r#""CoverageWeightedMean""#
+  );
+  assert_eq!(
+    serde_json::to_string(&AggregatePolicyKind::MeanRenormalized).unwrap(),
+    r#""MeanRenormalized""#
+  );
+  assert_eq!(
+    serde_json::to_string(&AggregatePolicyKind::Ema { alpha: 0.25 }).unwrap(),
+    r#"{"Ema":{"alpha":0.25}}"#
+  );
+  assert_eq!(
+    serde_json::to_string(&AggregatePolicyKind::SaliencyWeighted).unwrap(),
+    r#""SaliencyWeighted""#
+  );
+
+  // And the same strings decode back, so a config written by an older build is
+  // still readable by this one.
+  let decoded: Vec<AggregatePolicyKind> = [
+    r#""CoverageWeightedMean""#,
+    r#""MeanRenormalized""#,
+    r#"{"Ema":{"alpha":0.25}}"#,
+    r#""SaliencyWeighted""#,
+  ]
+  .iter()
+  .map(|s| serde_json::from_str(s).unwrap())
+  .collect();
+  assert_eq!(
+    decoded,
+    vec![
+      AggregatePolicyKind::CoverageWeightedMean,
+      AggregatePolicyKind::MeanRenormalized,
+      AggregatePolicyKind::Ema { alpha: 0.25 },
+      AggregatePolicyKind::SaliencyWeighted,
+    ]
+  );
 }
 
 #[cfg(feature = "serde")]
