@@ -51,7 +51,14 @@ embeddings, VAD, and ASR.
   chunker behind the `text` feature. `ContentAware::chunk` is fallible: it
   reports invalid geometry and honours `WindowOptions::max_windows` exactly as
   `WindowPlan::spans` does, so the one configured bound on how much work a
-  chunking may cost reaches the chunker too. Packing calls `len_fn` `O(a log a)`
+  chunking may cost reaches the chunker too. The cap gates that work rather than
+  reporting on it after the fact: atoms are produced on demand and packed as they
+  are produced, so a capped chunking stops at the first chunk past the cap and
+  never splits or measures the text beyond it, and peak memory is one chunk's
+  worth of atoms rather than the whole input's. Neither the chunk list nor that
+  atom buffer can be sized before packing runs, so both grow through
+  `try_reserve` and report `WinditError::AllocFailed` rather than aborting a call
+  that returns `Result`. Packing calls `len_fn` `O(a log a)`
   times for `a` atoms — it never re-measures a range whose measure it already
   knows, and it locates each overlap boundary by probing rather than by walking
   one atom at a time — which keeps a near-window overlap over untrusted text off

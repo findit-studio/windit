@@ -49,26 +49,55 @@ mod content_aware {
     text
   }
 
-  /// A `len_fn` that tallies how often it is called and how much text it is
-  /// handed, so a packing bound can be asserted rather than described.
+  /// A `len_fn` that tallies how often it is called, how much text it is handed,
+  /// and how far into the source it reached, so a packing bound can be asserted
+  /// rather than described.
+  ///
+  /// `reach` is the highest byte offset at which a measured slice *started*.
+  /// Counting calls alone cannot separate "measured the whole input once" from
+  /// "measured every atom of it", because the preamble measurements all start at
+  /// offset zero however much text follows them; the starting offset says how far
+  /// the atom production actually walked. Every slice a chunking measures is a
+  /// sub-slice of the one `text` it was handed, so subtracting that text's
+  /// address recovers the offset — the only handle on production progress a
+  /// caller-supplied `len_fn` has.
   struct Meter {
+    base: usize,
     calls: Cell<usize>,
     units: Cell<usize>,
+    reach: Cell<usize>,
   }
 
   impl Meter {
-    fn new() -> Self {
+    fn new(text: &str) -> Self {
       Self {
+        base: text.as_ptr() as usize,
         calls: Cell::new(0),
         units: Cell::new(0),
+        reach: Cell::new(0),
       }
     }
 
-    fn measure(&self, s: &str) -> usize {
-      let n = word_count(s);
+    /// Record one measurement of `s` worth `units`, and return `units`.
+    fn record(&self, s: &str, units: usize) -> usize {
       self.calls.set(self.calls.get() + 1);
-      self.units.set(self.units.get() + n);
-      n
+      self.units.set(self.units.get() + units);
+      // Saturating because nothing stops a caller from measuring a slice of some
+      // other string; every measurement this module makes is of the text it
+      // constructed the meter from.
+      let start = (s.as_ptr() as usize).saturating_sub(self.base);
+      self.reach.set(self.reach.get().max(start));
+      units
+    }
+
+    /// Record one whitespace-word measurement of `s`.
+    fn measure(&self, s: &str) -> usize {
+      self.record(s, word_count(s))
+    }
+
+    /// Record one `char`-count measurement of `s`.
+    fn measure_chars(&self, s: &str) -> usize {
+      self.record(s, s.chars().count())
     }
   }
 
@@ -81,7 +110,7 @@ mod content_aware {
     // loop-exact model puts at 499_999 `len_fn` calls over 125_375_249
     // token-units -- cubic once the window and overlap scale with the input.
     let text = words(1000);
-    let meter = Meter::new();
+    let meter = Meter::new(&text);
     let counting = |s: &str| meter.measure(s);
     let len_fn: &dyn Fn(&str) -> usize = &counting;
     let opts = WindowOptions::new(500).with_overlap(499);
@@ -122,6 +151,66 @@ mod content_aware {
     assert_eq!(
       ContentAware::new(len_fn).chunk(text, &roomy).unwrap().len(),
       3
+    );
+  }
+
+  #[test]
+  fn a_cap_bounds_the_atom_production_it_caps() {
+    // One long word, `char`-count `len_fn`, window 1, cap 1: every char is its
+    // own atom and every atom its own chunk, so the cap is settled by the third
+    // atom. The cap used to be read only after the whole input had been split
+    // into atoms -- one allocated range per character, copied out through the
+    // recursion's nested vectors -- so the work a cap exists to forbid was
+    // already spent by the time it was consulted. `TooManyWindows` came back
+    // either way, which is why the verdict alone cannot witness this.
+    let text = "a".repeat(20_000);
+    let meter = Meter::new(&text);
+    let counting = |s: &str| meter.measure_chars(s);
+    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let opts = WindowOptions::new(1).with_max_windows(1);
+
+    assert_eq!(
+      ContentAware::new(len_fn).chunk(&text, &opts),
+      Err(WinditError::TooManyWindows { got: 2, max: 1 })
+    );
+    assert!(
+      meter.calls.get() < 64,
+      "a cap of 1 cost {} len_fn calls over a 20_000-char word",
+      meter.calls.get()
+    );
+    assert!(
+      meter.reach.get() < 64,
+      "a cap of 1 walked {} bytes into a 20_000-byte word",
+      meter.reach.get()
+    );
+  }
+
+  #[test]
+  fn a_low_cap_bounds_the_work_on_a_large_input() {
+    // The same class at the word level, where the atoms are whole words rather
+    // than characters: 50_000 one-token words at window 4 under a cap of 3 is
+    // settled by the seventeenth word. Tokenizing the other 49_983 is work the
+    // cap was set to prevent.
+    let text = words(50_000);
+    let meter = Meter::new(&text);
+    let counting = |s: &str| meter.measure(s);
+    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let opts = WindowOptions::new(4).with_max_windows(3);
+
+    assert_eq!(
+      ContentAware::new(len_fn).chunk(&text, &opts),
+      Err(WinditError::TooManyWindows { got: 4, max: 3 })
+    );
+    assert!(
+      meter.calls.get() < 128,
+      "a cap of 3 cost {} len_fn calls over 50_000 words",
+      meter.calls.get()
+    );
+    assert!(
+      meter.reach.get() < 256,
+      "a cap of 3 walked {} bytes into a {}-byte input",
+      meter.reach.get(),
+      text.len()
     );
   }
 

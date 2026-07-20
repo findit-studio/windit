@@ -127,6 +127,11 @@ let chunks = chunker.chunk(document, &opts)?; // Vec<Chunk>: half-open UTF-8 byt
 let first = chunks[0].as_str(document).unwrap();
 ```
 
+For untrusted text, add `with_max_windows`. Atoms are produced on demand and
+packed as they are produced, so the cap bounds the tokenization and the memory
+as well as the chunk count: a chunking that exceeds it stops at the first chunk
+past the cap and never splits the rest of the input.
+
 ## Custom policies
 
 Every family is a trait, so a project-specific strategy is a small `impl`. An
