@@ -242,6 +242,13 @@ const _: () = {
 
   /// Split `text[start..end]` into maximal `char`-aligned slices that each fit the
   /// window: the hard fallback for a single unit longer than the window.
+  ///
+  /// This is the crate's other `len_fn` walk over a growing substring, and it is
+  /// left as a walk deliberately. Each slice is measured from its own start, so
+  /// the measurement resets at every emitted boundary: the cost is the range's
+  /// length times one window, not times itself, which is the same shape the
+  /// packing bound has. Probing instead would need `len_fn` to be monotone over
+  /// a growing prefix, and a BPE tokenizer is not.
   fn split_chars(
     text: &str,
     start: usize,
