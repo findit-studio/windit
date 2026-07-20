@@ -106,20 +106,22 @@ let speech = longest_run(&frames, |&p| p >= 0.5, &opts);
 assert_eq!(speech, Some(Range::new(4, 7)));
 ```
 
-## Content-aware text chunking: the `len_fn` callback
+## Content-aware text chunking: the `MeasureText` measurer
 
 [`ContentAware`] (feature `text`) is a tokenizer-free string chunker. It splits
 on recursive boundaries — paragraphs, then sentences, then words — and greedily
 packs the pieces into chunks no longer than the window. Crucially, it measures
-length through a **caller-supplied `len_fn` callback**, so *you* define what a
-"token" is (a word count, a real tokenizer's id count, code points) without this
-crate ever depending on a tokenizer:
+length through a **caller-supplied [`MeasureText`]**, which every
+`Fn(&str) -> usize` closure implements, so *you* define what a "token" is (a word
+count, a real tokenizer's id count, code points) without this crate ever
+depending on a tokenizer:
 
 ```rust,ignore
 use windit::plan::WindowOptions;
 use windit::split::ContentAware;
 
 // "tokens" = whitespace-separated words, windows of 32, overlap of 4.
+// The closure is the MeasureText — nothing else to implement.
 let count = |s: &str| s.split_whitespace().count();
 let chunker = ContentAware::new(&count);
 let opts = WindowOptions::new(32).with_overlap(4);
@@ -127,10 +129,15 @@ let chunks = chunker.chunk(document, &opts)?; // Vec<Chunk>: half-open UTF-8 byt
 let first = chunks[0].as_str(document).unwrap();
 ```
 
-For untrusted text, add `with_max_windows`. Atoms are produced on demand and
-packed as they are produced, so the cap bounds the tokenization and the memory
-as well as the chunk count: a chunking that exceeds it stops at the first chunk
-past the cap and never splits the rest of the input.
+For untrusted text, add `with_max_windows`: the cap bounds the atoms produced
+and the memory as well as the chunk count, so a chunking that exceeds it stops
+at the first chunk past the cap and never splits the rest of the input. To bound
+the *measurement* too, implement [`MeasureText`] with an early stop — its
+`measure_within` counts only until the limit is passed, so a range far longer
+than a window is rejected after reading about a window of it. A plain closure
+cannot stop early and measures each range in full, so overriding `measure_within`
+in a real tokenizer is what keeps a large untrusted input from being scanned
+before the cap can apply.
 
 ## Custom policies
 
@@ -231,4 +238,5 @@ dual licensed as above, without any additional terms or conditions.
 [`HysteresisSegment`]: https://docs.rs/windit/latest/windit/segment/struct.HysteresisSegment.html
 [`FixedWindow`]: https://docs.rs/windit/latest/windit/split/struct.FixedWindow.html
 [`ContentAware`]: https://docs.rs/windit/latest/windit/split/struct.ContentAware.html
+[`MeasureText`]: https://docs.rs/windit/latest/windit/split/trait.MeasureText.html
 [`std::error::Error`]: https://doc.rust-lang.org/std/error/trait.Error.html

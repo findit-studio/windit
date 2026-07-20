@@ -28,7 +28,7 @@ mod content_aware {
   use core::cell::Cell;
   use std::string::String;
 
-  use super::super::{Chunk, ContentAware};
+  use super::super::{Chunk, ContentAware, MeasureText};
   use crate::{plan::WindowOptions, WinditError};
 
   /// The mock tokenizer: whitespace-delimited word count.
@@ -49,9 +49,22 @@ mod content_aware {
     text
   }
 
-  /// A `len_fn` that tallies how often it is called, how much text it is handed,
-  /// and how far into the source it reached, so a packing bound can be asserted
-  /// rather than described.
+  /// The unit a [`Meter`] tallies.
+  #[derive(Clone, Copy)]
+  enum Unit {
+    Words,
+    Chars,
+  }
+
+  /// A [`MeasureText`] that tallies how often it is queried, how many units it
+  /// consumes, and how far into the source it reaches, so a work bound can be
+  /// asserted rather than described.
+  ///
+  /// [`measure_within`](MeasureText::measure_within) stops at the first unit past
+  /// the limit — the early stop a real incremental tokenizer has and a plain
+  /// closure does not — so `units` records the work actually spent, not the
+  /// length of the text handed in. That is what lets a low-cap regression assert
+  /// total measured units track the cap rather than the input.
   ///
   /// `reach` is the highest byte offset at which a measured slice *started*.
   /// Counting calls alone cannot separate "measured the whole input once" from
@@ -60,26 +73,38 @@ mod content_aware {
   /// the atom production actually walked. Every slice a chunking measures is a
   /// sub-slice of the one `text` it was handed, so subtracting that text's
   /// address recovers the offset — the only handle on production progress a
-  /// caller-supplied `len_fn` has.
+  /// caller-supplied measurer has.
   struct Meter {
     base: usize,
+    unit: Unit,
     calls: Cell<usize>,
     units: Cell<usize>,
     reach: Cell<usize>,
   }
 
   impl Meter {
-    fn new(text: &str) -> Self {
+    fn new(text: &str, unit: Unit) -> Self {
       Self {
         base: text.as_ptr() as usize,
+        unit,
         calls: Cell::new(0),
         units: Cell::new(0),
         reach: Cell::new(0),
       }
     }
 
-    /// Record one measurement of `s` worth `units`, and return `units`.
-    fn record(&self, s: &str, units: usize) -> usize {
+    /// A meter that counts whitespace-delimited words.
+    fn words(text: &str) -> Self {
+      Self::new(text, Unit::Words)
+    }
+
+    /// A meter that counts `char`s.
+    fn chars(text: &str) -> Self {
+      Self::new(text, Unit::Chars)
+    }
+
+    /// Record one query that consumed `units` units of `s`.
+    fn note(&self, s: &str, units: usize) {
       self.calls.set(self.calls.get() + 1);
       self.units.set(self.units.get() + units);
       // Saturating because nothing stops a caller from measuring a slice of some
@@ -87,18 +112,43 @@ mod content_aware {
       // constructed the meter from.
       let start = (s.as_ptr() as usize).saturating_sub(self.base);
       self.reach.set(self.reach.get().max(start));
-      units
     }
+  }
 
-    /// Record one whitespace-word measurement of `s`.
+  impl MeasureText for Meter {
     fn measure(&self, s: &str) -> usize {
-      self.record(s, word_count(s))
+      let n = match self.unit {
+        Unit::Words => word_count(s),
+        Unit::Chars => s.chars().count(),
+      };
+      self.note(s, n);
+      n
     }
 
-    /// Record one `char`-count measurement of `s`.
-    fn measure_chars(&self, s: &str) -> usize {
-      self.record(s, s.chars().count())
+    fn measure_within(&self, s: &str, limit: usize) -> Option<usize> {
+      // Count units one at a time, stopping the instant the tally passes
+      // `limit`. `units` then grows with the limit, not with the length of `s`:
+      // the early stop a plain `Fn(&str) -> usize` closure cannot express.
+      let mut n = 0usize;
+      let over = match self.unit {
+        Unit::Words => count_until(s.split_whitespace(), limit, &mut n),
+        Unit::Chars => count_until(s.chars(), limit, &mut n),
+      };
+      self.note(s, n);
+      (!over).then_some(n)
     }
+  }
+
+  /// Advance `iter`, incrementing `*n`, until it is exhausted (returns `false`)
+  /// or `*n` first exceeds `limit` (returns `true`, having stopped early).
+  fn count_until<I: Iterator>(iter: I, limit: usize, n: &mut usize) -> bool {
+    for _ in iter {
+      *n += 1;
+      if *n > limit {
+        return true;
+      }
+    }
+    false
   }
 
   #[test]
@@ -110,17 +160,15 @@ mod content_aware {
     // loop-exact model puts at 499_999 `len_fn` calls over 125_375_249
     // token-units -- cubic once the window and overlap scale with the input.
     let text = words(1000);
-    let meter = Meter::new(&text);
-    let counting = |s: &str| meter.measure(s);
-    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let meter = Meter::words(&text);
     let opts = WindowOptions::new(500).with_overlap(499);
 
-    let chunks = ContentAware::new(len_fn).chunk(&text, &opts).unwrap();
+    let chunks = ContentAware::new(&meter).chunk(&text, &opts).unwrap();
 
     assert_eq!(chunks.len(), 501, "the packing itself must not change");
     assert!(
       meter.calls.get() < 10_000,
-      "packing 1000 atoms at overlap 499 took {} len_fn calls",
+      "packing 1000 atoms at overlap 499 took {} measure queries",
       meter.calls.get()
     );
     assert!(
@@ -136,7 +184,7 @@ mod content_aware {
     // ignored here, so the one configured bound on how much work a chunking may
     // cost did not reach the chunker at all.
     let text = "a b c d e f g h i j k l";
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
 
     // Twelve words at window 4 want three chunks; a cap of two aborts as soon as
     // it is first exceeded, reporting the same `got` / `max` pair the planner does.
@@ -164,24 +212,31 @@ mod content_aware {
     // already spent by the time it was consulted. `TooManyWindows` came back
     // either way, which is why the verdict alone cannot witness this.
     let text = "a".repeat(20_000);
-    let meter = Meter::new(&text);
-    let counting = |s: &str| meter.measure_chars(s);
-    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let meter = Meter::chars(&text);
     let opts = WindowOptions::new(1).with_max_windows(1);
 
     assert_eq!(
-      ContentAware::new(len_fn).chunk(&text, &opts),
+      ContentAware::new(&meter).chunk(&text, &opts),
       Err(WinditError::TooManyWindows { got: 2, max: 1 })
     );
     assert!(
       meter.calls.get() < 64,
-      "a cap of 1 cost {} len_fn calls over a 20_000-char word",
+      "a cap of 1 cost {} measure queries over a 20_000-char word",
       meter.calls.get()
     );
     assert!(
       meter.reach.get() < 64,
       "a cap of 1 walked {} bytes into a 20_000-byte word",
       meter.reach.get()
+    );
+    // The meter-based bound Codex R4 asked for: pre-change, the descent measured
+    // the whole 20_000-char word before the cap could apply (80_010 char-units);
+    // the bounded query stops at window + 1 per parent range, so the units spent
+    // track the cap and window, not the input length.
+    assert!(
+      meter.units.get() < 100,
+      "a cap of 1 measured {} char-units of a 20_000-char word; must track the cap, not the input",
+      meter.units.get()
     );
   }
 
@@ -192,18 +247,16 @@ mod content_aware {
     // settled by the seventeenth word. Tokenizing the other 49_983 is work the
     // cap was set to prevent.
     let text = words(50_000);
-    let meter = Meter::new(&text);
-    let counting = |s: &str| meter.measure(s);
-    let len_fn: &dyn Fn(&str) -> usize = &counting;
+    let meter = Meter::words(&text);
     let opts = WindowOptions::new(4).with_max_windows(3);
 
     assert_eq!(
-      ContentAware::new(len_fn).chunk(&text, &opts),
+      ContentAware::new(&meter).chunk(&text, &opts),
       Err(WinditError::TooManyWindows { got: 4, max: 3 })
     );
     assert!(
       meter.calls.get() < 128,
-      "a cap of 3 cost {} len_fn calls over 50_000 words",
+      "a cap of 3 cost {} measure queries over 50_000 words",
       meter.calls.get()
     );
     assert!(
@@ -212,12 +265,62 @@ mod content_aware {
       meter.reach.get(),
       text.len()
     );
+    // The meter-based bound: pre-change, the descent measured the whole 50_000
+    // word input (150_085 token-units) before the cap of 3 could apply; the
+    // bounded query keeps the units spent proportional to the cap and window.
+    assert!(
+      meter.units.get() < 1_000,
+      "a cap of 3 measured {} token-units of 50_000 words; must track the cap, not the input",
+      meter.units.get()
+    );
+  }
+
+  #[test]
+  fn measured_units_track_the_cap_not_the_input() {
+    // Codex R4, verbatim: the first atom request called split on the whole input
+    // and measured that entire substring "before producing anything or checking
+    // the window cap", so the meter "necessarily records at least 50_000
+    // token-units from this initial call" even at a cap of one. The fix is the
+    // interface: MeasureText::measure_within lets the descent measure a parent
+    // range only far enough to learn it overflows the window, so the units spent
+    // are set by the cap and window, not the input length. Ten times the input
+    // therefore costs the same bounded work.
+    let opts = WindowOptions::new(4).with_max_windows(1);
+
+    let small = words(5_000);
+    let m_small = Meter::words(&small);
+    assert_eq!(
+      ContentAware::new(&m_small).chunk(&small, &opts),
+      Err(WinditError::TooManyWindows { got: 2, max: 1 })
+    );
+
+    let large = words(50_000);
+    let m_large = Meter::words(&large);
+    assert_eq!(
+      ContentAware::new(&m_large).chunk(&large, &opts),
+      Err(WinditError::TooManyWindows { got: 2, max: 1 })
+    );
+
+    // A small constant, not ~5_000 and ~50_000: the units spent track the cap,
+    // and a 10x-larger input is measured no more than the smaller one.
+    assert!(
+      m_large.units.get() < 200,
+      "large-input units {} must track the cap, not the input",
+      m_large.units.get()
+    );
+    assert_eq!(
+      m_small.units.get(),
+      m_large.units.get(),
+      "a 10x-larger input under the same cap measured the same bounded work: {} vs {}",
+      m_small.units.get(),
+      m_large.units.get()
+    );
   }
 
   #[test]
   fn packs_words_within_window() {
     let text = "a b c d e f g h";
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let chunks = ContentAware::new(len_fn)
       .chunk(text, &WindowOptions::new(5))
       .unwrap();
@@ -237,7 +340,7 @@ mod content_aware {
     // Two sentences (2 and 4 words) that together exceed window 5: the packer
     // breaks at the sentence boundary rather than mid-sentence.
     let text = "One two. Three four five six.";
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let chunks = ContentAware::new(len_fn)
       .chunk(text, &WindowOptions::new(5))
       .unwrap();
@@ -257,7 +360,7 @@ mod content_aware {
     // overlap 1: the second chunk repeats the last token of the first. Words are
     // single-token atoms, so a token budget and an atom count coincide here.
     let text = "a b c d e f g h";
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let opts = WindowOptions::new(5).with_overlap(1);
     let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
 
@@ -289,7 +392,7 @@ mod content_aware {
     // 3 tokens), giving two chunks -- not the advance-by-one slide (3 chunks,
     // 9 repeated tokens) that an atom-count overlap produced.
     let text = "Aa bb cc. Dd ee ff. Gg hh ii. Jj kk ll. Mm nn oo. Pp qq rr.";
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let opts = WindowOptions::new(12).with_overlap(4);
     let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
 
@@ -310,7 +413,7 @@ mod content_aware {
     // NOT the atom-count slide (3 chunks) that repeated 16 tokens per step.
     let para = "The quick brown fox jumps over lazy dogs";
     let text = [para; 5].join("\n\n");
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let opts = WindowOptions::new(24).with_overlap(6);
     let chunks = ContentAware::new(len_fn).chunk(&text, &opts).unwrap();
 
@@ -327,7 +430,7 @@ mod content_aware {
     // Invalid geometry cannot produce a range that honours the window, so it is
     // reported rather than answered with per-atom ranges that all violate the
     // "<= window" guarantee.
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     assert_eq!(
       ContentAware::new(len_fn).chunk("hello world", &WindowOptions::new(0)),
       Err(WinditError::ZeroWindow)
@@ -345,7 +448,7 @@ mod content_aware {
     // "every range measures <= window" guarantee.
     let text = "ab";
     let len3 = |s: &str| s.chars().count() * 3; // each char measures 3 tokens
-    let len_fn: &dyn Fn(&str) -> usize = &len3;
+    let len_fn: &dyn MeasureText = &len3;
     let chunks = ContentAware::new(len_fn)
       .chunk(text, &WindowOptions::new(2))
       .unwrap();
@@ -371,7 +474,7 @@ mod content_aware {
       }
       text.push('x');
     }
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     let chunks = ContentAware::new(len_fn)
       .chunk(&text, &WindowOptions::new(5))
       .unwrap();
@@ -386,7 +489,7 @@ mod content_aware {
 
   #[test]
   fn empty_and_whitespace_yield_no_chunks() {
-    let len_fn: &dyn Fn(&str) -> usize = &word_count;
+    let len_fn: &dyn MeasureText = &word_count;
     assert!(ContentAware::new(len_fn)
       .chunk("", &WindowOptions::new(5))
       .unwrap()
