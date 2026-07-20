@@ -84,6 +84,14 @@ pub trait Real:
   /// The multiplicative identity.
   const ONE: Self;
 
+  /// The exponent one past the largest representable power of two, matching
+  /// [`f32::MAX_EXP`]: `2^(MAX_EXP - 1)` is finite and `2^MAX_EXP` is not.
+  const MAX_EXP: i32;
+
+  /// The exponent one past the smallest *normal* power of two, matching
+  /// [`f32::MIN_EXP`]: `2^(MIN_EXP - 1)` is the smallest positive normal value.
+  const MIN_EXP: i32;
+
   /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA
   /// smoothing factor — into this domain. Exact for every implementor.
   ///
@@ -100,6 +108,24 @@ pub trait Real:
   /// scalar's range — `1e20_f32` squares to infinity, `1e-30_f32` to zero — still
   /// be normalized rather than rejected.
   fn abs(self) -> Self;
+
+  /// The binary exponent of `self`'s magnitude: the `e` for which
+  /// `2^e <= |self| < 2^(e + 1)`.
+  ///
+  /// Defined for a finite, non-zero `self`; aggregation only ever asks for the
+  /// exponent of a magnitude it has already checked for both. Subnormals report
+  /// their true exponent (`f32::from_bits(1)` is `-149`), not a flushed one.
+  fn exponent(self) -> i32;
+
+  /// `self * 2^n`, exact whenever the result is representable.
+  ///
+  /// This exactness is the whole basis of the aggregation math's scale
+  /// handling. A power of two leaves the significand untouched and moves only
+  /// the exponent, so a sum rescaled this way is the *same* sum with its
+  /// exponent shifted: it keeps the direction, keeps the rounding, and — the
+  /// property a rescale by an arbitrary divisor destroys — keeps an exactly
+  /// cancelling sum at exactly zero. `n == 0` returns `self` unchanged.
+  fn ldexp(self, n: i32) -> Self;
 
   /// Whether the value is finite: neither infinite nor NaN.
   fn is_finite(self) -> bool;
@@ -120,6 +146,8 @@ impl Scalar for f32 {
 impl Real for f32 {
   const ZERO: Self = 0.0;
   const ONE: Self = 1.0;
+  const MAX_EXP: i32 = f32::MAX_EXP;
+  const MIN_EXP: i32 = f32::MIN_EXP;
 
   fn from_f32(x: f32) -> Self {
     x
@@ -133,6 +161,16 @@ impl Real for f32 {
   // libm's `arch` feature lowers this to the hardware instruction anyway.
   fn abs(self) -> Self {
     libm::fabsf(self)
+  }
+
+  // `frexpf` splits into a significand in [0.5, 1) and an exponent, so its
+  // exponent is one above the `2^e <= |x|` convention this trait states.
+  fn exponent(self) -> i32 {
+    libm::frexpf(self).1 - 1
+  }
+
+  fn ldexp(self, n: i32) -> Self {
+    libm::ldexpf(self, n)
   }
 
   // Inherent-first path resolution picks `core`'s `f32::is_finite`, not this
@@ -158,6 +196,8 @@ impl Scalar for f64 {
 impl Real for f64 {
   const ZERO: Self = 0.0;
   const ONE: Self = 1.0;
+  const MAX_EXP: i32 = f64::MAX_EXP;
+  const MIN_EXP: i32 = f64::MIN_EXP;
 
   fn from_f32(x: f32) -> Self {
     f64::from(x)
@@ -169,6 +209,14 @@ impl Real for f64 {
 
   fn abs(self) -> Self {
     libm::fabs(self)
+  }
+
+  fn exponent(self) -> i32 {
+    libm::frexp(self).1 - 1
+  }
+
+  fn ldexp(self, n: i32) -> Self {
+    libm::ldexp(self, n)
   }
 
   fn is_finite(self) -> bool {
