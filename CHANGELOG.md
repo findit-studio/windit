@@ -31,7 +31,10 @@ embeddings, VAD, and ASR.
   compute scalar, so `AggregatePolicyKind`'s wire format is scalar-independent.
 - Smoothing policies: the `SmoothPolicy` trait with `Ema` and `Hysteresis`.
 - Segmentation: `runs`, `longest_run`, `runs_sorted`, and the `SegmentPolicy`
-  built-ins `Threshold` and `HysteresisSegment`.
+  built-ins `Threshold` and `HysteresisSegment`. A run is continuous in the
+  input geometry as well as in the sequence, so a plan whose hop exceeds its
+  window never fuses two accepted spans across the elements it strided past;
+  only `merge_gap` bridges them.
 - Split policies: `FixedWindow`, and the tokenizer-free `ContentAware` string
   chunker behind the `text` feature.
 - `no_std + alloc` support with optional `std`, `text`, and `serde` features;
