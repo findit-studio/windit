@@ -425,6 +425,66 @@ mod content_aware {
     );
   }
 
+  /// Codex R5 finding 4: a context-sensitive measurer whose token count does not
+  /// fall monotonically as a suffix shortens. Word count, except two trailing
+  /// suffixes of the four-atom chunk `"a b c d"` are pinned so its overlap-suffix
+  /// measures are `t=1 -> "b c d" = 3`, `t=2 -> "c d" = 1`, `t=3 -> "d" = 2`. BPE
+  /// and wordpiece tokenizers are non-monotonic in exactly this way.
+  struct NonMonotone;
+
+  impl MeasureText for NonMonotone {
+    fn measure(&self, s: &str) -> usize {
+      match s {
+        "c d" => 1,
+        "d" => 2,
+        _ => word_count(s),
+      }
+    }
+  }
+
+  #[test]
+  fn overlap_search_finds_earliest_fit_when_measure_is_not_monotone() {
+    // The overlap-boundary search must repeat the EARLIEST trailing suffix that
+    // fits the overlap budget, for an arbitrary measurer. For "a b c d" (window
+    // 4) at overlap 1 the suffix measures are t=1 -> "b c d" = 3, t=2 -> "c d" =
+    // 1, t=3 -> "d" = 2; the earliest that fits the budget of 1 is t=2 ("c d").
+    // A doubling+bisection search probes t=1 then t=3, skips t=2, and falls
+    // through to the t=4 "repeat nothing" sentinel -- silently dropping the
+    // configured overlap. A linear scan over the closed chunk's trailing atoms
+    // finds t=2.
+    let text = "a b c d e";
+    let opts = WindowOptions::new(4).with_overlap(1);
+    let chunks = ContentAware::new(&NonMonotone).chunk(text, &opts).unwrap();
+
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
+    assert_eq!(
+      slices,
+      std::vec!["a b c d", "c d e"],
+      "the second chunk must repeat the earliest fitting suffix \"c d\" (t=2), not \
+       start fresh at \"e\" (the t=4 no-overlap sentinel)"
+    );
+    // The overlap boundary itself: byte 4 is atom "c", the start of the repeated
+    // "c d". The pre-fix search returns byte 8 ("e"), repeating nothing.
+    assert_eq!(chunks[1].start(), 4);
+  }
+
+  #[test]
+  fn overlap_boundary_is_unchanged_for_a_monotone_measurer() {
+    // The same input and geometry under a monotonic measurer (word count): the
+    // suffix measures fall monotonically (t=1 -> 3, t=2 -> 2, t=3 -> 1), so the
+    // earliest fitting the budget of 1 is t=3 ("d") and the second chunk repeats
+    // one token. Linear scan and bisection agree whenever the measure is
+    // monotone, which is what keeps every existing chunk boundary identical.
+    let text = "a b c d e";
+    let len_fn: &dyn MeasureText = &word_count;
+    let opts = WindowOptions::new(4).with_overlap(1);
+    let chunks = ContentAware::new(len_fn).chunk(text, &opts).unwrap();
+
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
+    assert_eq!(slices, std::vec!["a b c d", "d e"]);
+    assert_eq!(chunks[1].start(), 6);
+  }
+
   #[test]
   fn chunk_rejects_invalid_window() {
     // Invalid geometry cannot produce a range that honours the window, so it is
