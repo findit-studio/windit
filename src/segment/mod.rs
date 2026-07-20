@@ -1,8 +1,9 @@
 //! Segmentation: reduce a windowed score sequence to continuous element ranges.
 //!
 //! The core is `runs`: it walks a `&[Windowed<V>]`, groups the windows a
-//! caller-supplied predicate accepts into contiguous runs, maps each run to a
-//! half-open `Range` in input-element units through its spans, then applies
+//! caller-supplied predicate accepts into runs that are continuous in both the
+//! sequence and the input geometry, maps each run to a half-open `Range` in
+//! input-element units through its spans, then applies
 //! two `SegmentOptions` passes — merge runs separated by at most `merge_gap`
 //! elements, then drop runs shorter than `min_len`. `longest_run` and
 //! `runs_sorted` rank those ranges; the find-longest-continuous-range case
@@ -164,9 +165,16 @@ impl Default for SegmentOptions {
 /// produce; a run's start is taken from its first window, not the minimum over
 /// the run.
 ///
-/// A run is a maximal block of consecutive accepted windows. Each run becomes
-/// the [`Range`] from its first window's `span.start` to the largest
-/// [`Span::end`](crate::plan::Span::end) among its windows (so
+/// A run is a maximal block of accepted windows that is also *geometrically
+/// continuous*: a window is added to the open run only when its `span.start` is
+/// at or before the run's current end. A plan whose hop exceeds its window
+/// strides over the input, so two accepted windows can be separated by elements
+/// no span covers; such a pair starts a new run rather than fusing into one that
+/// would claim the uncovered elements. Bridging that separation is
+/// [`SegmentOptions::merge_gap`]'s decision alone.
+///
+/// Each run becomes the [`Range`] from its first window's `span.start` to the
+/// largest [`Span::end`](crate::plan::Span::end) among its windows (so
 /// overlapping-window runs cover the union of their spans). The runs are then
 /// merged when separated by at most [`SegmentOptions::merge_gap`] elements, and
 /// any run shorter than [`SegmentOptions::min_len`] is dropped.
@@ -178,13 +186,19 @@ where
   let mut current: Option<Range> = None;
   for w in seq {
     if predicate(&w.value) {
-      let end = w.span.end();
-      if let Some(run) = current.as_mut() {
-        run.end = run.end.max(end);
-      } else {
+      let (start, end) = (w.span.start(), w.span.end());
+      match current {
+        // A span beginning past the open run's end leaves elements that no span
+        // covers. Closing the run here keeps `merge_gap` the only thing that can
+        // bridge them; extending instead would select them unconditionally.
+        Some(run) if start > run.end => {
+          raw.push(run);
+          current = Some(Range::new(start, end));
+        }
+        Some(ref mut run) => run.end = run.end.max(end),
         // `Span::end` is `start + len` with a non-zero `len`, so `start < end`
         // and the range is well formed.
-        current = Some(Range::new(w.span.start(), end));
+        None => current = Some(Range::new(start, end)),
       }
     } else if let Some(run) = current.take() {
       raw.push(run);

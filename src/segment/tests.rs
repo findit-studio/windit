@@ -4,7 +4,11 @@ use super::{
   longest_run, runs, runs_sorted, HysteresisSegment, Range, SegmentOptions, SegmentPolicy,
   Threshold,
 };
-use crate::{error::WinditError, plan::Span, windowed::Windowed};
+use crate::{
+  error::WinditError,
+  plan::{Span, WindowOptions, WindowPlan},
+  windowed::Windowed,
+};
 
 /// One `Windowed<f32>` per value, each covering a single element (window 1), so
 /// element units and frame indices coincide.
@@ -52,6 +56,84 @@ fn merge_gap_bridges_and_zero_keeps_separate() {
 
   let bridged = runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(1));
   assert_eq!(bridged, vec![Range::new(0, 4)]);
+}
+
+/// The gapped spans a `hop > window` plan produces: elements `2..5` are covered
+/// by no span, so the two accepted windows must stay two runs and only
+/// `merge_gap` may bridge them.
+fn gapped_plan() -> Vec<Windowed<f32>> {
+  let spans = WindowPlan::spans(&WindowOptions::new(2).with_hop(5), 7).unwrap();
+  assert_eq!(
+    spans
+      .iter()
+      .map(|s| (s.start(), s.len()))
+      .collect::<Vec<_>>(),
+    vec![(0, 2), (5, 2)],
+    "the planner must produce the gapped geometry this regression is about"
+  );
+  spans.into_iter().map(|s| Windowed::new(0.9, s)).collect()
+}
+
+#[test]
+fn gapped_spans_are_not_fused_into_one_run() {
+  let s = gapped_plan();
+
+  // Both windows are accepted, but they are not geometrically continuous:
+  // fusing them would silently select the uncovered elements 2..5.
+  assert_eq!(
+    runs(&s, |&v| v > 0.5, &plain()),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
+
+  // Bridging the 3-element gap is `merge_gap`'s decision alone.
+  assert_eq!(
+    runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(2)),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
+  assert_eq!(
+    runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(3)),
+    vec![Range::new(0, 7)]
+  );
+}
+
+#[test]
+fn gapped_spans_feed_min_len_longest_and_sorted() {
+  let s = gapped_plan();
+
+  // Each run is 2 elements, so a 3-element minimum drops both; fusing them into
+  // a single 7-element run would keep one.
+  assert!(runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_min_len(3)).is_empty());
+  assert_eq!(
+    runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_min_len(2)),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
+
+  // Equal lengths, so the earliest wins the tie and the sort keeps input order.
+  assert_eq!(
+    longest_run(&s, |&v| v > 0.5, &plain()),
+    Some(Range::new(0, 2))
+  );
+  assert_eq!(
+    runs_sorted(&s, |&v| v > 0.5, &plain()),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
+}
+
+#[test]
+fn gapped_spans_split_under_the_segment_policies() {
+  let s = gapped_plan();
+
+  // Both policies reach the geometry only through `runs`, so both inherit the
+  // split. `HysteresisSegment` latches on at the first window and stays on
+  // across the gap — a value decision that must not become a geometric one.
+  assert_eq!(
+    Threshold::new(0.5).segment(&s),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
+  assert_eq!(
+    HysteresisSegment::new(0.6, 0.3).segment(&s),
+    vec![Range::new(0, 2), Range::new(5, 7)]
+  );
 }
 
 #[test]
