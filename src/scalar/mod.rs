@@ -2,13 +2,26 @@
 //!
 //! [`Scalar`] is the storage type — [`Vector::as_slice`](crate::windowed::Vector::as_slice)
 //! yields `&[Self::Scalar]` — and [`Real`] is the floating-point domain the
-//! aggregation math runs in. For every scalar this crate ships the two coincide,
-//! but they are kept separate so a future narrow storage type (an `f16`, a
-//! quantized byte) can compute in a wider float without a breaking change to
+//! aggregation math runs in. The two are deliberately *not* the same for `f32`:
+//! an `f32` embedding stores `f32` but computes in `f64`
+//! ([`f32::Compute`](Scalar::Compute) is `f64`). That is the whole reason the
+//! storage and compute types are split, and it is what a future narrow storage
+//! type (an `f16`, a quantized byte) reuses to compute in a wider float without
+//! a breaking change to
 //! [`Vector::from_unnormalized`](crate::windowed::Vector::from_unnormalized).
 //!
-//! Two scalars are implemented: `f32` and `f64`. Neither is feature-gated —
-//! both are `core` types, and monomorphization already makes an unused one free.
+//! Widening `f32` to `f64` before accumulating is what ends a whole class of
+//! numerical defect. Every `f32` is exact in `f64`, every `f32` subnormal is a
+//! normal `f64`, and `f32::MAX` squared (~1.2e77) sits far inside `f64`'s range
+//! (~1.8e308), so a sum that overflowed, flushed a subnormal, or lost a
+//! cancellation in `f32` does none of those in `f64`. `f32` is therefore a
+//! storage scalar only: it is **not** a [`Real`], and no embedding accumulates
+//! in it.
+//!
+//! Two scalars are implemented: `f32` (storage, computes in `f64`) and `f64`
+//! (both storage and its own compute domain — the sole [`Real`]). Neither is
+//! feature-gated: both are `core` types, and monomorphization already makes an
+//! unused one free.
 //!
 //! # Sealed
 //!
@@ -29,8 +42,9 @@
 //!   right shape is a storage wrapper that carries its own scale.
 //! - **`f16` / `bf16`.** The intended next addition, and the case the
 //!   storage/compute split exists for — `f16` has no arithmetic in `core`, so
-//!   computing in `f32` is mandatory rather than optional. Left out only to
-//!   avoid taking a dependency for a use that has not arrived yet.
+//!   computing in `f64` (as `f32` already does) is mandatory rather than
+//!   optional. Left out only to avoid taking a dependency for a use that has not
+//!   arrived yet.
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +66,10 @@ mod private {
 pub trait Scalar: private::Sealed + Copy {
   /// The floating-point type this scalar's aggregation math runs in.
   ///
-  /// Equal to `Self` for every scalar this crate currently ships.
+  /// `f64` for both shipped scalars: `f64` computes in itself, and `f32` widens
+  /// to `f64` so no embedding ever accumulates in `f32`. A storage type equal to
+  /// its own `Compute` (only `f64`, here) is a [`Real`]; one narrower than its
+  /// `Compute` (`f32`) is storage only.
   type Compute: Real;
 
   /// Widen one stored value into the compute domain.
@@ -84,14 +101,6 @@ pub trait Real:
   /// The multiplicative identity.
   const ONE: Self;
 
-  /// The exponent one past the largest representable power of two, matching
-  /// [`f32::MAX_EXP`]: `2^(MAX_EXP - 1)` is finite and `2^MAX_EXP` is not.
-  const MAX_EXP: i32;
-
-  /// The exponent one past the smallest *normal* power of two, matching
-  /// [`f32::MIN_EXP`]: `2^(MIN_EXP - 1)` is the smallest positive normal value.
-  const MIN_EXP: i32;
-
   /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA
   /// smoothing factor — into this domain. Exact for every implementor.
   ///
@@ -105,8 +114,8 @@ pub trait Real:
   ///
   /// Aggregation uses this to find a vector's largest component and normalize
   /// against it, which is what lets an embedding whose *squares* leave the
-  /// scalar's range — `1e20_f32` squares to infinity, `1e-30_f32` to zero — still
-  /// be normalized rather than rejected.
+  /// compute scalar's range — `f64::MAX` squares to infinity, `f64::MIN_POSITIVE`
+  /// to zero — still be normalized rather than rejected.
   fn abs(self) -> Self;
 
   /// The binary exponent of `self`'s magnitude: the `e` for which
@@ -114,17 +123,18 @@ pub trait Real:
   ///
   /// Defined for a finite, non-zero `self`; aggregation only ever asks for the
   /// exponent of a magnitude it has already checked for both. Subnormals report
-  /// their true exponent (`f32::from_bits(1)` is `-149`), not a flushed one.
+  /// their true exponent (`f64::from_bits(1)` is `-1074`), not a flushed one.
   fn exponent(self) -> i32;
 
   /// `self * 2^n`, exact whenever the result is representable.
   ///
-  /// This exactness is the whole basis of the aggregation math's scale
-  /// handling. A power of two leaves the significand untouched and moves only
-  /// the exponent, so a sum rescaled this way is the *same* sum with its
-  /// exponent shifted: it keeps the direction, keeps the rounding, and — the
-  /// property a rescale by an arbitrary divisor destroys — keeps an exactly
-  /// cancelling sum at exactly zero. `n == 0` returns `self` unchanged.
+  /// A power of two leaves the significand untouched and moves only the
+  /// exponent, so dividing a component by its own `2^exponent` and multiplying
+  /// the root back afterwards is exact: renormalization computes a unit vector
+  /// whose norm was never representable (`[f64::MAX, f64::MAX]`) without ever
+  /// forming that norm, and the quotient is the direct `v_i / norm` to the bit
+  /// wherever the direct computation was valid. `n == 0` returns `self`
+  /// unchanged.
   fn ldexp(self, n: i32) -> Self;
 
   /// Whether the value is finite: neither infinite nor NaN.
@@ -132,52 +142,20 @@ pub trait Real:
 }
 
 impl Scalar for f32 {
-  type Compute = Self;
+  // Storage only: an `f32` embedding computes in `f64`. `f32` is not a `Real`,
+  // so nothing ever accumulates in it — the exact property that ends the
+  // overflow/underflow/cancellation class the `f32` fold kept reintroducing.
+  type Compute = f64;
 
   fn to_compute(self) -> Self::Compute {
-    self
+    // Widening `f32` to `f64` is exact for every value, subnormals included.
+    f64::from(self)
   }
 
-  fn as_compute_slice(v: &[Self]) -> Option<&[Self::Compute]> {
-    Some(v)
-  }
-}
-
-impl Real for f32 {
-  const ZERO: Self = 0.0;
-  const ONE: Self = 1.0;
-  const MAX_EXP: i32 = f32::MAX_EXP;
-  const MIN_EXP: i32 = f32::MIN_EXP;
-
-  fn from_f32(x: f32) -> Self {
-    x
-  }
-
-  fn sqrt(self) -> Self {
-    libm::sqrtf(self)
-  }
-
-  // Through libm for the same reason as `sqrt`: `f32::abs` is std-only, and
-  // libm's `arch` feature lowers this to the hardware instruction anyway.
-  fn abs(self) -> Self {
-    libm::fabsf(self)
-  }
-
-  // `frexpf` splits into a significand in [0.5, 1) and an exponent, so its
-  // exponent is one above the `2^e <= |x|` convention this trait states.
-  fn exponent(self) -> i32 {
-    libm::frexpf(self).1 - 1
-  }
-
-  fn ldexp(self, n: i32) -> Self {
-    libm::ldexpf(self, n)
-  }
-
-  // Inherent-first path resolution picks `core`'s `f32::is_finite`, not this
-  // trait method; the deny-by-default `unconditional_recursion` lint and the
-  // infinity/NaN cases in `tests.rs` are what keep that true.
-  fn is_finite(self) -> bool {
-    f32::is_finite(self)
+  fn as_compute_slice(_: &[Self]) -> Option<&[Self::Compute]> {
+    // `Compute` (`f64`) differs from `Self` (`f32`), so there is no zero-copy
+    // reborrow; `aggregate` widens elementwise through `to_compute` instead.
+    None
   }
 }
 
@@ -196,8 +174,6 @@ impl Scalar for f64 {
 impl Real for f64 {
   const ZERO: Self = 0.0;
   const ONE: Self = 1.0;
-  const MAX_EXP: i32 = f64::MAX_EXP;
-  const MIN_EXP: i32 = f64::MIN_EXP;
 
   fn from_f32(x: f32) -> Self {
     f64::from(x)
@@ -224,16 +200,17 @@ impl Real for f64 {
   }
 }
 
-/// A test-only storage scalar whose compute type is *not* `Self`.
+/// A test-only storage scalar narrower than `f64`, its compute type.
 ///
-/// Both shipped scalars widen to themselves, so without this double the
-/// widening half of [`Scalar::as_compute_slice`] — and the branch in
-/// `aggregate` that consumes it — would ship untested. It models a symmetric
-/// int8 quantization at a fixed scale of `1/127`, the arrangement a real
-/// quantized embedding would use.
+/// `f32` also widens (to `f64`), so the widening half of
+/// [`Scalar::as_compute_slice`] is no longer reachable only through this double.
+/// It survives because it is the one *integer* storage scalar — a symmetric int8
+/// quantization at a fixed scale of `1/127`, the arrangement a real quantized
+/// embedding would use — so it keeps the requantization round-trip
+/// (`f64` compute back to `i8` storage) under test.
 ///
 /// Sealing is what confines this to the crate: an integration test cannot
-/// implement [`Scalar`], so the widening path can only be exercised from here.
+/// implement [`Scalar`], so this widening path can only be exercised from here.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TestQuant(pub(crate) i8);
@@ -243,10 +220,10 @@ impl private::Sealed for TestQuant {}
 
 #[cfg(test)]
 impl Scalar for TestQuant {
-  type Compute = f32;
+  type Compute = f64;
 
   fn to_compute(self) -> Self::Compute {
-    f32::from(self.0) / 127.0
+    f64::from(self.0) / 127.0
   }
 
   fn as_compute_slice(_: &[Self]) -> Option<&[Self::Compute]> {

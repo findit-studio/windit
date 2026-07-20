@@ -13,9 +13,9 @@ mod tests;
 /// The compute type behind an embedding: the floating-point domain its
 /// aggregation runs in.
 ///
-/// For every scalar this crate ships this is just `V::Scalar` again; it differs
-/// only for a storage type narrower than the arithmetic performed on it. See the
-/// [`scalar`](crate::scalar) module.
+/// `f64` for both shipped scalars: it is `V::Scalar` again for an `f64`
+/// embedding, and the wider `f64` for an `f32` one, which stores `f32` but
+/// computes in `f64`. See the [`scalar`](crate::scalar) module.
 pub type ComputeOf<V> = <<V as Vector>::Scalar as Scalar>::Compute;
 
 /// A fixed-dimension embedding stored as a slice of some [`Scalar`].
@@ -26,8 +26,9 @@ pub type ComputeOf<V> = <<V as Vector>::Scalar as Scalar>::Compute;
 /// [`from_unnormalized`](Vector::from_unnormalized).
 ///
 /// An `f32` embedding — which is every embedding in practice — writes
-/// `type Scalar = f32;` and nothing else changes: [`ComputeOf<Self>`](ComputeOf)
-/// is then `f32` too.
+/// `type Scalar = f32;`; [`ComputeOf<Self>`](ComputeOf) is then `f64`, so
+/// [`from_unnormalized`](Vector::from_unnormalized) receives `&[f64]` and
+/// narrows to `f32` storage.
 pub trait Vector: Sized {
   /// The scalar type this embedding stores.
   type Scalar: Scalar;

@@ -45,11 +45,11 @@ fn zero_norm_is_nonfinite_error() {
 #[test]
 fn non_finite_input_errors() {
   assert!(matches!(
-    TestVec::from_unnormalized(&[f32::INFINITY, 1.0]),
+    TestVec::from_unnormalized(&[f64::INFINITY, 1.0]),
     Err(WinditError::NonFinite)
   ));
   assert!(matches!(
-    TestVec::from_unnormalized(&[f32::NAN, 1.0]),
+    TestVec::from_unnormalized(&[f64::NAN, 1.0]),
     Err(WinditError::NonFinite)
   ));
 }
