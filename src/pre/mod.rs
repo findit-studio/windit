@@ -25,13 +25,18 @@ mod tests;
 /// runs past `elements` trips a debug assertion; use [`try_slice_pad_mask`] for
 /// a checked variant.
 ///
+/// Whether the span is well formed in itself is not this function's concern:
+/// [`Span`] enforces `0 < len <= window` and a representable
+/// [`end`](Span::end) at construction, in every build.
+///
 /// # Panics
 ///
-/// Panics via a debug assertion (debug builds only) if
-/// `span.start + span.len > elements.len()`.
+/// Panics via a debug assertion (debug builds only) if `span.end() >
+/// elements.len()`. Release builds panic on the slice index instead, which is
+/// bounds-checked regardless.
 pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, Vec<u8>) {
   debug_assert!(
-    span.start() + span.len() <= elements.len(),
+    span.end() <= elements.len(),
     "span (start {}, len {}) runs past element length {}",
     span.start(),
     span.len(),
@@ -40,7 +45,7 @@ pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, 
   let window = span.window();
 
   let mut values = Vec::with_capacity(window);
-  values.extend_from_slice(&elements[span.start()..span.start() + span.len()]);
+  values.extend_from_slice(&elements[span.start()..span.end()]);
   values.resize(window, pad);
 
   let mut mask = Vec::with_capacity(window);
@@ -56,14 +61,23 @@ pub fn slice_pad_mask<T: Copy>(elements: &[T], span: &Span, pad: T) -> (Vec<T>, 
 /// # Errors
 ///
 /// Returns [`WinditError::DimMismatch`] when the span runs past `elements`
-/// (`span.start + span.len > elements.len()`), reporting `got = elements.len()`
-/// and `expected = span.start + span.len`.
+/// (`span.end() > elements.len()`), reporting `got = elements.len()` and
+/// `expected = span.end()`. Returns [`WinditError::InvalidSpan`] if the span's
+/// end is not representable — which [`Span`]'s constructors already rule out,
+/// so this arm exists only to keep the checked entry point total on its own
+/// terms rather than by appeal to a distant invariant.
 pub fn try_slice_pad_mask<T: Copy>(
   elements: &[T],
   span: &Span,
   pad: T,
 ) -> Result<(Vec<T>, Vec<u8>), WinditError> {
-  let required = span.start() + span.len();
+  let Some(required) = span.start().checked_add(span.len()) else {
+    return Err(WinditError::InvalidSpan {
+      start: span.start(),
+      len: span.len(),
+      window: span.window(),
+    });
+  };
   if required > elements.len() {
     return Err(WinditError::DimMismatch {
       got: elements.len(),

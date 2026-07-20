@@ -81,20 +81,24 @@ fn zero_window_and_bad_overlap_error() {
 }
 
 #[test]
-fn zero_window_span_coverage_is_zero() {
-  // `Span::new` rejects a zero window only through a debug assertion, so a
-  // release build can still hold one. This test builds it through the struct
-  // literal — reachable here because `tests` is a child of the defining module —
-  // to stand in for that release-build span, and pins `coverage` reporting `0.0`
-  // rather than dividing by zero (which would yield `inf`, or `NaN` for a zero
-  // `len` too). The planner itself never produces one.
-  let span = Span {
-    start: 0,
-    len: 5,
-    window: 0,
-  };
-  assert_eq!(span.coverage(), 0.0);
-  assert!(span.coverage().is_finite());
+fn zero_window_span_is_unconstructible_so_coverage_stays_finite() {
+  // A zero window is ruled out by `0 < len <= window` rather than by a separate
+  // check, which is what lets `coverage` divide unguarded.
+  assert!(matches!(
+    Span::try_new(0, 5, 0),
+    Err(WinditError::InvalidSpan {
+      start: 0,
+      len: 5,
+      window: 0
+    })
+  ));
+  assert!(matches!(
+    Span::try_new(0, 0, 0),
+    Err(WinditError::InvalidSpan { .. })
+  ));
+
+  let cov = Span::new(0, 1, 4).coverage();
+  assert!(cov.is_finite() && cov > 0.0 && cov <= 1.0);
 }
 
 #[test]
@@ -102,6 +106,46 @@ fn span_new_exposes_geometry_through_accessors() {
   let span = Span::new(8, 3, 4);
   assert_eq!((span.start(), span.len(), span.window()), (8, 3, 4));
   assert!((span.coverage() - 0.75).abs() < 1e-6);
+}
+
+#[test]
+#[should_panic(expected = "0 < len <= window")]
+fn span_new_rejects_len_above_window_in_every_build() {
+  let _ = Span::new(0, 2, 1);
+}
+
+#[test]
+#[should_panic(expected = "0 < len <= window")]
+fn span_new_rejects_zero_len_in_every_build() {
+  let _ = Span::new(0, 0, 4);
+}
+
+#[test]
+#[should_panic(expected = "representable start + len")]
+fn span_new_rejects_an_unrepresentable_end_in_every_build() {
+  let _ = Span::new(usize::MAX, 1, 1);
+}
+
+#[test]
+fn span_try_new_reports_the_same_invariant_as_a_typed_error() {
+  for (start, len, window) in [(0, 2, 1), (0, 0, 4), (usize::MAX, 1, 1)] {
+    assert_eq!(
+      Span::try_new(start, len, window),
+      Err(WinditError::InvalidSpan { start, len, window })
+    );
+  }
+
+  let span = Span::try_new(8, 3, 4).unwrap();
+  assert_eq!((span.start(), span.len(), span.window()), (8, 3, 4));
+}
+
+#[test]
+fn span_end_is_exact_at_the_usize_boundary() {
+  // The largest constructible span: its end is exactly `usize::MAX`, so `end`
+  // neither wraps nor saturates away a real element.
+  let span = Span::try_new(usize::MAX - 1, 1, 1).unwrap();
+  assert_eq!(span.end(), usize::MAX);
+  assert_eq!(Span::new(8, 3, 4).end(), 11);
 }
 
 #[cfg(feature = "serde")]
