@@ -4,16 +4,17 @@
 //! use windit::prelude::*;
 //! ```
 //!
-//! The value and geometry types are always available. The `Vec`-returning
-//! algorithms — the planner, the pre-processing helpers, and the four strategy
-//! families — are re-exported under the `alloc` feature, matching where they are
-//! defined. The content-aware chunker `ContentAware` joins them under the
-//! `text` feature, and `AggregatePolicyKind` under `serde`.
+//! The value, geometry, and scalar types are always available. The
+//! `Vec`-returning algorithms — the planner, the pre-processing helpers, and the
+//! four strategy families — are re-exported under the `alloc` feature, matching
+//! where they are defined. The content-aware chunker `ContentAware` joins them
+//! under the `text` feature, and `AggregatePolicyKind` under `serde`.
 
 pub use crate::{
   error::WinditError,
   plan::{Span, TailPolicy, WindowOptions},
-  windowed::{Vector, WindowEmbedding, Windowed},
+  scalar::{Real, Scalar},
+  windowed::{ComputeOf, Vector, WindowEmbedding, Windowed},
 };
 
 #[cfg(any(feature = "std", feature = "alloc"))]
