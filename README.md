@@ -123,7 +123,8 @@ use windit::split::ContentAware;
 let count = |s: &str| s.split_whitespace().count();
 let chunker = ContentAware::new(&count);
 let opts = WindowOptions::new(32).with_overlap(4);
-let ranges = chunker.chunk(document, &opts)?; // Vec<(usize, usize)> byte ranges
+let chunks = chunker.chunk(document, &opts)?; // Vec<Chunk>: half-open UTF-8 byte ranges
+let first = chunks[0].as_str(document).unwrap();
 ```
 
 ## Custom policies

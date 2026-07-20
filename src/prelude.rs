@@ -7,8 +7,9 @@
 //! The value, geometry, and scalar types are always available. The
 //! `Vec`-returning algorithms — the planner, the pre-processing helpers, and the
 //! four strategy families — are re-exported under the `alloc` feature, matching
-//! where they are defined. The content-aware chunker `ContentAware` joins them
-//! under the `text` feature, and `AggregatePolicyKind` under `serde`.
+//! where they are defined. The content-aware chunker `ContentAware` and its
+//! `Chunk` payload join them under the `text` feature, and `AggregatePolicyKind`
+//! under `serde`.
 
 pub use crate::{
   error::WinditError,
@@ -34,7 +35,7 @@ pub use crate::{
 };
 
 #[cfg(feature = "text")]
-pub use crate::split::ContentAware;
+pub use crate::split::{Chunk, ContentAware};
 
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 pub use crate::aggregate::AggregatePolicyKind;
