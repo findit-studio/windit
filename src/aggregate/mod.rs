@@ -49,11 +49,11 @@
 //!   value is zero can fold to an order-dependent non-zero residue once a small
 //!   term is absorbed into a large partial sum and the large term is later
 //!   subtracted away. The accumulation is therefore a compensated
-//!   (Neumaier's variant of Kahan-Babuška) sum: it carries the low-order bits every naive
-//!   fold discards, so an exactly cancelling sum lands at exactly zero
-//!   regardless of association order, and [`WinditError::NonFinite`] keeps
-//!   meaning "no direction" rather than "the fold happened to round to a
-//!   residue".
+//!   (Neumaier's variant of Kahan-Babuška) sum, and a determinacy gate then
+//!   rejects any result at or below the fold's own provable rounding floor — so
+//!   [`WinditError::NonFinite`] keeps meaning "no direction determined at
+//!   working precision" rather than "the fold happened to round to a residue".
+//!   The [Input domain](self#input-domain) note states the bound this rests on.
 //! - **A norm that is not representable although the vector is.**
 //!   `[f64::MAX, f64::MAX]` is an ordinary diagonal whose norm, `sqrt(2) *
 //!   f64::MAX`, overflows. The renormalization divides each component by its own
@@ -87,6 +87,21 @@
 //! the squared term [`SaliencyWeighted`] forms. Every value an `f32`-storage
 //! embedding can produce lies more than 250 binary orders inside this window on
 //! both sides, so no realizable `f32` input ever reaches a boundary.
+//!
+//! Within the domain, an aggregated result is the direction of a vector within
+//! `4 * `[`Real::EPSILON`]` * ||M||` of the exact weighted sum, where `M` is the
+//! componentwise sum of the folded term magnitudes; any result whose norm is at
+//! or below `16 * `[`Real::EPSILON`]` * ||M||` is reported as
+//! [`WinditError::NonFinite`] — no direction is determined at working precision.
+//! This is the crate's one accuracy claim, and it is a theorem rather than an
+//! observation: per dimension the fold's error is at most the product rounding
+//! (`<= u * M_j`, with `u = EPSILON / 2`) plus the Neumaier bound (`<= 2u * M_j`,
+//! plus an `O(n * u^2) * M_j` tail negligible for any window count that fits in
+//! memory), together at most `4 * EPSILON * M_j`; summing over dimensions gives
+//! `||R - exact|| <= 4 * EPSILON * ||M||`. An exactly cancelling sum therefore
+//! has `||R|| <= 4 * EPSILON * ||M|| < 16 * EPSILON * ||M||` and is always gated,
+//! whatever the ordering or tier structure — so no fold can fabricate a
+//! direction from cancellation without violating the bound.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
@@ -399,32 +414,37 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     coverages: &[f32],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
-    check_inputs(embeddings, coverages, dim)?;
     // A convex EMA needs alpha in [0, 1]; anything else (including NaN, which
-    // fails the range test) is a configuration error, not a normalizable vector.
-    // The test runs on the f32 configuration field, before widening, so the
-    // same range is enforced at every compute scalar.
+    // fails the range test) is a configuration error, checked first and on the
+    // f32 configuration field so the same range is enforced at every compute
+    // scalar.
     if !(0.0..=1.0).contains(&self.alpha) {
       return Err(WinditError::AlphaOutOfRange);
     }
-    // `1 - alpha` is formed in C rather than folded in f32 first: at C = f64
-    // the f32 fold would round the complement to f32 precision and make the
-    // f64 path gratuitously less accurate than its type promises.
+    // The recurrence `s_i = alpha*e_i + (1-alpha)*s_{i-1}` from `s_0 = e_0` is
+    // the convex combination `sum_i w_i * e_i` with `w_0 = (1-alpha)^(n-1)` and
+    // `w_i = alpha*(1-alpha)^(n-1-i)` for `i >= 1`. Building those weights and
+    // folding through `weighted_sum_renorm` gives EMA the same input domain,
+    // determinacy gate, and error bound as every other policy from one proof —
+    // there is no separate recurrence fold left to fabricate a direction. The
+    // dyadic case (`alpha = 0.5` over basis vectors) reproduces the old
+    // recurrence bit for bit. `1 - alpha` is formed in `C`, not folded in `f32`
+    // first, so the `f64` path keeps the precision its type promises.
     let alpha = C::from_f32(self.alpha);
     let complement = C::ONE - alpha;
-    let mut state = try_vec_with_capacity(embeddings[0].len())?;
-    state.extend_from_slice(embeddings[0]);
-    // No prescaling of the state: computing in f64 keeps `alpha * e` exact for
-    // every f32-derived subnormal (`0.5 * f32::from_bits(1)` is `2^-150`, a
-    // normal f64), so the convex step never flushes the small component a
-    // power-of-two shift used to discard by pushing it below the subnormal floor.
-    for emb in &embeddings[1..] {
-      for (s, &e) in state.iter_mut().zip(emb.iter()) {
-        *s = alpha * e + complement * *s;
-      }
+    let n = embeddings.len();
+    let mut weights = try_zeroed::<C>(n)?;
+    // One backward pass carrying `power = complement^(n-1-i)`; the oldest window
+    // gets the bare `complement^(n-1)` with no `alpha` factor.
+    let mut power = C::ONE;
+    for i in (1..n).rev() {
+      weights[i] = alpha * power;
+      power = power * complement;
     }
-    l2_renorm(&mut state)?;
-    Ok(state)
+    if n > 0 {
+      weights[0] = power;
+    }
+    weighted_sum_renorm(embeddings, coverages, dim, |i, _| weights[i])
   }
 }
 
@@ -519,16 +539,21 @@ fn check_inputs<C: Real>(
   Ok(())
 }
 
-/// Accumulate `sum_i weight(i, emb_i) * emb_i` and L2-renormalize it.
+/// Accumulate `sum_i weight(i, emb_i) * emb_i`, gate it against its own rounding
+/// floor, and L2-renormalize it.
 ///
 /// One pass, no retry, no prescaling: the compute scalar is `f64` (an `f32`
-/// embedding widened before this ran), which has the range to fold every `f32`
-/// derived product without overflow or underflow. The sum is *compensated*
-/// (Neumaier), so a wide exponent spread cannot fabricate a direction out of a
-/// sum that exactly cancels: the low-order bits a naive fold would drop when a
-/// small term meets a large partial sum are carried and added back, leaving an
-/// exactly cancelling accumulation at exactly zero for [`l2_renorm`] to reject
-/// as the directionless vector it is, whatever order the windows fold in.
+/// embedding widened before this ran), and [`check_inputs`] has confined every
+/// component to the input domain, so every product and partial sum is finite and
+/// normal. The sum is *compensated* (Neumaier), and alongside it the routine
+/// accumulates `M`, the componentwise sum of the term magnitudes. Before
+/// normalizing, a determinacy gate rejects any result whose norm is at or below
+/// `16 * EPSILON * ||M||`: within the fold's provable `4 * EPSILON * ||M||` error
+/// bound the exact weighted sum is indistinguishable from zero there, so a
+/// smaller residue is rounding noise with no direction — not a vector for
+/// [`l2_renorm`] to amplify into a fabricated unit direction. The bound is the
+/// crate's one accuracy claim; see the module [Input domain](self#input-domain)
+/// note for the proof.
 fn weighted_sum_renorm<C: Real>(
   embeddings: &[&[C]],
   coverages: &[f32],
@@ -542,14 +567,33 @@ fn weighted_sum_renorm<C: Real>(
   // The running Neumaier compensation, one term per dimension: the sum of the
   // low-order bits `acc` could not hold as it grew.
   let mut comp = try_zeroed::<C>(dim)?;
+  // `M`: the running sum of term magnitudes per dimension. Plain monotone adds
+  // (no cancellation), so it is a faithful measure of the mass the fold summed,
+  // and its own accumulation error only tightens the gate.
+  let mut mag = try_zeroed::<C>(dim)?;
   for (i, emb) in embeddings.iter().enumerate() {
     let w = weight(i, emb);
-    for ((a, c), &e) in acc.iter_mut().zip(comp.iter_mut()).zip(emb.iter()) {
-      neumaier_add(a, c, w * e);
+    for (((a, c), m), &e) in acc
+      .iter_mut()
+      .zip(comp.iter_mut())
+      .zip(mag.iter_mut())
+      .zip(emb.iter())
+    {
+      let term = w * e;
+      neumaier_add(a, c, term);
+      *m = *m + term.abs();
     }
   }
   for (a, &c) in acc.iter_mut().zip(comp.iter()) {
     *a = *a + c;
+  }
+  // Determinacy gate: reject a result at or below the fold's own rounding floor
+  // rather than let `l2_renorm` amplify rounding noise into a direction. `K = 16`
+  // against the proven `<= 4 * EPSILON * ||M||` bound (module Input domain note),
+  // so exact cancellation (`||exact|| = 0`) is always caught, at every ordering.
+  let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(&mag);
+  if l2_norm(&acc) <= tau {
+    return Err(WinditError::NonFinite);
   }
   l2_renorm(&mut acc)?;
   Ok(acc)
@@ -560,8 +604,9 @@ fn weighted_sum_renorm<C: Real>(
 /// The correction is `(larger - new_sum) + smaller`: the part of the smaller
 /// magnitude that `new_sum` could not represent, which is exactly what a naive
 /// `acc + term` discards. Accumulated into `comp` and folded back once at the
-/// end, it makes the total independent of association order — so an exactly
-/// cancelling set of terms totals exactly zero however the windows are ordered.
+/// end, it holds the fold's error to a small multiple of the accumulated term
+/// magnitude, which is what makes the determinacy gate in
+/// [`weighted_sum_renorm`] sound.
 fn neumaier_add<C: Real>(acc: &mut C, comp: &mut C, term: C) {
   let sum = *acc + term;
   *comp = *comp

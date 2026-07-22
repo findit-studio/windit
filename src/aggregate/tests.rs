@@ -110,6 +110,28 @@ fn quantized_storage_takes_widening_path() {
     .map(|x| TestQuant(libm::roundf(x * 127.0) as i8))
     .collect();
   assert_eq!(out.as_slice(), requantized.as_slice());
+
+  // The determinacy gate holds at the widening path too: an exactly-cancelling
+  // quantized pair [1, 0] and [-1, 0] quantizes to [127, 0] and [-127, 0], widens
+  // to f64 [1, 0] and [-1, 0], and folds to the zero vector -> NonFinite. This is
+  // the F1 class reached through i8 storage rather than the f64 borrow path.
+  // (TestQuant's image {0} U +-[1/127, 1] cannot express an out-of-domain
+  // magnitude, so MagnitudeOutOfRange genericity stays with the direct-f64 corner
+  // tests.)
+  let cancelling = [
+    Windowed::new(
+      TestQuantVec::from_unnormalized(&[1.0, 0.0]).unwrap(),
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      TestQuantVec::from_unnormalized(&[-1.0, 0.0]).unwrap(),
+      Span::new(0, 4, 4),
+    ),
+  ];
+  assert!(matches!(
+    aggregate(&CoverageWeightedMean, &cancelling),
+    Err(WinditError::NonFinite)
+  ));
 }
 
 #[test]
@@ -604,32 +626,128 @@ fn wide_spread_cancellation_rejected_at_f64_scale() {
   );
 }
 
-/// The EMA counterexample: `alpha 0.5` over `[1, d]` then `[-1, d]` has exact
-/// state `[0, d]`, a valid unit vector `[0, 1]` — but the first component
-/// cancels and the second is a subnormal that a shifted fold used to flush. In
-/// f64 the halving `0.5 * d` stays representable, so the small component
-/// survives and the scale-aware renorm returns the direction it points.
-fn assert_ema_subnormal_survives(d: f64) {
-  let fwd: [&[f64]; 2] = [&[1.0, d], &[-1.0, d]];
-  let out = EmaRenormalized::new(0.5)
-    .aggregate_values(&fwd, &[1.0, 1.0], 2)
-    .unwrap();
-  assert_close_f64(&out, &[0.0, 1.0]);
-
-  // Reversed, the same cancellation and the same surviving subnormal.
-  let rev: [&[f64]; 2] = [&[-1.0, d], &[1.0, d]];
-  let out_rev = EmaRenormalized::new(0.5)
-    .aggregate_values(&rev, &[1.0, 1.0], 2)
-    .unwrap();
-  assert_close_f64(&out_rev, &[0.0, 1.0]);
+#[test]
+fn ema_subnormal_survives_at_f32_scale() {
+  // REVOKED (settlement §4.5.6(b), R-A — expressly signed off by the Fable 5
+  // adjudication): re-pinned to Err(NonFinite) for both window orders. Here
+  // d = 2^-149 is in-domain, so the domain check passes it and the determinacy
+  // gate does the rejecting.
+  //
+  // Justification: `alpha 0.5` over `[1, d]` then `[-1, d]` has the exact convex
+  // sum `[0, d]`, but that `d` sits 2^-97 below the fold's provable error floor
+  // (||R|| / (eps*||M||) = 2^-97). A one-ulp change to either unit component
+  // moves the exact direction anywhere in the rejection band — [0,1], [+1,0],
+  // and [-1,0] are all members (2^96 conditioning) — so no direction is
+  // determined at working precision; the old [0,1] was a per-dimension-recurrence
+  // artifact. The fixture's gate signature is moreover indistinguishable from a
+  // real in-domain three-tier EMA fabrication whose exact direction is orthogonal
+  // to [0,1], so keeping it green would require special-casing the fixture (the
+  // actual gaming). This is the f32-scale face of the promise its own f64-scale
+  // sibling already revokes. Genuine in-domain subnormal survival is pinned by
+  // the cancellation-free companion below.
+  let d = f64::from(f32::from_bits(1)); // 2^-149
+  for windows in [[[1.0, d], [-1.0, d]], [[-1.0, d], [1.0, d]]] {
+    let embeddings: [&[f64]; 2] = [&windows[0], &windows[1]];
+    let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &[1.0, 1.0], 2);
+    assert!(
+      matches!(got, Err(WinditError::NonFinite)),
+      "an in-domain subnormal below the gate floor must be NonFinite, got {got:?}"
+    );
+  }
 }
 
 #[test]
-fn ema_subnormal_survives_at_f32_scale() {
-  // d = smallest f32 subnormal (2^-149). In f32, `0.5 * d` rounds to zero and the
-  // state collapses to [0, 0] -> NonFinite; in f64, `0.5 * 2^-149 = 2^-150` is a
-  // normal f64, so the subnormal survives and the EMA returns [0, 1].
-  assert_ema_subnormal_survives(f64::from(f32::from_bits(1)));
+fn ema_subnormal_survives_without_cancellation_at_f32_scale() {
+  // The companion the R-A revocation adds, pinning the property the revoked
+  // fixture actually owned: f64 keeps a halved f32-subnormal representable
+  // (`0.5 * 2^-149 = 2^-150`, a normal f64, no flush), decoupled from the
+  // cancellation rider. Windows `[d, 2d]` twice (d = 2^-149) fold without
+  // cancellation to `[d, 2d]`, so `||R|| = ||M|| = sqrt(5)*d` clears the gate by
+  // ~2^48 and the direction is `[1/sqrt(5), 2/sqrt(5)]`. A flushing fold would
+  // return `[0, 1]` and fail this assertion; note `[3d, 4d]` would not exercise
+  // the floor, since `0.5 * 3d = 1.5 * 2^-149` never dips below it.
+  let d = f64::from(f32::from_bits(1)); // 2^-149
+  let windows: [&[f64]; 2] = [&[d, 2.0 * d], &[d, 2.0 * d]];
+  let out = EmaRenormalized::new(0.5)
+    .aggregate_values(&windows, &[1.0, 1.0], 2)
+    .unwrap();
+  assert_close_f64(&out, &[0.447_213_595_499_957_9, 0.894_427_190_999_915_9]);
+}
+
+#[test]
+fn exact_cancellation_across_three_tiers_is_gated() {
+  // R5 F1: the Neumaier fold is exact per step, but its final fold-back leaves an
+  // order-dependent residue when tiny terms ride on a magnitude-1 cancellation
+  // across three exponent tiers. A = 2^-60 and d = 3*2^-120 are both in-domain,
+  // so the domain check passes them; the six windows have an exact componentwise
+  // sum of zero, yet the fold leaves ~3*2^-120 in dimension 0 that a naive renorm
+  // would amplify to a fabricated [1, 0]. The determinacy gate rejects it
+  // (||R|| ~ 2.3e-36 vs tau ~ 1.6e-14) under every one of the 720 window orders,
+  // at both uniform-weight policies.
+  let a = f64::from_bits(0x3c30_0000_0000_0000); // 2^-60
+  let d = 3.0 * f64::from_bits(0x3870_0000_0000_0000); // 3 * 2^-120
+  let windows = [
+    [a, 1.0],
+    [-d, 1.0],
+    [-1.0, 0.0],
+    [-a, -1.0],
+    [d, -1.0],
+    [1.0, 0.0],
+  ];
+  let coverages = [1.0_f32; 6];
+  let mut orders = 0;
+  for order in permutations(6) {
+    orders += 1;
+    let cols: Vec<[f64; 2]> = order.iter().map(|&i| windows[i]).collect();
+    let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+    for (name, got) in [
+      (
+        "MeanRenormalized",
+        MeanRenormalized.aggregate_values(&embeddings, &coverages, 2),
+      ),
+      (
+        "CoverageWeightedMean",
+        CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 2),
+      ),
+    ] {
+      assert!(
+        matches!(got, Err(WinditError::NonFinite)),
+        "{name} order {order:?} must gate the F1 fabrication, got {got:?}"
+      );
+    }
+  }
+  assert_eq!(orders, 720, "F1 must be checked at all 720 permutations");
+}
+
+#[test]
+fn determinacy_gate_rejects_opposite_units_and_admits_a_real_residual() {
+  // Two exactly-opposite unit windows sum to the zero vector; the gate reports
+  // NonFinite (no direction) at both uniform-weight policies.
+  let opposite: [&[f64]; 2] = [&[1.0, 0.0], &[-1.0, 0.0]];
+  for (name, got) in [
+    (
+      "MeanRenormalized",
+      MeanRenormalized.aggregate_values(&opposite, &[1.0, 1.0], 2),
+    ),
+    (
+      "CoverageWeightedMean",
+      CoverageWeightedMean.aggregate_values(&opposite, &[1.0, 1.0], 2),
+    ),
+  ] {
+    assert!(
+      matches!(got, Err(WinditError::NonFinite)),
+      "{name} must gate exactly-opposite units, got {got:?}"
+    );
+  }
+
+  // A genuine residual well above the gate floor is admitted: [1, 0] and
+  // [-1, 1e-8] cancel in dimension 0 but leave 1e-8 in dimension 1 (~13 orders
+  // above tau ~ 7e-15), so the honest aggregate direction [0, 1] is returned.
+  let near: [&[f64]; 2] = [&[1.0, 0.0], &[-1.0, 1e-8]];
+  let out = MeanRenormalized
+    .aggregate_values(&near, &[1.0, 1.0], 2)
+    .unwrap();
+  assert_close_f64(&out, &[0.0, 1.0]);
 }
 
 #[test]
