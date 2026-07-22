@@ -101,6 +101,34 @@ pub trait Real:
   /// The multiplicative identity.
   const ONE: Self;
 
+  /// The unit roundoff: the gap between `1` and the next larger representable
+  /// value (`2^-52` for `f64`).
+  ///
+  /// Aggregation scales this by the accumulated term magnitude to decide when a
+  /// folded result lies at or below its own rounding floor, and so determines no
+  /// direction at working precision.
+  const EPSILON: Self;
+
+  /// The smallest magnitude a nonzero input component may carry into aggregation
+  /// (`2^-400` for `f64`).
+  ///
+  /// With [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) it bounds the input
+  /// domain within which every intermediate of every built-in aggregation policy
+  /// stays finite and every nonzero intermediate stays a normal value — no
+  /// overflow, no flush to a subnormal. A nonzero component below it is rejected
+  /// before any arithmetic. Every magnitude an `f32`-storage embedding can
+  /// produce sits far above it.
+  const MIN_AGG_MAGNITUDE: Self;
+
+  /// The largest magnitude a nonzero input component may carry into aggregation
+  /// (`2^400` for `f64`).
+  ///
+  /// The upper companion to [`MIN_AGG_MAGNITUDE`](Real::MIN_AGG_MAGNITUDE),
+  /// sized so that even the norm-weighted saliency policy — which squares a
+  /// magnitude — keeps every intermediate a normal value. A component above it
+  /// is rejected before any arithmetic.
+  const MAX_AGG_MAGNITUDE: Self;
+
   /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA
   /// smoothing factor — into this domain. Exact for every implementor.
   ///
@@ -174,6 +202,11 @@ impl Scalar for f64 {
 impl Real for f64 {
   const ZERO: Self = 0.0;
   const ONE: Self = 1.0;
+  const EPSILON: Self = f64::EPSILON;
+  // 2^-400 and 2^400, the aggregation magnitude domain (sized in the `aggregate`
+  // module docs). `from_bits` is const well below the 1.95 MSRV.
+  const MIN_AGG_MAGNITUDE: Self = f64::from_bits(0x26F0_0000_0000_0000);
+  const MAX_AGG_MAGNITUDE: Self = f64::from_bits(0x58F0_0000_0000_0000);
 
   fn from_f32(x: f32) -> Self {
     f64::from(x)

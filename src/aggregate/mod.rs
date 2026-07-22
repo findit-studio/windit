@@ -71,16 +71,22 @@
 //! cancel exactly is not a vector whose norm was unrepresentable — it is a
 //! vector with no direction.
 //!
-//! One magnitude window is irreducible, because `f64` is the widest domain there
-//! is. [`SaliencyWeighted`] weights each window by its L2 norm, so it forms the
-//! square of a magnitude where the other policies stay linear in it. Past about
-//! `1.3e154` (roughly `sqrt(f64::MAX)`) that square overflows, and below about
-//! `1.5e-162` it underflows to zero — and no power-of-two prescaling can pull
-//! either back without the subnormal-flushing fabrication a scaled fold
-//! reintroduces, so that one policy returns [`WinditError::NonFinite`] outside
-//! the window rather than invent a direction. The three linear policies have no
-//! such window, and every realistic embedding magnitude (unit-ish, and never
-//! past `~1e38`) sits more than a hundred orders of magnitude inside it.
+//! Rather than let any policy reach for the edge of `f64`, aggregation enforces
+//! an input domain that keeps every fold clear of it — see below.
+//!
+//! # Input domain
+//!
+//! Every input component must be finite and either zero or of a magnitude
+//! between [`Real::MIN_AGG_MAGNITUDE`] and [`Real::MAX_AGG_MAGNITUDE`]
+//! (`[2^-400, 2^400]` for `f64`, about `[3.9e-121, 2.6e120]`); every coverage
+//! must be finite and in `[0, 1]`. Inputs outside this domain are rejected with
+//! [`WinditError::MagnitudeOutOfRange`] or [`WinditError::CoverageOutOfRange`]
+//! before any arithmetic. The bounds are sized so that within them every
+//! intermediate of every built-in policy is finite and every nonzero
+//! intermediate is a normal `f64` — no overflow, no subnormal flush — including
+//! the squared term [`SaliencyWeighted`] forms. Every value an `f32`-storage
+//! embedding can produce lies more than 250 binary orders inside this window on
+//! both sides, so no realizable `f32` input ever reaches a boundary.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
@@ -154,11 +160,19 @@ pub trait AggregatePolicy<C: Real = f64> {
   /// `f32` at every scalar: a coverage is a geometric fraction from
   /// [`Span::coverage`](crate::plan::Span::coverage), not an embedding value.
   ///
+  /// Every component must be finite and either zero or of magnitude within
+  /// `[MIN_AGG_MAGNITUDE, MAX_AGG_MAGNITUDE]`, and every coverage finite and in
+  /// `[0, 1]`; see the module [Input domain](self#input-domain) note.
+  ///
   /// # Errors
   ///
   /// - [`WinditError::Empty`] if `embeddings` is empty.
   /// - [`WinditError::DimMismatch`] if `coverages.len() != embeddings.len()` or
   ///   any embedding's length differs from `dim`.
+  /// - [`WinditError::MagnitudeOutOfRange`] if a nonzero component's magnitude is
+  ///   outside `[MIN_AGG_MAGNITUDE, MAX_AGG_MAGNITUDE]`.
+  /// - [`WinditError::CoverageOutOfRange`] if a coverage is not a finite fraction
+  ///   in `[0, 1]`.
   /// - [`WinditError::NonFinite`] if the combined vector cannot be normalized to
   ///   a finite unit vector (zero norm or a non-finite component).
   fn aggregate_values(
@@ -326,12 +340,11 @@ impl EmaRenormalized {
 /// [`aggregate_values`](AggregatePolicy::aggregate_values) directly to exploit it.
 ///
 /// Because it squares magnitudes (weight times component, and the weight is
-/// itself a norm), it is the one built-in with a bounded `f64` magnitude window:
-/// a component past about `sqrt(f64::MAX)` (`~1.3e154`) overflows and one below
-/// about `1.5e-162` underflows to zero, and either is rejected with
-/// [`WinditError::NonFinite`] rather than rescaled by the fabrication-prone shift
-/// that widening to `f64` exists to retire. Realistic magnitudes sit deep inside
-/// the window; see the module [Scale](self#scale) note.
+/// itself a norm), its intermediates reach higher than any linear policy's. The
+/// crate-level [input domain](self#input-domain) is sized so even that square
+/// stays a finite, normal `f64`, which is why this policy needs no window of its
+/// own: a component outside the domain is rejected by the shared input check
+/// before the square is ever formed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SaliencyWeighted;
 
@@ -457,8 +470,19 @@ impl AggregatePolicyKind {
   }
 }
 
-/// Validate that `embeddings` is non-empty, `coverages` matches its length, and
-/// every embedding has length `dim`.
+/// Validate `embeddings`, `coverages`, and every component against the
+/// aggregation input domain, before any arithmetic runs.
+///
+/// Beyond the structural checks — non-empty, `coverages` length matching
+/// `embeddings`, every embedding of length `dim` — this rejects a non-finite
+/// component ([`NonFinite`](WinditError::NonFinite)), a nonzero component whose
+/// magnitude is outside `[MIN_AGG_MAGNITUDE, MAX_AGG_MAGNITUDE]`
+/// ([`MagnitudeOutOfRange`](WinditError::MagnitudeOutOfRange)), and a coverage
+/// that is not a finite fraction in `[0, 1]`
+/// ([`CoverageOutOfRange`](WinditError::CoverageOutOfRange)). Enforcing the
+/// domain here — the one choke point every built-in policy passes through — is
+/// what lets each fold run without overflow or subnormal flush; see the module
+/// [Scale](self#scale) note.
 fn check_inputs<C: Real>(
   embeddings: &[&[C]],
   coverages: &[f32],
@@ -473,12 +497,23 @@ fn check_inputs<C: Real>(
       expected: embeddings.len(),
     });
   }
-  for emb in embeddings {
+  for (window, (emb, &coverage)) in embeddings.iter().zip(coverages).enumerate() {
     if emb.len() != dim {
       return Err(WinditError::DimMismatch {
         got: emb.len(),
         expected: dim,
       });
+    }
+    if !(coverage.is_finite() && (0.0..=1.0).contains(&coverage)) {
+      return Err(WinditError::CoverageOutOfRange { window });
+    }
+    for (component, &x) in emb.iter().enumerate() {
+      if !x.is_finite() {
+        return Err(WinditError::NonFinite);
+      }
+      if x != C::ZERO && (x.abs() < C::MIN_AGG_MAGNITUDE || x.abs() > C::MAX_AGG_MAGNITUDE) {
+        return Err(WinditError::MagnitudeOutOfRange { window, component });
+      }
     }
   }
   Ok(())
