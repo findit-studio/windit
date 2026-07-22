@@ -73,6 +73,29 @@ pub enum WinditError {
   /// An embedding could not be normalized to a finite unit vector: a component
   /// was not finite, or the vector had zero norm.
   NonFinite,
+  /// A nonzero input component's magnitude fell outside the aggregation domain
+  /// `[MIN_AGG_MAGNITUDE, MAX_AGG_MAGNITUDE]` (for `f64`, `[2^-400, 2^400]`).
+  ///
+  /// Aggregation rejects such a component before any arithmetic: outside this
+  /// domain an intermediate could overflow to infinity or flush to a subnormal,
+  /// so a typed rejection is the honest answer rather than a fabricated or lost
+  /// direction. Zero is always admissible. The bounds are `Real` associated
+  /// constants, so a future compute scalar sets its own.
+  MagnitudeOutOfRange {
+    /// The index of the offending window within the aggregated sequence.
+    window: usize,
+    /// The index of the offending component within that window's embedding.
+    component: usize,
+  },
+  /// A per-window coverage was not a finite fraction in `[0, 1]`.
+  ///
+  /// A coverage is a geometric fraction (from `Span::coverage`), so a value
+  /// outside `[0, 1]`, or a non-finite one, is rejected before aggregation
+  /// rather than folded into a weight.
+  CoverageOutOfRange {
+    /// The index of the offending window within the aggregated sequence.
+    window: usize,
+  },
   /// An exponential-moving-average smoothing factor (`alpha`) was outside the
   /// valid `[0, 1]` range, or was not a number.
   ///
@@ -130,6 +153,18 @@ impl core::fmt::Display for WinditError {
         write!(f, "dimension {got} does not match the expected {expected}")
       }
       Self::NonFinite => f.write_str("embedding could not be normalized to a finite unit vector"),
+      Self::MagnitudeOutOfRange { window, component } => {
+        write!(
+          f,
+          "component {component} of window {window} is outside the aggregation magnitude domain"
+        )
+      }
+      Self::CoverageOutOfRange { window } => {
+        write!(
+          f,
+          "coverage of window {window} must be a finite fraction in [0, 1]"
+        )
+      }
       Self::AlphaOutOfRange => f.write_str("EMA smoothing factor alpha must be in [0, 1]"),
       Self::Empty => f.write_str("input sequence was empty"),
       Self::AllocFailed { elements } => {

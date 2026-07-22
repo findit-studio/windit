@@ -252,11 +252,12 @@ fn every_builtin_policy_normalizes_f32_range_vectors() {
 
 #[test]
 fn linear_policies_normalize_f64_range_vectors() {
-  // The same class at the exponents that reach f64's own range: 1.5e308 squares
-  // to infinity and its norm, sqrt(2) * 1.5e308, is likewise not representable.
-  // f64 is the widest domain there is, so these are handled by the scale-aware
-  // renormalization rather than by widening further. The three policies that stay
-  // linear in the component (they do not weight by a norm) have no ceiling here.
+  // REVOKED (settlement §4.5.6, deliberate): the former promise that any finite
+  // f64 normalizes is retracted. These synthetic f64-range extremes all sit
+  // outside the enforced input domain [2^-400, 2^400], so every row is now
+  // rejected before arithmetic with MagnitudeOutOfRange rather than normalized.
+  // No consumer produces them: an f32-storage embedding stays 250+ binary orders
+  // inside the domain on both sides.
   let coverages = [1.0];
   let linear: [(&str, PolicyRun); 3] = [
     ("MeanRenormalized", |e, c, d| {
@@ -269,58 +270,49 @@ fn linear_policies_normalize_f64_range_vectors() {
       EmaRenormalized::new(0.5).aggregate_values(e, c, d)
     }),
   ];
-  for (raw, want) in [
-    (
-      [1.5e308_f64, 1.5e308],
-      [core::f64::consts::FRAC_1_SQRT_2; 2],
-    ),
-    ([1e200, 0.0], [1.0, 0.0]),
-    ([f64::MAX, 0.0], [1.0, 0.0]),
-    ([1e-300, 0.0], [1.0, 0.0]),
-    ([f64::from_bits(1), 0.0], [1.0, 0.0]),
+  for raw in [
+    [1.5e308_f64, 1.5e308],
+    [1e200, 0.0],
+    [f64::MAX, 0.0],
+    [1e-300, 0.0],
+    [f64::from_bits(1), 0.0],
   ] {
     let embeddings: [&[f64]; 1] = [&raw];
     for (name, run) in linear {
-      let got = run(&embeddings, &coverages, 2)
-        .unwrap_or_else(|e| panic!("{name} rejected the finite vector {raw:?}: {e:?}"));
-      assert_close_f64(&got, &want);
+      let got = run(&embeddings, &coverages, 2);
+      assert!(
+        matches!(got, Err(WinditError::MagnitudeOutOfRange { .. })),
+        "{name} must reject out-of-domain {raw:?}, got {got:?}"
+      );
     }
   }
 }
 
 #[test]
 fn saliency_normalizes_within_its_f64_magnitude_window() {
-  // SaliencyWeighted squares a magnitude (weight = norm, then weight * component),
-  // so its window is `sqrt(f64::MIN_POSITIVE) .. sqrt(f64::MAX)`
-  // (~1.5e-162 .. ~1.3e154), not the full f64 range. Inside it, a very large or
-  // very small window still normalizes: `1e150` squares to `1e300` and `1e-150`
-  // to `1e-300`, both inside f64.
-  for (raw, want) in [
-    ([1e150_f64, 0.0], [1.0, 0.0]),
-    ([1e-150, 0.0], [1.0, 0.0]),
-    ([1e100, 1e100], [core::f64::consts::FRAC_1_SQRT_2; 2]),
-  ] {
+  // REVOKED (settlement §4.5.6, deliberate): SaliencyWeighted loses its special
+  // per-policy window. The crate-level input domain [2^-400, 2^400] replaces it,
+  // so the former "inside the window" extremes (1e150, 1e-150) are now out of
+  // domain and rejected before the square is formed, alongside the former
+  // out-of-window ones (1e200, 1e-200).
+  for raw in [[1e150_f64, 0.0], [1e-150, 0.0], [1e200, 0.0], [1e-200, 0.0]] {
     let embeddings: [&[f64]; 1] = [&raw];
-    let got = SaliencyWeighted
-      .aggregate_values(&embeddings, &[1.0], 2)
-      .unwrap_or_else(|e| panic!("SaliencyWeighted rejected {raw:?} inside its window: {e:?}"));
-    assert_close_f64(&got, &want);
-  }
-
-  // Outside the window the norm-weighted square leaves f64 — overflow at the top,
-  // underflow to zero at the bottom — and with no wider domain to escape to and
-  // only the fabrication-prone shift to rescale with, the honest answer is a
-  // rejection, not an invented direction.
-  for beyond in [[1e200_f64, 0.0], [1e-200, 0.0]] {
-    let embeddings: [&[f64]; 1] = [&beyond];
     assert!(
       matches!(
         SaliencyWeighted.aggregate_values(&embeddings, &[1.0], 2),
-        Err(WinditError::NonFinite)
+        Err(WinditError::MagnitudeOutOfRange { .. })
       ),
-      "SaliencyWeighted must reject {beyond:?} outside its magnitude window"
+      "SaliencyWeighted must reject out-of-domain {raw:?}"
     );
   }
+
+  // The in-domain row stays: 1e100 is well within [2^-400, 2^400], so its square
+  // (1e200) is an ordinary normal f64 and the window still normalizes.
+  let in_domain: [&[f64]; 1] = [&[1e100, 1e100]];
+  let got = SaliencyWeighted
+    .aggregate_values(&in_domain, &[1.0], 2)
+    .unwrap();
+  assert_close_f64(&got, &[core::f64::consts::FRAC_1_SQRT_2; 2]);
 }
 
 #[test]
@@ -536,19 +528,24 @@ fn exact_cancellation_is_rejected() {
   }
 }
 
-/// The R4 counterexample: a sum that cancels exactly only because tiny terms
-/// ride on a huge one. `e` is the huge component and `d*e` the tiny term; the
-/// five window values `e, -e, 48d*e, -32d*e, -16d*e` sum to exactly zero, since
-/// `e - e = 0` and `48 - 32 - 16 = 0`. A naive fold destroys the second half by
-/// absorbing `48d*e` into `e` and then subtracting `e` away, fabricating an
-/// order-dependent residue that normalizes to a fictitious `[1]`. The compensated
-/// accumulation recovers it, so the uniform-weight policies reject the
-/// directionless vector under every permutation of the five windows.
+/// The R4 counterexample: a sum that cancels only because tiny terms ride on a
+/// huge one. `e` is the huge component and `d*e` the tiny term; the five window
+/// values `e, -e, 48d*e, -32d*e, -16d*e` have an exact sum of zero (`e - e = 0`
+/// and `48 - 32 - 16 = 0`). A naive fold destroys the second half by absorbing
+/// `48d*e` into `e` and then subtracting `e` away, fabricating an
+/// order-dependent residue that normalizes to a fictitious `[1]`.
+///
+/// The uniform-weight policies must reject the directionless vector under every
+/// permutation. When the values are in-domain (`domain_rejected == false`) the
+/// fold cannot fabricate a direction from the exact cancellation and returns
+/// [`WinditError::NonFinite`]; when the huge component is out of the input
+/// domain (`domain_rejected == true`) the input check rejects it first as
+/// [`WinditError::MagnitudeOutOfRange`].
 ///
 /// The cancellation is carried in the (f64) embedding values, not the (f32)
 /// coverages: at the f64 scale the coverage weights `48d` would be far below
 /// f32's subnormal floor, so only the compute-domain channel can express it.
-fn assert_wide_spread_cancellation_rejected(e: f64, d: f64) {
+fn assert_wide_spread_cancellation_rejected(e: f64, d: f64, domain_rejected: bool) {
   let de = d * e; // exact: the tiny term that rides on `e`
   let values = [e, -e, 48.0 * de, -32.0 * de, -16.0 * de];
   let coverages = [1.0_f32; 5];
@@ -557,16 +554,26 @@ fn assert_wide_spread_cancellation_rejected(e: f64, d: f64) {
     let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
     // Uniform weight at both policies (every coverage is 1.0), so each folds the
     // same five values and must reach the same verdict.
-    let mean = MeanRenormalized.aggregate_values(&embeddings, &coverages, 1);
-    assert!(
-      matches!(mean, Err(WinditError::NonFinite)),
-      "MeanRenormalized order {order:?} at e={e:e} d={d:e} must reject cancellation, got {mean:?}"
-    );
-    let cov = CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 1);
-    assert!(
-      matches!(cov, Err(WinditError::NonFinite)),
-      "CoverageWeightedMean order {order:?} at e={e:e} d={d:e} must reject cancellation, got {cov:?}"
-    );
+    for (name, got) in [
+      (
+        "MeanRenormalized",
+        MeanRenormalized.aggregate_values(&embeddings, &coverages, 1),
+      ),
+      (
+        "CoverageWeightedMean",
+        CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 1),
+      ),
+    ] {
+      let rejected = if domain_rejected {
+        matches!(got, Err(WinditError::MagnitudeOutOfRange { .. }))
+      } else {
+        matches!(got, Err(WinditError::NonFinite))
+      };
+      assert!(
+        rejected,
+        "{name} order {order:?} at e={e:e} d={d:e} must reject cancellation, got {got:?}"
+      );
+    }
   }
 }
 
@@ -580,19 +587,20 @@ fn wide_spread_cancellation_rejected_at_f32_scale() {
   assert_wide_spread_cancellation_rejected(
     f64::from(f32::from_bits(0x7f00_0000)), // 2^127
     f64::from(f32::from_bits(1)),           // 2^-149
+    false,                                  // in-domain: rejected as directionless
   );
 }
 
 #[test]
 fn wide_spread_cancellation_rejected_at_f64_scale() {
-  // The f64 analogue at f64's own extremes: e = 2^1023 and d = the smallest f64
-  // subnormal (2^-1074), so d*e = 2^-51. Here f64 is the widest domain, so
-  // exactness comes from the compensated summation, not a wider type: a naive
-  // fold fabricates an order-dependent residue up to 48*2^-51, which normalizes
-  // to a fictitious [1].
+  // REVOKED (settlement §4.5.6, deliberate): the huge component e = 2^1023 is now
+  // outside the input domain [2^-400, 2^400], so this fixture is rejected before
+  // any arithmetic with MagnitudeOutOfRange rather than by compensated summation.
+  // The in-domain cancellation class stays covered by the f32-scale sibling.
   assert_wide_spread_cancellation_rejected(
     f64::from_bits(0x7fe0_0000_0000_0000), // 2^1023
     f64::from_bits(1),                     // 2^-1074
+    true,                                  // out-of-domain: rejected by the input check
   );
 }
 
@@ -626,12 +634,111 @@ fn ema_subnormal_survives_at_f32_scale() {
 
 #[test]
 fn ema_subnormal_survives_at_f64_scale() {
-  // The f64 analogue: d = 2^-1073, the smallest subnormal whose half (2^-1074) is
-  // still representable in f64 — below it no domain can carry the value, so this
-  // is the faithful floor. The scale-aware renorm divides `[0, 2^-1073]` by its
-  // own 2^-1073 scale (a naive sum of squares would underflow to zero), yielding
-  // the unit vector [0, 1].
-  assert_ema_subnormal_survives(f64::from_bits(2)); // 2^-1073
+  // REVOKED (settlement §4.5.6, deliberate): d = 2^-1073 is below the input
+  // domain floor 2^-400, so this fixture is now rejected before any arithmetic
+  // with MagnitudeOutOfRange rather than normalized to [0, 1]. The genuine
+  // in-domain subnormal-survival property is pinned by a separate,
+  // cancellation-free fixture.
+  let d = f64::from_bits(2); // 2^-1073
+  for windows in [[[1.0, d], [-1.0, d]], [[-1.0, d], [1.0, d]]] {
+    let embeddings: [&[f64]; 2] = [&windows[0], &windows[1]];
+    let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &[1.0, 1.0], 2);
+    assert!(
+      matches!(got, Err(WinditError::MagnitudeOutOfRange { .. })),
+      "out-of-domain EMA subnormal must be rejected, got {got:?}"
+    );
+  }
+}
+
+#[test]
+fn domain_corners_are_accepted_at_the_boundary_and_rejected_beyond() {
+  // The inclusive domain boundary: ±2^400 and ±2^-400 (Real::MAX_AGG_MAGNITUDE /
+  // MIN_AGG_MAGNITUDE for f64) are accepted by all four policies and normalize to
+  // the axis they point along; one binary order past either edge (2^401, 2^-401)
+  // is rejected with MagnitudeOutOfRange carrying the offending window and
+  // component.
+  let max = f64::from_bits(0x58F0_0000_0000_0000); // 2^400
+  let min = f64::from_bits(0x26F0_0000_0000_0000); // 2^-400
+  for (value, want) in [
+    (max, [1.0, 0.0]),
+    (-max, [-1.0, 0.0]),
+    (min, [1.0, 0.0]),
+    (-min, [-1.0, 0.0]),
+  ] {
+    let embeddings: [&[f64]; 1] = [&[value, 0.0]];
+    for (name, run) in builtin_policies() {
+      let got = run(&embeddings, &[1.0], 2)
+        .unwrap_or_else(|e| panic!("{name} rejected boundary {value:e}: {e:?}"));
+      assert_close_f64(&got, &want);
+    }
+  }
+
+  // One binary order past the boundary, with the offending value at a known index
+  // so the reported window/component can be pinned exactly. `2 * 2^400 = 2^401`
+  // and `2^-400 / 2 = 2^-401` are both exact powers of two.
+  for beyond in [2.0 * max, min / 2.0] {
+    let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, beyond]];
+    for (name, run) in builtin_policies() {
+      let got = run(&embeddings, &[1.0, 1.0], 2);
+      assert!(
+        matches!(
+          got,
+          Err(WinditError::MagnitudeOutOfRange {
+            window: 1,
+            component: 1
+          })
+        ),
+        "{name} must reject {beyond:e} at window 1 component 1, got {got:?}"
+      );
+    }
+  }
+}
+
+#[test]
+fn out_of_range_coverage_is_rejected() {
+  // A coverage is a geometric fraction in [0, 1]; NaN, above 1, or below 0 is
+  // rejected with CoverageOutOfRange before any fold, at every policy — the check
+  // lives in the shared input path, so even the policies that ignore coverage
+  // enforce its range.
+  let embeddings: [&[f64]; 1] = [&[1.0, 0.0]];
+  for bad in [f32::NAN, 1.5, -0.1] {
+    for (name, run) in builtin_policies() {
+      let got = run(&embeddings, &[bad], 2);
+      assert!(
+        matches!(got, Err(WinditError::CoverageOutOfRange { window: 0 })),
+        "{name} must reject coverage {bad} at window 0, got {got:?}"
+      );
+    }
+  }
+}
+
+#[test]
+fn out_of_domain_saliency_coverage_and_ema_inputs_are_rejected() {
+  // The R5 F2/F3 findings, now designed rejections: each fixture carries a
+  // component outside the input domain, so it is rejected before the arithmetic
+  // that used to overflow (F2a) or flush a subnormal (F2b, F3) could run.
+  let m = f64::from_bits(1); // 2^-1074, below the domain floor
+
+  // F2a: SaliencyWeighted squared 1e154 past f64's range; 1e154 is out of domain.
+  let f2a: [&[f64]; 2] = [&[1e154, 0.0], &[1e154, 0.0]];
+  assert!(matches!(
+    SaliencyWeighted.aggregate_values(&f2a, &[1.0, 1.0], 2),
+    Err(WinditError::MagnitudeOutOfRange { .. })
+  ));
+
+  // F2b: CoverageWeightedMean flushed 0.5 * m to zero; m is out of domain.
+  let f2b: [&[f64]; 2] = [&[1.0, m], &[-1.0, m]];
+  assert!(matches!(
+    CoverageWeightedMean.aggregate_values(&f2b, &[0.5, 0.5], 2),
+    Err(WinditError::MagnitudeOutOfRange { .. })
+  ));
+
+  // F3: EmaRenormalized halved m toward zero; m is out of domain.
+  let f3: [&[f64]; 2] = [&[1.0, m], &[-1.0, m]];
+  assert!(matches!(
+    EmaRenormalized::new(0.5).aggregate_values(&f3, &[1.0, 1.0], 2),
+    Err(WinditError::MagnitudeOutOfRange { .. })
+  ));
 }
 
 #[test]
