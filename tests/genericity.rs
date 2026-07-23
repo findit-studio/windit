@@ -141,6 +141,47 @@ fn granite_512_window_f64() {
 }
 
 #[test]
+fn f32_widening_path_matches_f64_fast_path_by_value() {
+  // `assert_unit_norm`/`assert_unit_norm_64` are shape-only: any finite,
+  // non-zero, dimension-4 output passes them, so neither can tell "the
+  // widening branch computed the right f64 values" from "the widening branch
+  // computed some other finite, dimension-preserving values" (e.g. a
+  // wrong-but-uniform transform). `embed`/`embed64` compute the identical
+  // logical input from one shared `spans` geometry, so this pins the two
+  // `aggregate()` branches — f32 storage (the widening path) and f64 storage
+  // (the zero-copy fast path) — to the SAME direction by value, not just by
+  // shape.
+  let opts = WindowOptions::new(512);
+  let spans = WindowPlan::spans(&opts, 1500).expect("plan spans");
+
+  let windows: Vec<WindowEmbedding<TestEmbedding>> = spans
+    .iter()
+    .map(|span| Windowed::new(embed(span), *span))
+    .collect();
+  let summary = aggregate(&CoverageWeightedMean, &windows).expect("aggregate");
+
+  let windows64: Vec<WindowEmbedding<TestEmbedding64>> = spans
+    .iter()
+    .map(|span| Windowed::new(embed64(span), *span))
+    .collect();
+  let summary64 = aggregate(&CoverageWeightedMean, &windows64).expect("aggregate");
+
+  // The f32 path narrows to f32 at every window (`from_unnormalized`) and
+  // again at the aggregate's own reconstruction, so the comparison tolerance
+  // is f32 narrowing precision (~1e-6, matching the crate's own
+  // `assert_close`), not f64's ~1e-12.
+  let widened: Vec<f64> = summary.as_slice().iter().map(|&x| f64::from(x)).collect();
+  let want64 = summary64.as_slice();
+  assert_eq!(widened.len(), want64.len());
+  for (got, want) in widened.iter().zip(want64) {
+    assert!(
+      (got - want).abs() < 1e-6,
+      "f32 widening path diverged from f64 fast path in value: {widened:?} vs {want64:?}"
+    );
+  }
+}
+
+#[test]
 fn granite_large_window() {
   // The SAME `run`, only `unit_window` changes to a long-context size:
   // window-size-agnosticism.
@@ -223,13 +264,13 @@ fn vad_frame_segment_longest_run() {
 }
 
 /// The content-aware chunker is driven by the same [`WindowOptions`] window, with
-/// length measured through the caller's `len_fn` callback. Gated on `text`.
+/// length measured through the caller's `MeasureText`. Gated on `text`.
 #[cfg(feature = "text")]
 #[test]
 fn content_aware_chunk_is_window_config_driven() {
   use windit::split::ContentAware;
 
-  // The len_fn callback defines "how long": here, whitespace-separated words.
+  // The MeasureText defines "how long": here, whitespace-separated words.
   let count = |s: &str| s.split_whitespace().count();
   let chunker = ContentAware::new(&count);
   let text = "a b c d e f g h i j k l";

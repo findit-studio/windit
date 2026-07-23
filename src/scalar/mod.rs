@@ -179,9 +179,14 @@ pub trait Real:
   /// dominates the largest residue such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
-  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
-  /// normal-product fold accumulates, so it leaves every verdict outside that
-  /// subnormal regime unchanged. See the `aggregate` module's Input domain note.
+  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass the
+  /// three bounded-weight policies can accumulate in-domain, so their verdicts are
+  /// bit-for-bit unchanged. For `EmaRenormalized` it engages whenever the
+  /// accumulated mass falls below about `2^-948`, including folds whose products
+  /// are still normal — where it monotonically turns a sub-floor direction into
+  /// `NonFinite` (an engagement boundary a regression test pins); no realizable
+  /// `f32` workload reaches that regime. See the `aggregate` module's Input domain
+  /// note.
   const MIN_GATE_THRESHOLD: Self;
 
   /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA

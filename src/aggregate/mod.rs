@@ -113,16 +113,22 @@
 //! `K_abs <= sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40` and
 //! `dim <= 2^32`. The threshold
 //! `τ = 16 * EPSILON * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] carries a matching
-//! absolute floor (`2^-1000` for `f64`, above `K_abs` and — for any mass a
-//! normal-product fold accumulates — far below `16 * EPSILON * ||M||`), so an
+//! absolute floor (`2^-1000` for `f64`, above `K_abs` and — for any mass the
+//! bounded-weight policies accumulate — far below `16 * EPSILON * ||M||`), so an
 //! exactly cancelling sum has `||R|| <= 4 * EPSILON * ||M|| + K_abs < τ` and is
 //! always gated, whatever the ordering, tier structure, or weight range — so no
 //! fold can fabricate a direction from in-domain cancellation without violating the
 //! bound. When EMA's unbounded-below weights drive the whole fold subnormal,
 //! `||M||` is itself subnormal and `16 * EPSILON * ||M||` underflows, leaving the
 //! floor to gate alone: the entire signal then sits below the precision the domain
-//! guarantees, so `NonFinite` remains the honest verdict — a regime no
-//! `f32`-storage input reaches.
+//! guarantees, so `NonFinite` remains the honest verdict. The floor also engages
+//! earlier, while every product is still normal: for `EmaRenormalized` alone, once
+//! the accumulated mass falls below about `2^-948`, `16 * EPSILON * ||M||` itself
+//! drops beneath the `2^-1000` floor and the floor decides the verdict alone,
+//! monotonically turning a sub-floor direction into `NonFinite` rather than
+//! admitting it — an over-rejection-only widening of the gate, pinned by a
+//! regression test. Neither regime — whole-fold-subnormal or sub-`2^-948`
+//! normal-product — is one a realizable `f32` workload reaches.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
