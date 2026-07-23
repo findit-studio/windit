@@ -82,26 +82,47 @@
 //! must be finite and in `[0, 1]`. Inputs outside this domain are rejected with
 //! [`WinditError::MagnitudeOutOfRange`] or [`WinditError::CoverageOutOfRange`]
 //! before any arithmetic. The bounds are sized so that within them every
-//! intermediate of every built-in policy is finite and every nonzero
-//! intermediate is a normal `f64` — no overflow, no subnormal flush — including
-//! the squared term [`SaliencyWeighted`] forms. Every value an `f32`-storage
-//! embedding can produce lies more than 250 binary orders inside this window on
-//! both sides, so no realizable `f32` input ever reaches a boundary.
+//! intermediate of every built-in policy is finite, and — for the three policies
+//! whose weights are bounded below ([`MeanRenormalized`] at `1`,
+//! [`CoverageWeightedMean`] at a coverage `>= 2^-149`, and [`SaliencyWeighted`] at
+//! a norm `>= 2^-400`) — every nonzero intermediate is a normal `f64`, no overflow
+//! and no subnormal flush, including the squared term [`SaliencyWeighted`] forms.
+//! [`EmaRenormalized`] is the exception: its recency weights
+//! `w_i = alpha * (1 - alpha)^(n - 1 - i)` are unbounded below, so at a large
+//! window count the oldest windows' products can underflow toward a subnormal (or
+//! to zero) even for in-domain inputs — a regime the determinacy gate's absolute
+//! floor handles (see below). Every value an `f32`-storage embedding can produce
+//! lies more than 250 binary orders inside this window on both sides, so no
+//! realizable `f32` input ever reaches a boundary.
 //!
 //! Within the domain, an aggregated result is the direction of a vector within
-//! `4 * `[`Real::EPSILON`]` * ||M||` of the exact weighted sum, where `M` is the
-//! componentwise sum of the folded term magnitudes; any result whose norm is at
-//! or below `16 * `[`Real::EPSILON`]` * ||M||` is reported as
+//! `4 * `[`Real::EPSILON`]` * ||M|| + K_abs` of the exact weighted sum, where `M`
+//! is the componentwise sum of the folded term magnitudes and `K_abs` is the small
+//! absolute term defined below; any result whose norm is at or below
+//! `16 * `[`Real::EPSILON`]` * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] is reported as
 //! [`WinditError::NonFinite`] — no direction is determined at working precision.
 //! This is the crate's one accuracy claim, and it is a theorem rather than an
-//! observation: per dimension the fold's error is at most the product rounding
-//! (`<= u * M_j`, with `u = EPSILON / 2`) plus the Neumaier bound (`<= 2u * M_j`,
-//! plus an `O(n * u^2) * M_j` tail negligible for any window count that fits in
-//! memory), together at most `4 * EPSILON * M_j`; summing over dimensions gives
-//! `||R - exact|| <= 4 * EPSILON * ||M||`. An exactly cancelling sum therefore
-//! has `||R|| <= 4 * EPSILON * ||M|| < 16 * EPSILON * ||M||` and is always gated,
-//! whatever the ordering or tier structure — so no fold can fabricate a
-//! direction from cancellation without violating the bound.
+//! observation. Each product `w_i * e_i` is rounded relatively when it is a normal
+//! `f64` (by at most `u * |w_i * e_i|`, `u = EPSILON / 2`) and absolutely when it
+//! has underflowed toward a subnormal (by at most `2^-1075`, half the subnormal
+//! spacing). Per dimension the relative parts sum to at most `u * M_j`, the
+//! Neumaier fold adds at most `2u * M_j` (plus an `O(n * u^2) * M_j` tail, and it
+//! is exact for subnormal operands), together at most `4 * EPSILON * M_j`; the
+//! absolute parts sum to at most `n * 2^-1075`. Over all dimensions,
+//! `||R - exact|| <= 4 * EPSILON * ||M|| + K_abs` with
+//! `K_abs <= sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40` and
+//! `dim <= 2^32`. The threshold
+//! `τ = 16 * EPSILON * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] carries a matching
+//! absolute floor (`2^-1000` for `f64`, above `K_abs` and — for any mass a
+//! normal-product fold accumulates — far below `16 * EPSILON * ||M||`), so an
+//! exactly cancelling sum has `||R|| <= 4 * EPSILON * ||M|| + K_abs < τ` and is
+//! always gated, whatever the ordering, tier structure, or weight range — so no
+//! fold can fabricate a direction from in-domain cancellation without violating the
+//! bound. When EMA's unbounded-below weights drive the whole fold subnormal,
+//! `||M||` is itself subnormal and `16 * EPSILON * ||M||` underflows, leaving the
+//! floor to gate alone: the entire signal then sits below the precision the domain
+//! guarantees, so `NonFinite` remains the honest verdict — a regime no
+//! `f32`-storage input reaches.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
@@ -426,10 +447,13 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     // `w_i = alpha*(1-alpha)^(n-1-i)` for `i >= 1`. Building those weights and
     // folding through `weighted_sum_renorm` gives EMA the same input domain,
     // determinacy gate, and error bound as every other policy from one proof —
-    // there is no separate recurrence fold left to fabricate a direction. The
-    // dyadic case (`alpha = 0.5` over basis vectors) reproduces the old
-    // recurrence bit for bit. `1 - alpha` is formed in `C`, not folded in `f32`
-    // first, so the `f64` path keeps the precision its type promises.
+    // there is no separate recurrence fold left to fabricate a direction. Unlike
+    // the other policies these weights are unbounded below, so at a large window
+    // count the oldest windows' products underflow toward a subnormal; the gate's
+    // `MIN_GATE_THRESHOLD` floor is what keeps that regime sound (module Input
+    // domain note). The dyadic case (`alpha = 0.5` over basis vectors) reproduces
+    // the old recurrence bit for bit. `1 - alpha` is formed in `C`, not folded in
+    // `f32` first, so the `f64` path keeps the precision its type promises.
     let alpha = C::from_f32(self.alpha);
     let complement = C::ONE - alpha;
     let n = embeddings.len();
@@ -544,14 +568,18 @@ fn check_inputs<C: Real>(
 ///
 /// One pass, no retry, no prescaling: the compute scalar is `f64` (an `f32`
 /// embedding widened before this ran), and [`check_inputs`] has confined every
-/// component to the input domain, so every product and partial sum is finite and
-/// normal. The sum is *compensated* (Neumaier), and alongside it the routine
-/// accumulates `M`, the componentwise sum of the term magnitudes. Before
-/// normalizing, a determinacy gate rejects any result whose norm is at or below
-/// `16 * EPSILON * ||M||`: within the fold's provable `4 * EPSILON * ||M||` error
-/// bound the exact weighted sum is indistinguishable from zero there, so a
-/// smaller residue is rounding noise with no direction — not a vector for
-/// [`l2_renorm`] to amplify into a fabricated unit direction. The bound is the
+/// component to the input domain, so every product and partial sum is finite —
+/// and normal for the bounded-weight policies, while [`EmaRenormalized`]'s
+/// unbounded-below weights can drive the oldest windows' products subnormal. The
+/// sum is *compensated* (Neumaier, exact for subnormal operands), and alongside it
+/// the routine accumulates `M`, the componentwise sum of the term magnitudes.
+/// Before normalizing, a determinacy gate rejects any result whose norm is at or
+/// below `16 * EPSILON * ||M|| + `[`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD):
+/// within the fold's provable `4 * EPSILON * ||M|| + K_abs` error bound the exact
+/// weighted sum is indistinguishable from zero there, so a smaller residue is
+/// rounding noise with no direction — not a vector for [`l2_renorm`] to amplify
+/// into a fabricated unit direction. The absolute floor keeps the gate sound where
+/// subnormal products make `16 * EPSILON * ||M||` underflow. The bound is the
 /// crate's one accuracy claim; see the module [Input domain](self#input-domain)
 /// note for the proof.
 fn weighted_sum_renorm<C: Real>(
@@ -589,9 +617,16 @@ fn weighted_sum_renorm<C: Real>(
   }
   // Determinacy gate: reject a result at or below the fold's own rounding floor
   // rather than let `l2_renorm` amplify rounding noise into a direction. `K = 16`
-  // against the proven `<= 4 * EPSILON * ||M||` bound (module Input domain note),
-  // so exact cancellation (`||exact|| = 0`) is always caught, at every ordering.
-  let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(&mag);
+  // against the proven `<= 4 * EPSILON * ||M||` relative bound, plus the absolute
+  // `MIN_GATE_THRESHOLD` floor. The floor dominates the residue once
+  // `EmaRenormalized`'s unbounded-below recency weights push the fold's products
+  // subnormal — there `16 * EPSILON * ||M||` itself underflows to zero and per-term
+  // rounding turns absolute, so without the floor the gate would degenerate into an
+  // exact-zero check a nonzero subnormal residue slips past (module Input domain
+  // note). With it, exact cancellation (`||exact|| = 0`) is always caught, at every
+  // ordering, tier structure, and weight range. For the three bounded-weight
+  // policies the floor is far below `16 * EPSILON * ||M||` and changes no verdict.
+  let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(&mag) + C::MIN_GATE_THRESHOLD;
   if l2_norm(&acc) <= tau {
     return Err(WinditError::NonFinite);
   }

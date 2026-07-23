@@ -114,10 +114,15 @@ pub trait Real:
   ///
   /// With [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) it bounds the input
   /// domain within which every intermediate of every built-in aggregation policy
-  /// stays finite and every nonzero intermediate stays a normal value — no
-  /// overflow, no flush to a subnormal. A nonzero component below it is rejected
-  /// before any arithmetic. Every magnitude an `f32`-storage embedding can
-  /// produce sits far above it.
+  /// stays finite, and — for the policies whose weights are bounded below
+  /// (`MeanRenormalized`, `CoverageWeightedMean`, `SaliencyWeighted`) — every
+  /// nonzero intermediate stays a normal value, with no overflow and no flush to
+  /// a subnormal. `EmaRenormalized`'s recency weights are unbounded below, so its
+  /// oldest-window products may underflow toward a subnormal; the determinacy
+  /// gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor keeps that
+  /// regime sound (see the `aggregate` module's Input domain note). A nonzero
+  /// component below this bound is rejected before any arithmetic. Every magnitude
+  /// an `f32`-storage embedding can produce sits far above it.
   const MIN_AGG_MAGNITUDE: Self;
 
   /// The largest magnitude a nonzero input component may carry into aggregation
@@ -128,6 +133,23 @@ pub trait Real:
   /// magnitude — keeps every intermediate a normal value. A component above it
   /// is rejected before any arithmetic.
   const MAX_AGG_MAGNITUDE: Self;
+
+  /// The absolute floor of the aggregation determinacy threshold (`2^-1000` for
+  /// `f64`).
+  ///
+  /// The determinacy gate rejects a folded result whose norm is at or below
+  /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD`, where `M`
+  /// is the accumulated term-magnitude vector. The relative `16 * EPSILON * ||M||`
+  /// part underflows to zero once `EmaRenormalized`'s unbounded-below recency
+  /// weights drive the fold's products into the subnormal range, where per-term
+  /// rounding is absolute (at most `2^-1075`) rather than relative. This floor
+  /// dominates the largest residue such an exactly-cancelling fold can leave
+  /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
+  /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
+  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
+  /// normal-product fold accumulates, so it leaves every verdict outside that
+  /// subnormal regime unchanged. See the `aggregate` module's Input domain note.
+  const MIN_GATE_THRESHOLD: Self;
 
   /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA
   /// smoothing factor — into this domain. Exact for every implementor.
@@ -207,6 +229,9 @@ impl Real for f64 {
   // module docs). `from_bits` is const well below the 1.95 MSRV.
   const MIN_AGG_MAGNITUDE: Self = f64::from_bits(0x26F0_0000_0000_0000);
   const MAX_AGG_MAGNITUDE: Self = f64::from_bits(0x58F0_0000_0000_0000);
+  // 2^-1000, the absolute determinacy-threshold floor (sized in the `aggregate`
+  // module docs).
+  const MIN_GATE_THRESHOLD: Self = f64::from_bits(0x0170_0000_0000_0000);
 
   fn from_f32(x: f32) -> Self {
     f64::from(x)

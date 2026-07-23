@@ -751,6 +751,111 @@ fn determinacy_gate_rejects_opposite_units_and_admits_a_real_residual() {
 }
 
 #[test]
+fn ema_subnormal_product_cancellation_family_a_is_gated() {
+  // B1 family A (independent review counterexample, confirmed on the real crate):
+  // EmaRenormalized(0.5) over n = 700 fabricated Ok([1, 0]) from an exactly
+  // cancelling in-domain input before the determinacy threshold carried an
+  // absolute floor. Windows 0..3 carry values ~2^-349 (all in [2^-400, 2^400]);
+  // the recency weights w0 = w1 = 2^-699 and w2 = 2^-698 drive the products to
+  // ~2^-1048 (subnormal), where the relative gate 16*eps*||M|| underflowed to 0.0
+  // and the nonzero subnormal rounding residue slipped past. e0 = -(e1 + 2*e2) is
+  // exact, so the weighted sum is exactly zero; MIN_GATE_THRESHOLD now gates it.
+  let two_m40 = libm::ldexp(1.0, -40);
+  let e1 = libm::ldexp(1.0 + 19600.0 * two_m40, -350);
+  let e2 = libm::ldexp(1.0 + 9800.0 * two_m40, -350);
+  let e0 = -(e1 + 2.0 * e2);
+  let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
+  cols.resize(700, [0.0, 0.0]);
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0_f32; 700];
+  let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "family A exact cancellation must be gated, got {got:?}"
+  );
+}
+
+#[test]
+fn ema_subnormal_product_cancellation_family_b_is_gated() {
+  // B1 family B: alpha = 255/256 (f32-exact), n = 84 — an ordinary window count,
+  // confirmed on the real crate to fabricate Ok([-1, 0]) before the floor. The
+  // weights (w0 = 2^-664, w1 = 255*2^-664, w2 = 255*2^-656) push the products
+  // subnormal; e0 = -255*(e1 + 256*e2) is exact, so the weighted sum is exactly
+  // zero. Confirms the fix depends on neither a dyadic alpha nor a large n.
+  let alpha = f32::from_bits(0x3F7F_0000); // 255/256 = 0.996_093_75
+  let two_m30 = libm::ldexp(1.0, -30);
+  let e1 = libm::ldexp(1.0 + 7.0 * two_m30, -392);
+  let e2 = libm::ldexp(1.0 + 9.0 * two_m30, -392);
+  let e0 = -255.0 * (e1 + 256.0 * e2);
+  let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
+  cols.resize(84, [0.0, 0.0]);
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0_f32; 84];
+  let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &coverages, 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "family B exact cancellation must be gated, got {got:?}"
+  );
+}
+
+#[test]
+fn ema_single_subnormal_product_term_is_gated() {
+  // B1 family C (no cancellation): a single in-domain window whose tiny EMA weight
+  // drives its product to a nonzero *subnormal* — falsifying the old claim that
+  // "every nonzero intermediate is a normal f64" in domain. alpha = 0.5, n = 701,
+  // so window 0's weight is w0 = 2^-700; its value e ~ 2^-370 is in domain, but
+  // w0*e ~ 2^-1070 is subnormal, rounded absolutely rather than by 4*eps*||M||.
+  // The old gate's 16*eps*||M|| underflowed to 0.0 and admitted the sub-precision
+  // result; the floor now gates it (||acc|| ~ 2^-1070 <= MIN_GATE_THRESHOLD =
+  // 2^-1000). The restated error bound 4*eps*||M|| + K_abs holds — |R - exact| <=
+  // 2^-1075 <= K_abs — which the gate threshold subsumes.
+  let e = (libm::ldexp(1.0, 53) - 1.0) * libm::ldexp(1.0, -423); // (2^53 - 1) * 2^-423 ~ 2^-370
+  let mut cols: Vec<[f64; 2]> = vec![[e, 0.0]];
+  cols.resize(701, [0.0, 0.0]);
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0_f32; 701];
+  let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a single in-domain subnormal-product term must be gated, got {got:?}"
+  );
+}
+
+#[test]
+fn determinacy_gate_floor_boundary_is_monotone() {
+  // The MIN_GATE_THRESHOLD floor's engagement boundary, in the normal-product
+  // regime so it isolates the floor itself. alpha = 0.5, n = 606 puts window 0's
+  // weight at w0 = 2^-605; window 0 = [v, 2v] (a genuine direction [1, 2]/sqrt5),
+  // the other 605 windows zero, so the aggregated mass is ~ 2^-605 * ||[v, 2v]||:
+  //  - v = 2^-390 (in domain): mass ~ 2^-994 > floor, and the real direction
+  //    [1/sqrt5, 2/sqrt5] is returned (products 2^-995 / 2^-994 are normal);
+  //  - v = 2^-400 (in domain, the input-domain floor): mass ~ 2^-1004 < floor, so
+  //    NonFinite.
+  // Both sides carry the same geometry, so crossing the floor is direction ->
+  // NonFinite (monotone): never a flipped or fabricated direction, and the
+  // sub-floor side is honestly "no direction at working precision". No f32 input
+  // reaches this regime (605 zero recent windows beside one ancient window).
+  let above = libm::ldexp(1.0, -390);
+  let mut cols_above: Vec<[f64; 2]> = vec![[above, 2.0 * above]];
+  cols_above.resize(606, [0.0, 0.0]);
+  let e_above: Vec<&[f64]> = cols_above.iter().map(|c| c.as_slice()).collect();
+  let out = EmaRenormalized::new(0.5)
+    .aggregate_values(&e_above, &vec![1.0_f32; 606], 2)
+    .unwrap();
+  assert_close_f64(&out, &[0.447_213_595_499_957_9, 0.894_427_190_999_915_9]);
+
+  let below = libm::ldexp(1.0, -400);
+  let mut cols_below: Vec<[f64; 2]> = vec![[below, 2.0 * below]];
+  cols_below.resize(606, [0.0, 0.0]);
+  let e_below: Vec<&[f64]> = cols_below.iter().map(|c| c.as_slice()).collect();
+  let got = EmaRenormalized::new(0.5).aggregate_values(&e_below, &vec![1.0_f32; 606], 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "sub-floor mass must be NonFinite, got {got:?}"
+  );
+}
+
+#[test]
 fn ema_subnormal_survives_at_f64_scale() {
   // REVOKED (settlement §4.5.6, deliberate): d = 2^-1073 is below the input
   // domain floor 2^-400, so this fixture is now rejected before any arithmetic
