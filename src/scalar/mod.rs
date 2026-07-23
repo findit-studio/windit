@@ -5,9 +5,9 @@
 //! aggregation math runs in. The two are deliberately *not* the same for `f32`:
 //! an `f32` embedding stores `f32` but computes in `f64`
 //! ([`f32::Compute`](Scalar::Compute) is `f64`). That is the whole reason the
-//! storage and compute types are split, and it is what a future narrow storage
-//! type (an `f16`, a quantized byte) reuses to compute in a wider float without
-//! a breaking change to
+//! storage and compute types are split, and it is what the narrow storage
+//! scalars (`f16`, `bf16`, and the quantized `i8` byte) reuse to compute in a
+//! wider float without a breaking change to
 //! [`Vector::from_unnormalized`](crate::windowed::Vector::from_unnormalized).
 //!
 //! Widening `f32` to `f64` before accumulating is what ends a whole class of
@@ -18,10 +18,19 @@
 //! storage scalar only: it is **not** a [`Real`], and no embedding accumulates
 //! in it.
 //!
-//! Two scalars are implemented: `f32` (storage, computes in `f64`) and `f64`
-//! (both storage and its own compute domain — the sole [`Real`]). Neither is
-//! feature-gated: both are `core` types, and monomorphization already makes an
-//! unused one free.
+//! The storage scalars are the two core floats `f32` (storage only — it computes
+//! in `f64`) and `f64` (both storage and its own compute domain, the sole
+//! [`Real`]); the code scalar `i8`; and, behind the `half` feature, `f16` and
+//! `bf16` (two more storage-only floats that compute in `f64`, exactly as `f32`
+//! does). The core scalars are not feature-gated: monomorphization already makes
+//! an unused one free.
+//!
+//! `i8` is a *code* scalar, not a value scalar: its
+//! [`to_compute`](Scalar::to_compute) widens the raw stored quantization code,
+//! which becomes a value only once an embedding applies the dequantization scale
+//! this crate cannot know. [`TO_COMPUTE_IS_VALUE`](Scalar::TO_COMPUTE_IS_VALUE)
+//! records that distinction, and the `Vector::compute_components` projection
+//! enforces it.
 //!
 //! # Sealed
 //!
@@ -32,19 +41,21 @@
 //! silently violate. Sealing also means adding a scalar later is not a breaking
 //! change. To request one, open an issue.
 //!
-//! Deliberately absent, and why:
+//! Two notes on the narrow scalars:
 //!
-//! - **Bare integers (`i8`, `i16`, …).** Mechanically they would fit, since the
-//!   square roots happen in [`Real`]. Semantically they do not: a bare `i8` has
-//!   no value without a per-tensor quantization scale, and this crate cannot
-//!   know it. Implementing `to_compute` would mean picking a scale of `1.0` and
-//!   silently returning a wrong answer to everyone whose scale differs. The
-//!   right shape is a storage wrapper that carries its own scale.
-//! - **`f16` / `bf16`.** The intended next addition, and the case the
-//!   storage/compute split exists for — `f16` has no arithmetic in `core`, so
-//!   computing in `f64` (as `f32` already does) is mandatory rather than
-//!   optional. Left out only to avoid taking a dependency for a use that has not
-//!   arrived yet.
+//! - **`i8` is a code, not a value.** A bare `i8` has no value without a
+//!   per-tensor (or per-row, per-block) quantization scale this crate cannot
+//!   know, so folding raw codes as if they were values is right only by
+//!   coincidence — symmetric, uniform-scale, renormalizing — and silently wrong
+//!   otherwise. `i8` is therefore admitted as a code scalar whose value lives
+//!   with the [`Vector`](crate::windowed::Vector) that knows its scale, projected
+//!   by its `compute_components` method; the default projection refuses raw codes
+//!   with [`WinditError::MissingDequantization`](crate::WinditError::MissingDequantization)
+//!   rather than fold a wrong answer. This is the insight the old "use a storage
+//!   wrapper that carries its own scale" note carried, now enforced.
+//! - **Wider integers (`i16`, `i32`, …) and unsigned types** stay out: `i8` is
+//!   the width a quantized embedding stores, and the code-scalar mechanism does
+//!   not become more general by widening it. To request one, open an issue.
 
 #[cfg(test)]
 mod tests;
@@ -57,6 +68,12 @@ mod private {
 
   impl Sealed for f32 {}
   impl Sealed for f64 {}
+  impl Sealed for i8 {}
+
+  #[cfg(feature = "half")]
+  impl Sealed for half::f16 {}
+  #[cfg(feature = "half")]
+  impl Sealed for half::bf16 {}
 }
 
 /// A scalar type an embedding can be stored in.
@@ -66,13 +83,29 @@ mod private {
 pub trait Scalar: private::Sealed + Copy {
   /// The floating-point type this scalar's aggregation math runs in.
   ///
-  /// `f64` for both shipped scalars: `f64` computes in itself, and `f32` widens
-  /// to `f64` so no embedding ever accumulates in `f32`. A storage type equal to
-  /// its own `Compute` (only `f64`, here) is a [`Real`]; one narrower than its
-  /// `Compute` (`f32`) is storage only.
+  /// `f64` for every shipped scalar: `f64` computes in itself, and `f32`, `i8`,
+  /// and the `half` scalars all widen to `f64` so no embedding ever accumulates
+  /// in a narrower type. A storage type equal to its own `Compute` (only `f64`,
+  /// here) is a [`Real`]; one narrower than its `Compute` (`f32`, `i8`, `f16`,
+  /// `bf16`) is storage only.
   type Compute: Real;
 
-  /// Widen one stored value into the compute domain.
+  /// Whether [`to_compute`](Scalar::to_compute) yields the value this scalar
+  /// *represents*, rather than its raw stored code.
+  ///
+  /// `true` for every float scalar (`f32`, `f64`, and the `half` scalars):
+  /// widening is exact and value-preserving. `false` for `i8`, whose stored code
+  /// has no value without a quantization scale this crate cannot know; the value
+  /// projection for such a scalar lives at the embedding level, in the
+  /// [`Vector`](crate::windowed::Vector) `compute_components` method, whose
+  /// default refuses to fold raw codes.
+  const TO_COMPUTE_IS_VALUE: bool;
+
+  /// Widen one stored scalar into the compute domain.
+  ///
+  /// For a code scalar (`i8`) this widens the raw stored code, which is a value
+  /// only after an embedding applies its dequantization scale — see
+  /// [`TO_COMPUTE_IS_VALUE`](Scalar::TO_COMPUTE_IS_VALUE).
   fn to_compute(self) -> Self::Compute;
 
   /// Borrow a stored slice as compute values when the two types coincide.
@@ -197,6 +230,9 @@ impl Scalar for f32 {
   // overflow/underflow/cancellation class the `f32` fold kept reintroducing.
   type Compute = f64;
 
+  // Widening f32 to f64 is exact and value-preserving.
+  const TO_COMPUTE_IS_VALUE: bool = true;
+
   fn to_compute(self) -> Self::Compute {
     // Widening `f32` to `f64` is exact for every value, subnormals included.
     f64::from(self)
@@ -211,6 +247,10 @@ impl Scalar for f32 {
 
 impl Scalar for f64 {
   type Compute = Self;
+
+  // f64 is its own compute domain, so `to_compute` is the identity — trivially
+  // value-preserving.
+  const TO_COMPUTE_IS_VALUE: bool = true;
 
   fn to_compute(self) -> Self::Compute {
     self
@@ -258,6 +298,74 @@ impl Real for f64 {
   }
 }
 
+impl Scalar for i8 {
+  // A quantized code stored as one byte. It widens to `f64` like the other
+  // narrow scalars, but the widened code is not the value it represents.
+  type Compute = f64;
+
+  // A stored code, not a value: folding raw codes is right only by coincidence
+  // (symmetric, uniform-scale, renormalizing), so nothing in this crate ever
+  // does. A quantized `Vector` overrides `compute_components` to dequantize; its
+  // default projection refuses a code scalar rather than fold raw codes.
+  const TO_COMPUTE_IS_VALUE: bool = false;
+
+  fn to_compute(self) -> Self::Compute {
+    // The raw code, widened exactly (every `i8` is exact in `f64`). NOT a
+    // represented value: `TO_COMPUTE_IS_VALUE` being `false` is what keeps every
+    // crate path from treating it as one.
+    f64::from(self)
+  }
+
+  fn as_compute_slice(_: &[Self]) -> Option<&[Self::Compute]> {
+    // `Compute` (`f64`) differs from `Self` (`i8`): no zero-copy reborrow.
+    None
+  }
+}
+
+// f16: an 11-bit effective significand and value exponents in [-24, 15], both
+// strictly inside f64's (53-bit, [-1074, 1023]), so every finite f16 is exact in
+// f64 and `to_compute` rounds nothing — the same property f32 already has.
+#[cfg(feature = "half")]
+impl Scalar for half::f16 {
+  type Compute = f64;
+
+  // Widening f16 to f64 is exact and value-preserving.
+  const TO_COMPUTE_IS_VALUE: bool = true;
+
+  fn to_compute(self) -> Self::Compute {
+    f64::from(self)
+  }
+
+  fn as_compute_slice(_: &[Self]) -> Option<&[Self::Compute]> {
+    None
+  }
+}
+
+// bf16: an 8-bit effective significand and value exponents in [-133, 127], both
+// strictly inside f64's, so every finite bf16 is exact in f64 as well.
+#[cfg(feature = "half")]
+impl Scalar for half::bf16 {
+  type Compute = f64;
+
+  // Widening bf16 to f64 is exact and value-preserving.
+  const TO_COMPUTE_IS_VALUE: bool = true;
+
+  fn to_compute(self) -> Self::Compute {
+    f64::from(self)
+  }
+
+  fn as_compute_slice(_: &[Self]) -> Option<&[Self::Compute]> {
+    None
+  }
+}
+
+/// The half-precision storage scalars, re-exported so a consumer's
+/// `type Scalar = f16;` names the same type this crate implemented [`Scalar`]
+/// for, whatever `half` version the consumer resolves.
+#[cfg(feature = "half")]
+#[cfg_attr(docsrs, doc(cfg(feature = "half")))]
+pub use half::{bf16, f16};
+
 /// A test-only storage scalar narrower than `f64`, its compute type.
 ///
 /// `f32` also widens (to `f64`), so the widening half of
@@ -279,6 +387,10 @@ impl private::Sealed for TestQuant {}
 #[cfg(test)]
 impl Scalar for TestQuant {
   type Compute = f64;
+
+  // Its fixed 1/127 scale is baked into `to_compute`, so the widened value is a
+  // genuine represented value, not a raw code.
+  const TO_COMPUTE_IS_VALUE: bool = true;
 
   fn to_compute(self) -> Self::Compute {
     f64::from(self.0) / 127.0

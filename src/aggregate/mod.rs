@@ -133,7 +133,7 @@ use std::vec::Vec;
 
 use crate::{
   error::WinditError,
-  scalar::{Real, Scalar},
+  scalar::Real,
   windowed::{ComputeOf, Vector, WindowEmbedding},
 };
 
@@ -221,15 +221,18 @@ pub trait AggregatePolicy<C: Real = f64> {
 
 /// Aggregate a sequence of window embeddings into one embedding of type `E`.
 ///
-/// Extracts each window's values and [`Span::coverage`](crate::plan::Span::coverage),
-/// runs `policy` in `E`'s compute domain, and reconstructs `E` via
-/// [`Vector::from_unnormalized`]. Works with any policy, including
-/// `&dyn AggregatePolicy`.
+/// Projects each window into `E`'s compute domain through
+/// [`compute_components`](Vector::compute_components), pairs it with its
+/// [`Span::coverage`](crate::plan::Span::coverage), runs `policy` there, and
+/// reconstructs `E` via [`Vector::from_unnormalized`]. Works with any policy,
+/// including `&dyn AggregatePolicy`.
 ///
 /// # Errors
 ///
 /// [`WinditError::Empty`] if `windows` is empty; otherwise any error from the
-/// policy or from [`Vector::from_unnormalized`].
+/// per-window projection (for example [`WinditError::MissingDequantization`] when
+/// quantized storage did not override its dequantization), from the policy, or
+/// from [`Vector::from_unnormalized`].
 pub fn aggregate<E, P>(policy: &P, windows: &[WindowEmbedding<E>]) -> Result<E, WinditError>
 where
   E: Vector,
@@ -244,40 +247,21 @@ where
     coverages.push(w.span.coverage());
   }
 
-  // Fast path: borrow the storage when it already is the compute scalar (true of
-  // `f64` storage) rather than widen it into fresh buffers. `f32` storage
-  // computes in `f64`, so its `as_compute_slice` returns `None` and a single
-  // one sends the whole aggregation down the widening branch below.
-  let mut borrowed: Vec<&[ComputeOf<E>]> = try_vec_with_capacity(windows.len())?;
-  let mut all_borrowable = true;
+  // Project each window into its compute domain: a zero-copy borrow when the
+  // storage already is the compute scalar (`f64`), an exact elementwise widening
+  // otherwise (`f32`, `f16`, `bf16`), or the implementor's own dequantization
+  // (quantized storage overrides `compute_components`). This runs before any
+  // weighting, so every policy — including the magnitude-weighted one — sees
+  // represented values, and it is these slices the input-domain check validates.
+  let mut cows = try_vec_with_capacity(windows.len())?;
   for w in windows {
-    match <E::Scalar as Scalar>::as_compute_slice(w.value.as_slice()) {
-      Some(s) => borrowed.push(s),
-      None => {
-        all_borrowable = false;
-        break;
-      }
-    }
+    cows.push(w.value.compute_components()?);
   }
-
-  let raw = if all_borrowable {
-    policy.aggregate_values(&borrowed, &coverages, dim)?
-  } else {
-    let mut widened: Vec<Vec<ComputeOf<E>>> = try_vec_with_capacity(windows.len())?;
-    for w in windows {
-      let stored = w.value.as_slice();
-      let mut col = try_vec_with_capacity(stored.len())?;
-      for s in stored {
-        col.push(s.to_compute());
-      }
-      widened.push(col);
-    }
-    let mut embeddings: Vec<&[ComputeOf<E>]> = try_vec_with_capacity(widened.len())?;
-    for col in &widened {
-      embeddings.push(col.as_slice());
-    }
-    policy.aggregate_values(&embeddings, &coverages, dim)?
-  };
+  let mut embeddings: Vec<&[ComputeOf<E>]> = try_vec_with_capacity(cows.len())?;
+  for c in &cows {
+    embeddings.push(c.as_ref());
+  }
+  let raw = policy.aggregate_values(&embeddings, &coverages, dim)?;
   E::from_unnormalized(&raw)
 }
 
@@ -290,7 +274,10 @@ where
 /// correspond to memory that exists — so a refused allocation must surface as a
 /// typed error rather than abort the process. `try_reserve_exact` because each
 /// buffer is then filled to exactly `n` and never grown again.
-fn try_vec_with_capacity<T>(n: usize) -> Result<Vec<T>, WinditError> {
+///
+/// `pub(crate)` so [`Vector::compute_components`](crate::windowed::Vector::compute_components)'s
+/// default projection can share the same typed-OOM discipline.
+pub(crate) fn try_vec_with_capacity<T>(n: usize) -> Result<Vec<T>, WinditError> {
   let mut v = Vec::new();
   v.try_reserve_exact(n)
     .map_err(|_| WinditError::AllocFailed { elements: n })?;

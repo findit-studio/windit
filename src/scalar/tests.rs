@@ -1,3 +1,5 @@
+#[cfg(feature = "half")]
+use super::{bf16, f16};
 use super::{Real, Scalar, TestQuant};
 
 #[test]
@@ -166,4 +168,77 @@ fn test_quant_widens_to_its_scale() {
   assert_eq!(TestQuant(127).to_compute(), 1.0f64);
   assert_eq!(TestQuant(0).to_compute(), 0.0f64);
   assert_eq!(TestQuant(-127).to_compute(), -1.0f64);
+}
+
+#[test]
+fn to_compute_is_value_separates_codes_from_values() {
+  // Every float scalar represents its widened value; `i8` stores a raw code that
+  // is a value only after an embedding applies its scale. The default projection
+  // reads exactly this flag to decide whether it may fold `to_compute` output.
+  let flags = [
+    <f32 as Scalar>::TO_COMPUTE_IS_VALUE,
+    <f64 as Scalar>::TO_COMPUTE_IS_VALUE,
+    <TestQuant as Scalar>::TO_COMPUTE_IS_VALUE,
+    <i8 as Scalar>::TO_COMPUTE_IS_VALUE,
+  ];
+  assert_eq!(flags, [true, true, true, false]);
+}
+
+#[test]
+fn i8_to_compute_is_the_raw_code_widened() {
+  // `i8`'s `to_compute` widens the stored code exactly (every `i8` is exact in
+  // f64); it is NOT a represented value — that comes from a Vector's own
+  // dequantization, which is why `TO_COMPUTE_IS_VALUE` is false above.
+  assert_eq!(<i8 as Scalar>::to_compute(0), 0.0f64);
+  assert_eq!(<i8 as Scalar>::to_compute(127), 127.0f64);
+  assert_eq!(<i8 as Scalar>::to_compute(-128), -128.0f64);
+  // No zero-copy reborrow: `i8` differs from its `f64` compute type.
+  assert!(<i8 as Scalar>::as_compute_slice(&[i8::MIN, 0, i8::MAX]).is_none());
+}
+
+#[cfg(feature = "half")]
+#[test]
+fn half_scalars_are_value_preserving() {
+  // Both half floats widen exactly, so their `to_compute` is a genuine value.
+  let flags = [
+    <f16 as Scalar>::TO_COMPUTE_IS_VALUE,
+    <bf16 as Scalar>::TO_COMPUTE_IS_VALUE,
+  ];
+  assert_eq!(flags, [true, true]);
+}
+
+#[cfg(feature = "half")]
+#[test]
+fn f16_widens_exactly_and_lands_in_domain() {
+  // Every finite f16 is exact in f64 (an 11-bit significand, exponents in
+  // [-24, 15], both inside f64's), so `to_compute` rounds nothing. Pinned against
+  // independent f64 constants rather than `f64::from` of the same value.
+  let max = <f16 as Scalar>::to_compute(f16::from_bits(0x7BFF)); // max normal
+  let min_normal = <f16 as Scalar>::to_compute(f16::from_bits(0x0400)); // 2^-14
+  let min_subnormal = <f16 as Scalar>::to_compute(f16::from_bits(1)); // 2^-24
+  assert_eq!(max, 65504.0f64);
+  assert_eq!(min_normal, libm::ldexp(1.0, -14));
+  assert_eq!(min_subnormal, libm::ldexp(1.0, -24));
+  assert_eq!(<f16 as Scalar>::to_compute(f16::from_f32(-2.5)), -2.5f64);
+
+  // The whole finite nonzero f16 range sits inside the aggregation domain
+  // [2^-400, 2^400], so no finite f16 datum can trip the input-domain check.
+  assert!(min_subnormal >= <f64 as Real>::MIN_AGG_MAGNITUDE);
+  assert!(max <= <f64 as Real>::MAX_AGG_MAGNITUDE);
+}
+
+#[cfg(feature = "half")]
+#[test]
+fn bf16_widens_exactly_and_lands_in_domain() {
+  // bf16: an 8-bit significand, exponents in [-133, 127], all inside f64's.
+  // Max normal is (2 - 2^-7) * 2^127; min subnormal is 2^-133.
+  let bf16_max = (2.0 - libm::ldexp(1.0, -7)) * libm::ldexp(1.0, 127);
+  let max = <bf16 as Scalar>::to_compute(bf16::from_bits(0x7F7F));
+  let min_subnormal = <bf16 as Scalar>::to_compute(bf16::from_bits(1)); // 2^-133
+  assert_eq!(max, bf16_max);
+  assert_eq!(min_subnormal, libm::ldexp(1.0, -133));
+  assert_eq!(<bf16 as Scalar>::to_compute(bf16::from_f32(-3.5)), -3.5f64);
+
+  assert!(min_subnormal >= <f64 as Real>::MIN_AGG_MAGNITUDE);
+  assert!(max <= <f64 as Real>::MAX_AGG_MAGNITUDE);
 }

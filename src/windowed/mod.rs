@@ -36,6 +36,59 @@ pub trait Vector: Sized {
   /// The embedding as a contiguous slice of its stored scalar.
   fn as_slice(&self) -> &[Self::Scalar];
 
+  /// The embedding's components as *values* in its compute domain — what the
+  /// embedding represents, not how it is stored.
+  ///
+  /// Aggregation reads an embedding only through this method, once per
+  /// aggregation, **before any weighting** — which is what makes
+  /// magnitude-sensitive policies ([`SaliencyWeighted`](crate::aggregate::SaliencyWeighted))
+  /// and mixed per-window quantization scales correct by construction. The
+  /// returned slice must have length [`dim`](Vector::dim) (aggregation rejects a
+  /// mismatch with [`WinditError::DimMismatch`]) and is the exact input the
+  /// aggregation's input-domain check validates.
+  ///
+  /// The default borrows storage zero-copy when the stored scalar is its own
+  /// compute type (`f64`), widens elementwise through [`Scalar::to_compute`] when
+  /// that widening is value-preserving (`f32`, `f16`, `bf16`), and refuses with
+  /// [`WinditError::MissingDequantization`] when it is not (`i8`): a raw
+  /// quantization code has no value without its scale. A quantized embedding
+  /// overrides this method with its own dequantization — per-tensor, per-row,
+  /// per-block, affine or not; this crate never sees the parameters. For plain
+  /// affine `i8` data, dequantize as
+  /// `scale * f64::from(i16::from(q) - i16::from(zero_point))`: the integer
+  /// subtraction is exact in `i16` (no `i8` overflow at `127 - (-128)`), a code
+  /// equal to the zero point dequantizes to exactly `0.0`, and each component
+  /// costs one rounding.
+  ///
+  /// Overrides live behind the same `alloc` tier as their use of aggregation, so
+  /// the featureless build keeps the storage-only trait surface unchanged.
+  ///
+  /// # Errors
+  ///
+  /// [`WinditError::AllocFailed`] if the widened buffer cannot be allocated;
+  /// [`WinditError::MissingDequantization`] as above. Overrides should surface
+  /// their own allocation failures the same way.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+  fn compute_components(&self) -> Result<std::borrow::Cow<'_, [ComputeOf<Self>]>, WinditError> {
+    use std::borrow::Cow;
+    let stored = self.as_slice();
+    // f64 storage is already the compute scalar: borrow it, no copy.
+    if let Some(s) = <Self::Scalar as Scalar>::as_compute_slice(stored) {
+      return Ok(Cow::Borrowed(s));
+    }
+    // A code scalar (i8) has no value without its scale; refuse rather than fold
+    // raw codes. Monomorphizes away for every value-preserving scalar.
+    if !<Self::Scalar as Scalar>::TO_COMPUTE_IS_VALUE {
+      return Err(WinditError::MissingDequantization);
+    }
+    let mut col = crate::aggregate::try_vec_with_capacity(stored.len())?;
+    for s in stored {
+      col.push(s.to_compute());
+    }
+    Ok(Cow::Owned(col))
+  }
+
   /// Build a normalized embedding from raw (unnormalized) values in the
   /// embedding's compute domain.
   ///
