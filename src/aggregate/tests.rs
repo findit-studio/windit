@@ -9,7 +9,9 @@ use super::{
 use crate::{
   plan::Span,
   scalar::TestQuant,
-  test_support::{assert_close, assert_close_f64, TestQuantVec, TestVec},
+  test_support::{
+    assert_close, assert_close_f64, BareI8Emb, QuantEmb, RawF64Emb, TestQuantVec, TestVec,
+  },
   windowed::{Vector, WindowEmbedding, Windowed},
   WinditError,
 };
@@ -1106,4 +1108,455 @@ fn kind_serde_round_trip() {
   let json = serde_json::to_string(&AggregatePolicyKind::Ema { alpha: 0.75 }).unwrap();
   let back: AggregatePolicyKind = serde_json::from_str(&json).unwrap();
   assert!(matches!(back, AggregatePolicyKind::Ema { alpha } if alpha == 0.75));
+}
+
+// Shared quantized fixture: W = 3, D = 8, mixed-sign non-cancelling codes with
+// distinct per-window (scale, zero_point) and coverages (1.0, 0.75, 0.5 at
+// window 4), exercising asymmetric and per-window-scale dequantization together.
+const CODES: [[i8; 8]; 3] = [
+  [40, -12, 5, 60, -30, 18, -7, 25],
+  [15, 50, -20, -8, 33, -45, 10, 22],
+  [-25, 30, 12, -40, 8, 19, -33, 5],
+];
+const SCALES: [f64; 3] = [0.011, 0.0125, 0.02];
+const ZPS: [i8; 3] = [0, -3, 5];
+const LENS: [usize; 3] = [4, 3, 2];
+const WINDOW: usize = 4;
+
+/// Dequantize one window with the affine formula the design pins:
+/// `scale * (q - zero_point)`, the exact `i16` subtraction widened to `f64`.
+fn dequant(codes: &[i8], scale: f64, zp: i8) -> Vec<f64> {
+  codes
+    .iter()
+    .map(|&q| scale * f64::from(i16::from(q) - i16::from(zp)))
+    .collect()
+}
+
+/// The fixture as quantized `i8` embeddings (path Q): each carries its own scale
+/// and zero point and dequantizes through the `compute_components` override.
+fn quant_windows() -> Vec<WindowEmbedding<QuantEmb>> {
+  (0..3)
+    .map(|i| {
+      Windowed::new(
+        QuantEmb {
+          codes: CODES[i].to_vec(),
+          scale: SCALES[i],
+          zero_point: ZPS[i],
+          captured: Vec::new(),
+        },
+        Span::new(0, LENS[i], WINDOW),
+      )
+    })
+    .collect()
+}
+
+/// The same fixture hand-dequantized into `f64` storage (path R): the reference
+/// side, aggregated through the default zero-copy `f64` projection.
+fn raw_windows() -> Vec<WindowEmbedding<RawF64Emb>> {
+  (0..3)
+    .map(|i| {
+      Windowed::new(
+        RawF64Emb {
+          data: dequant(&CODES[i], SCALES[i], ZPS[i]),
+          captured: Vec::new(),
+        },
+        Span::new(0, LENS[i], WINDOW),
+      )
+    })
+    .collect()
+}
+
+/// The fixture dequantized through `f32` into `TestVec` storage (path R2): the
+/// f32-precision reference, which agrees with the full-precision `i8` path only
+/// to about f32 epsilon.
+fn r2_windows() -> Vec<WindowEmbedding<TestVec>> {
+  (0..3)
+    .map(|i| {
+      let data: Vec<f32> = CODES[i]
+        .iter()
+        .map(|&q| (SCALES[i] * f64::from(i16::from(q) - i16::from(ZPS[i]))) as f32)
+        .collect();
+      Windowed::new(TestVec(data), Span::new(0, LENS[i], WINDOW))
+    })
+    .collect()
+}
+
+/// Aggregate the quantized and hand-dequantized fixtures with `policy` and assert
+/// the captured results are bitwise identical: the same f64 inputs traverse the
+/// same deterministic pipeline to the same bits.
+fn assert_bitwise_identical<P: AggregatePolicy<f64>>(policy: &P, name: &str) {
+  let q = aggregate(policy, &quant_windows()).unwrap();
+  let r = aggregate(policy, &raw_windows()).unwrap();
+  assert_eq!(q.captured.len(), 8, "{name}: unexpected dim");
+  assert_eq!(q.captured.len(), r.captured.len(), "{name}: length");
+  for (a, b) in q.captured.iter().zip(&r.captured) {
+    assert_eq!(
+      a.to_bits(),
+      b.to_bits(),
+      "{name}: {a} vs {b} not bitwise-equal"
+    );
+  }
+}
+
+#[test]
+fn quantized_projection_matches_hand_dequantized_f64_bitwise() {
+  // The primary differential: aggregating quantized i8 windows (through their
+  // compute_components override) must feed the deterministic pipeline exactly the
+  // f64 values a hand-dequantized f64 aggregation feeds it, so the captured unit
+  // vector is bitwise identical at every policy — compensated sum, fixed order,
+  // determinacy gate, and input-domain check included. Any divergence is a
+  // projection-path defect by construction.
+  assert_bitwise_identical(&CoverageWeightedMean, "CoverageWeightedMean");
+  assert_bitwise_identical(&MeanRenormalized, "MeanRenormalized");
+  assert_bitwise_identical(&EmaRenormalized::new(0.3), "EmaRenormalized");
+  assert_bitwise_identical(&SaliencyWeighted, "SaliencyWeighted");
+}
+
+#[test]
+fn quantized_projection_tracks_f32_dequant_reference() {
+  // The prompt's stated differential: the i8 projection against an f32-dequant
+  // reference. R2 rounds each dequantized component to f32 and narrows the
+  // aggregate to f32 storage, so it agrees with the full-precision i8 path only
+  // to about f32 epsilon. On this well-conditioned fixture the unit directions
+  // still align to within 1e-6.
+  let q = aggregate(&CoverageWeightedMean, &quant_windows()).unwrap();
+  let r2 = aggregate(&CoverageWeightedMean, &r2_windows()).unwrap();
+  // Both are unit vectors, so their dot product is the direction cosine: q is
+  // f64-unit, r2 is f32-unit widened back to f64.
+  let dot: f64 = q
+    .captured
+    .iter()
+    .zip(r2.as_slice())
+    .map(|(a, b)| *a * f64::from(*b))
+    .sum();
+  assert!(dot >= 1.0 - 1e-6, "direction cosine {dot} below 1 - 1e-6");
+}
+
+#[test]
+fn per_row_scale_feeds_true_magnitudes_to_saliency() {
+  // Per-row scale: window A has a small scale (1e-3, ||A|| ~ 0.1), window B a
+  // large one (1e-2, ||B|| ~ 1.0). Dequantization precedes weighting, so
+  // SaliencyWeighted weighs the TRUE magnitudes and B dominates. Negative control
+  // (stated, not run): the raw-code norms are near-equal (~100.04 vs ~100.02), so
+  // a scale-blind fold would land near [0.707, .., 0.707, 0] — the r[0] < 0.2
+  // bound kills that.
+  let windows = vec![
+    Windowed::new(
+      QuantEmb {
+        codes: vec![100, 3, 0, 0],
+        scale: 1e-3,
+        zero_point: 0,
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      QuantEmb {
+        codes: vec![0, 2, 100, 0],
+        scale: 1e-2,
+        zero_point: 0,
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+  ];
+  let sal = aggregate(&SaliencyWeighted, &windows).unwrap();
+  let r = &sal.captured;
+  assert!(
+    r[2] > 0.99,
+    "B's true magnitude must dominate saliency, got {r:?}"
+  );
+  assert!(
+    r[0] < 0.2,
+    "a scale-blind fold would put ~0.707 here, got {r:?}"
+  );
+
+  // Per-row scale breaks even the plain mean: B's 10x scale restores its ratio,
+  // so this proves the point is about dequant-before-weight, not about saliency.
+  let mean = aggregate(&MeanRenormalized, &windows).unwrap();
+  let m = &mean.captured;
+  assert!(
+    m[2] > 9.0 * m[0],
+    "the 10x scale ratio must survive the mean, got {m:?}"
+  );
+}
+
+#[test]
+fn asymmetric_zero_point_shifts_direction() {
+  // A single asymmetric window (zp = -20): dequantization shifts every code by
+  // +20 before scaling, so the true direction differs from the normalized raw
+  // codes. Guards a future "optimization" that drops the zero point.
+  let codes = vec![10i8, -5, 30, 0, -20, 15];
+  let scale = 0.01;
+  let zp = -20i8;
+  let out = aggregate(
+    &MeanRenormalized,
+    &[Windowed::new(
+      QuantEmb {
+        codes: codes.clone(),
+        scale,
+        zero_point: zp,
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    )],
+  )
+  .unwrap();
+
+  // The bitwise identity from the primary differential, on this asymmetric
+  // window: the override must match hand-dequantization to the bit.
+  let raw = aggregate(
+    &MeanRenormalized,
+    &[Windowed::new(
+      RawF64Emb {
+        data: dequant(&codes, scale, zp),
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    )],
+  )
+  .unwrap();
+  for (a, b) in out.captured.iter().zip(&raw.captured) {
+    assert_eq!(a.to_bits(), b.to_bits(), "override must match hand-dequant");
+  }
+
+  // The normalized RAW codes (zero point dropped) point a measurably different
+  // way — at least 1e-2 apart in some component.
+  let raw_norm: Vec<f64> = {
+    let ss: f64 = codes.iter().map(|&q| f64::from(q) * f64::from(q)).sum();
+    let n = libm::sqrt(ss);
+    codes.iter().map(|&q| f64::from(q) / n).collect()
+  };
+  let mut max_diff = 0.0_f64;
+  for (a, b) in out.captured.iter().zip(&raw_norm) {
+    let d = libm::fabs(a - b);
+    if d > max_diff {
+      max_diff = d;
+    }
+  }
+  assert!(
+    max_diff > 1e-2,
+    "dropping the zero point must shift the direction, max diff {max_diff}"
+  );
+}
+
+#[test]
+fn i8_without_projection_is_refused() {
+  // The footgun guard: a bare i8 embedding with no compute_components override.
+  // The default projection refuses to fold raw codes and returns
+  // MissingDequantization, before any policy math. It is a monomorphization
+  // constant, so it fires in every build profile and a plain #[test] pins it.
+  let windows = vec![Windowed::new(
+    BareI8Emb(vec![1, 2, 3, 4]),
+    Span::new(0, 4, 4),
+  )];
+  assert!(matches!(
+    aggregate(&MeanRenormalized, &windows),
+    Err(WinditError::MissingDequantization)
+  ));
+  // Every policy refuses it identically — the guard is in the shared projection,
+  // not in one policy.
+  assert!(matches!(
+    aggregate(&SaliencyWeighted, &windows),
+    Err(WinditError::MissingDequantization)
+  ));
+}
+
+#[test]
+fn poisoned_or_out_of_domain_quant_params_fail_closed() {
+  // Every hole in the quantization parameters fails closed. NaN/Inf scale poisons
+  // components non-finite -> the input-domain check returns NonFinite; a zero
+  // scale dequantizes to the all-zero (directionless) vector -> the determinacy
+  // gate returns NonFinite; an absurd but finite scale drives a component past
+  // 2^400 -> the genuine MagnitudeOutOfRange (settlement §5 domain arithmetic);
+  // and a sane per-tensor scale lands ~390 binary orders inside the domain and
+  // aggregates cleanly. No new validation code — the settlement catches it all.
+  let span = Span::new(0, 4, 4);
+  let mk = |codes: Vec<i8>, scale: f64, zp: i8| -> Vec<WindowEmbedding<QuantEmb>> {
+    vec![Windowed::new(
+      QuantEmb {
+        codes,
+        scale,
+        zero_point: zp,
+        captured: Vec::new(),
+      },
+      span,
+    )]
+  };
+  assert!(matches!(
+    aggregate(&MeanRenormalized, &mk(vec![10, -3, 5, 7], f64::NAN, 0)),
+    Err(WinditError::NonFinite)
+  ));
+  assert!(matches!(
+    aggregate(&MeanRenormalized, &mk(vec![10, -3, 5, 7], f64::INFINITY, 0)),
+    Err(WinditError::NonFinite)
+  ));
+  assert!(matches!(
+    aggregate(&MeanRenormalized, &mk(vec![10, -3, 5, 7], 0.0, 0)),
+    Err(WinditError::NonFinite)
+  ));
+  assert!(matches!(
+    aggregate(&MeanRenormalized, &mk(vec![100, 0, 0, 0], 1e200, 0)),
+    Err(WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    })
+  ));
+  assert!(aggregate(&MeanRenormalized, &mk(vec![100, -50, 30, 7], 1.2e-3, 0)).is_ok());
+}
+
+#[cfg(feature = "half")]
+#[test]
+fn half_projection_matches_hand_widened_f64_bitwise() {
+  // Part A composed with aggregation: f16/bf16 storage widened by the default
+  // projection feeds the pipeline exactly what a hand-widened f64 aggregation
+  // feeds it. Every finite f16/bf16 is exact in f64, so the captured result is
+  // bitwise identical — the §4.1 differential pattern, in the half registers.
+  use crate::{
+    scalar::{bf16, f16},
+    test_support::{Bf16Emb, HalfEmb},
+  };
+
+  // Small dyadic values, exact in both half formats and in f64.
+  let w0 = [0.5f32, -0.25, 1.5, 0.75];
+  let w1 = [-1.0f32, 0.125, 0.5, -2.0];
+
+  // f16 storage vs its hand-widened f64 reference.
+  let f16_windows = [
+    Windowed::new(
+      HalfEmb {
+        data: w0.iter().map(|&x| f16::from_f32(x)).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      HalfEmb {
+        data: w1.iter().map(|&x| f16::from_f32(x)).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 3, 4),
+    ),
+  ];
+  let f16_reference = [
+    Windowed::new(
+      RawF64Emb {
+        data: w0.iter().map(|&x| f64::from(f16::from_f32(x))).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: w1.iter().map(|&x| f64::from(f16::from_f32(x))).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 3, 4),
+    ),
+  ];
+  let h = aggregate(&CoverageWeightedMean, &f16_windows).unwrap();
+  let r = aggregate(&CoverageWeightedMean, &f16_reference).unwrap();
+  assert_eq!(h.captured.len(), r.captured.len());
+  for (a, b) in h.captured.iter().zip(&r.captured) {
+    assert_eq!(
+      a.to_bits(),
+      b.to_bits(),
+      "f16 projection must match hand-widened f64 bitwise"
+    );
+  }
+
+  // bf16 storage vs its hand-widened f64 reference.
+  let bf16_windows = [
+    Windowed::new(
+      Bf16Emb {
+        data: w0.iter().map(|&x| bf16::from_f32(x)).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      Bf16Emb {
+        data: w1.iter().map(|&x| bf16::from_f32(x)).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 3, 4),
+    ),
+  ];
+  let bf16_reference = [
+    Windowed::new(
+      RawF64Emb {
+        data: w0.iter().map(|&x| f64::from(bf16::from_f32(x))).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: w1.iter().map(|&x| f64::from(bf16::from_f32(x))).collect(),
+        captured: Vec::new(),
+      },
+      Span::new(0, 3, 4),
+    ),
+  ];
+  let hb = aggregate(&CoverageWeightedMean, &bf16_windows).unwrap();
+  let rb = aggregate(&CoverageWeightedMean, &bf16_reference).unwrap();
+  assert_eq!(hb.captured.len(), rb.captured.len());
+  for (a, b) in hb.captured.iter().zip(&rb.captured) {
+    assert_eq!(
+      a.to_bits(),
+      b.to_bits(),
+      "bf16 projection must match hand-widened f64 bitwise"
+    );
+  }
+}
+
+#[cfg(feature = "half")]
+#[test]
+fn half_stored_non_finite_is_rejected() {
+  // f16/bf16 storage composes with the input-domain check: a stored NaN or
+  // infinity widens to a non-finite f64 and is rejected with NonFinite, exactly
+  // as a poisoned quant scale is. Only stored non-finites can reject a half
+  // embedding — its entire finite range sits inside the domain.
+  use crate::{
+    scalar::{bf16, f16},
+    test_support::{Bf16Emb, HalfEmb},
+  };
+
+  let span = Span::new(0, 4, 4);
+  for bad in [f16::NAN, f16::INFINITY, f16::NEG_INFINITY] {
+    let windows = vec![Windowed::new(
+      HalfEmb {
+        data: vec![
+          f16::from_f32(0.5),
+          bad,
+          f16::from_f32(-0.25),
+          f16::from_f32(1.0),
+        ],
+        captured: Vec::new(),
+      },
+      span,
+    )];
+    assert!(matches!(
+      aggregate(&MeanRenormalized, &windows),
+      Err(WinditError::NonFinite)
+    ));
+  }
+  for bad in [bf16::NAN, bf16::INFINITY, bf16::NEG_INFINITY] {
+    let windows = vec![Windowed::new(
+      Bf16Emb {
+        data: vec![
+          bf16::from_f32(0.5),
+          bad,
+          bf16::from_f32(-0.25),
+          bf16::from_f32(1.0),
+        ],
+        captured: Vec::new(),
+      },
+      span,
+    )];
+    assert!(matches!(
+      aggregate(&MeanRenormalized, &windows),
+      Err(WinditError::NonFinite)
+    ));
+  }
 }

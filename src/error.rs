@@ -96,6 +96,13 @@ pub enum WinditError {
     /// The index of the offending window within the aggregated sequence.
     window: usize,
   },
+  /// An embedding's stored scalar carries quantization *codes* rather than
+  /// values ([`Scalar::TO_COMPUTE_IS_VALUE`](crate::scalar::Scalar::TO_COMPUTE_IS_VALUE)
+  /// is `false`), and its [`Vector`](crate::windowed::Vector) implementation did
+  /// not override its `compute_components` projection with the dequantization
+  /// only it can know. Folding raw codes would be silently wrong for asymmetric
+  /// or per-window-scale quantization, so aggregation refuses them instead.
+  MissingDequantization,
   /// An exponential-moving-average smoothing factor (`alpha`) was outside the
   /// valid `[0, 1]` range, or was not a number.
   ///
@@ -165,6 +172,9 @@ impl core::fmt::Display for WinditError {
           "coverage of window {window} must be a finite fraction in [0, 1]"
         )
       }
+      Self::MissingDequantization => f.write_str(
+        "storage carries quantization codes, not values; the Vector implementation must override compute_components to dequantize them",
+      ),
       Self::AlphaOutOfRange => f.write_str("EMA smoothing factor alpha must be in [0, 1]"),
       Self::Empty => f.write_str("input sequence was empty"),
       Self::AllocFailed { elements } => {

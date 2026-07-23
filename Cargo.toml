@@ -43,6 +43,11 @@ alloc = []
 std = ["alloc"]
 text = ["alloc", "dep:unicode-segmentation"]
 serde = ["dep:serde"]
+# f16 / bf16 storage scalars. Named for its dependency per the `serde` precedent,
+# and deliberately does NOT imply `alloc`: the scalars are core-tier, so
+# `--no-default-features --features half` is a valid trait-surface-plus-scalars
+# build with no algorithms.
+half = ["dep:half"]
 
 [dependencies]
 # `libm` supplies `sqrtf` / `sqrt` for `Real::sqrt`, which core cannot provide
@@ -69,6 +74,13 @@ serde = { version = "1", optional = true, default-features = false, features = [
   "alloc",
   "derive",
 ] }
+# f16 / bf16 storage scalars for the `half` feature. `default-features = false`
+# drops half's `std` default (its feature table is hierarchical like this
+# crate's: `std = ["alloc"]`, `alloc = []`), so the bare-metal tier stays intact;
+# on targets without native half-precision intrinsics the f64 conversions are
+# pure-Rust core code. MSRV: half 2.7.1 declares rust-version 1.81, inside this
+# crate's 1.95.
+half = { version = "2", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = "0.8"

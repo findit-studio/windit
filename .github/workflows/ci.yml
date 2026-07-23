@@ -134,6 +134,12 @@ jobs:
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features serde
       - name: cargo check --target thumbv7em-none-eabihf --features alloc,text,serde
         run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc,text,serde
+      # `half` must build bare-metal without `alloc` (it does not imply alloc):
+      # the core-tier scalar surface, no algorithms.
+      - name: cargo check --target thumbv7em-none-eabihf --features half
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features --features half
+      - name: cargo check --target thumbv7em-none-eabihf --features alloc,half
+        run: cargo check --target thumbv7em-none-eabihf --no-default-features --features alloc,half
 
   # Prove rustdoc is warning-clean on every feature row, not just under
   # `--all-features`. A doc comment can carry an intra-doc link to an item that
