@@ -72,8 +72,9 @@ impl Ema {
 /// Latching two-threshold gate producing a binary `0.0` / `1.0` sequence.
 ///
 /// The gate turns on when a value rises to `on` or above, turns off when a value
-/// falls to `off` or below, and otherwise holds its previous state. It starts
-/// off. Configure `on >= off`; the band between them is the hold region that
+/// falls strictly below `off`, and otherwise holds its previous state — so a
+/// value exactly at `off` holds rather than turning off. It starts off. Configure
+/// `on >= off`; the half-open band `off <= value < on` is the hold region that
 /// suppresses chatter. If misconfigured with `on < off`, the turn-on test is
 /// evaluated first and wins, so the gate degrades to a single threshold at `on`.
 /// This is the binary VAD smoothing generalized to any f32 score.
@@ -84,12 +85,13 @@ pub struct Hysteresis {
 }
 
 impl Hysteresis {
-  /// A gate that latches on at `>= on` and off at `<= off`.
+  /// A gate that latches on at `>= on` and off at `< off`.
   ///
-  /// Configure `on >= off`; the band between them is the hold region. An
-  /// `on < off` pair is deliberately not rejected: the type documents the
-  /// single-threshold behaviour it degrades to, which is defined and
-  /// deterministic rather than invalid.
+  /// Configure `on >= off`; the band `off <= value < on` is the hold region, so
+  /// a value exactly at `off` holds rather than turning off. An `on < off` pair
+  /// is deliberately not rejected: the type documents the single-threshold
+  /// behaviour it degrades to, which is defined and deterministic rather than
+  /// invalid.
   #[must_use]
   pub const fn new(on: f32, off: f32) -> Self {
     Self { on, off }
@@ -101,7 +103,8 @@ impl Hysteresis {
     self.on
   }
 
-  /// The turn-off threshold: a value `<= off` latches the gate off.
+  /// The turn-off threshold: a value `< off` latches the gate off; a value
+  /// exactly at `off` holds instead.
   #[must_use]
   pub const fn off(&self) -> f32 {
     self.off
@@ -142,7 +145,9 @@ impl SmoothPolicy<f32> for Hysteresis {
     for w in seq {
       if w.value >= self.on {
         on = true;
-      } else if w.value <= self.off {
+      } else if w.value < self.off {
+        // Strict: a value exactly at `off` holds the previous state instead of
+        // turning off (see the struct doc for the hold region and why).
         on = false;
       }
       out.push(Windowed::new(if on { 1.0 } else { 0.0 }, w.span));

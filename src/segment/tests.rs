@@ -230,6 +230,17 @@ fn hysteresis_segment_reuses_smooth_then_runs() {
 }
 
 #[test]
+fn hysteresis_segment_holds_at_off_boundary_instead_of_turning_off() {
+  // Mirrors smooth::Hysteresis's own off-boundary regression (on 0.6, off
+  // 0.3): the gate latches on at frame 0 and a value exactly at `off` (frame
+  // 1) must hold it on rather than close the run early, so frames 0..3 stay
+  // one run; only the strictly-below value at frame 3 (0.2) ends it.
+  let s = seq(&[0.7, 0.3, 0.3, 0.2]);
+  let policy = HysteresisSegment::new(0.6, 0.3);
+  assert_eq!(policy.segment(&s), vec![Range::new(0, 3)]);
+}
+
+#[test]
 fn empty_and_all_false_yield_none() {
   let empty: Vec<Windowed<f32>> = Vec::new();
   assert!(runs(&empty, |&v| v > 0.5, &plain()).is_empty());
