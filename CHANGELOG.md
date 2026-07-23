@@ -4,6 +4,22 @@ All notable changes to `windit` are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.1
+
+### Fixed
+
+- `smooth::Hysteresis` now turns off strictly below `off` (`value < off`)
+  instead of at or below it (`value <= off`); `segment::HysteresisSegment`
+  inherits the fix, since it composes `Hysteresis` rather than reimplementing
+  the latch. A value exactly at `off` now holds the gate's previous state
+  instead of unconditionally turning it off — the hold region is the
+  half-open band `off <= value < on`. This matches the strict-below
+  convention both real VAD systems this primitive generalizes use at their
+  own off threshold; the prior inclusive boundary was faithful to neither.
+  Output changes only for inputs exactly equal to `off`; every other input
+  (including inputs equal to `on`, and every input strictly above or below
+  either threshold) is unaffected.
+
 ## 0.1.0
 
 Initial release: the generic windowed-sequence processing core (pre + post) for

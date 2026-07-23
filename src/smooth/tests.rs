@@ -39,6 +39,17 @@ fn hysteresis_latches_and_holds() {
 }
 
 #[test]
+fn hysteresis_holds_at_off_boundary_instead_of_turning_off() {
+  // on=0.6, off=0.3: 0.7 latches on; a value exactly at `off` (0.3) must hold
+  // that on state rather than turn off, twice in a row to show it is stable
+  // and not a one-step fluke. Only the strictly-below value 0.2 turns it off.
+  // This is the strict-below boundary this type's real VAD consumers rely on.
+  let input = seq(&[0.7, 0.3, 0.3, 0.2]);
+  let out = Hysteresis::new(0.6, 0.3).smooth(&input);
+  assert_eq!(values(&out), vec![1.0, 1.0, 1.0, 0.0]);
+}
+
+#[test]
 fn ema_clamps_alpha_and_never_emits_nan() {
   // alpha 2.0 clamps to 1.0 (track the input exactly): s_t = x_t.
   let input = seq(&[0.5, 0.8]);

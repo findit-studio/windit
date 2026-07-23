@@ -320,8 +320,9 @@ impl SegmentPolicy<f32> for Threshold {
 /// Segment through a latching two-threshold gate: the binary-VAD path.
 ///
 /// The sequence is first smoothed by [`Hysteresis`]
-/// with these `on` / `off` thresholds (turn on at `>= on`, off at `<= off`, hold
-/// between), then the latched-on windows are grouped by [`runs`] under `opts`.
+/// with these `on` / `off` thresholds (turn on at `>= on`, off strictly below
+/// `off`, hold between — a value exactly at `off` holds), then the latched-on
+/// windows are grouped by [`runs`] under `opts`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HysteresisSegment {
   on: f32,
@@ -330,11 +331,11 @@ pub struct HysteresisSegment {
 }
 
 impl HysteresisSegment {
-  /// Latch on at `>= on` and off at `<= off`, shaping the resulting runs with
-  /// the default [`SegmentOptions`].
+  /// Latch on at `>= on` and off strictly below `off`, shaping the resulting
+  /// runs with the default [`SegmentOptions`].
   ///
-  /// Configure `on >= off`; [`Hysteresis`] documents how the gate degrades
-  /// otherwise.
+  /// Configure `on >= off`; [`Hysteresis`] documents the hold region and how
+  /// the gate degrades otherwise.
   #[must_use]
   pub const fn new(on: f32, off: f32) -> Self {
     Self {
