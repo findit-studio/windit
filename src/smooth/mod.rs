@@ -140,8 +140,8 @@ impl Hysteresis {
   /// evaluated first and wins.
   ///
   /// The single definition of the gate transition: [`Hysteresis::smooth`] and
-  /// the fused `segment::HysteresisSegment` both step through it, so the two
-  /// paths cannot drift apart.
+  /// any segmentation gate stream both step through it, so the smoothing and
+  /// gating paths cannot drift apart.
   pub(crate) const fn step(&self, active: bool, value: f32) -> bool {
     if value >= self.on {
       true

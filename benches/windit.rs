@@ -1,10 +1,11 @@
 //! Temporal smoothing and segmentation benchmarks.
 //!
 //! Covers the smoothing policies (`Identity` copy baseline, `Ema`, `Hysteresis`)
-//! and the segmentation paths (the two-pass reference composition, the fused
-//! `HysteresisSegment`, and `Threshold` for context) over representative lengths
-//! and run patterns, reporting element throughput. The `segment/two_pass` versus
-//! `segment/fused` pair is the fusion trade-off measurement.
+//! and the segmentation paths (the batch `runs` composition, the incremental
+//! `Segmenter` streaming drive, and `Threshold` for context) over representative
+//! lengths and run patterns, reporting element throughput. The
+//! `segment/two_pass` versus `segment/streaming` pair contrasts the batch and
+//! incremental drivers of the one shared state machine.
 //!
 //! Gated on the heap tier: the temporal modules do not exist without it, so the
 //! featureless build compiles to an empty `main`.
@@ -16,7 +17,7 @@ mod temporal {
   use criterion::{BenchmarkId, Criterion, Throughput};
   use windit::{
     plan::Span,
-    segment::{runs, HysteresisSegment, SegmentOptions, SegmentPolicy, Threshold},
+    segment::{runs, SegmentOptions, SegmentPolicy, Segmenter, Threshold},
     smooth::{Ema, Hysteresis, SmoothPolicy},
     windowed::Windowed,
   };
@@ -118,18 +119,28 @@ mod temporal {
     });
   }
 
-  /// The pre-fusion composition, inlined through the public API so the trade-off
-  /// against `segment/fused` stays measurable.
+  /// The batch driver over a hysteresis-smoothed sequence, contrasted against
+  /// the incremental drive of the same state machine below.
   fn segment_two_pass(c: &mut Criterion) {
     each_input(c, "segment/two_pass", |s| {
       let gated = Hysteresis::new(0.6, 0.3).smooth(s);
-      runs(&gated, |&v| v >= 0.5, &SegmentOptions::new())
+      runs(&gated, |&v| v >= 0.5, &SegmentOptions::new()).unwrap()
     });
   }
 
-  fn segment_fused(c: &mut Criterion) {
-    each_input(c, "segment/fused", |s| {
-      HysteresisSegment::new(0.6, 0.3).segment(s)
+  /// The incremental `Segmenter` driven one window at a time through a threshold
+  /// gate — the zero-allocation streaming push/finish path. Returns a count so
+  /// no output vector is built inside the timed loop.
+  fn segment_streaming(c: &mut Criterion) {
+    each_input(c, "segment/streaming", |s| {
+      let mut seg = Segmenter::new(SegmentOptions::new());
+      let mut finalized = 0usize;
+      for w in s {
+        if seg.push(*w.value() >= 0.5, w.span()).unwrap().is_some() {
+          finalized += 1;
+        }
+      }
+      finalized + seg.finish().count()
     });
   }
 
@@ -146,7 +157,7 @@ mod temporal {
   criterion::criterion_group!(
     segment_benches,
     segment_two_pass,
-    segment_fused,
+    segment_streaming,
     segment_threshold
   );
 }

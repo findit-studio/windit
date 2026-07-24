@@ -1,26 +1,25 @@
-//! `HysteresisSegment::segment` does not allocate the intermediate gated
-//! sequence: the fused single pass carries one bool of latch state instead of
-//! building a `Vec<Windowed<f32>>` the length of the input.
+//! The incremental [`Segmenter`](windit::segment::Segmenter) allocates nothing:
+//! `push` advances four machine words of state, and `finish` returns a
+//! fixed-size [`SegmentTail`](windit::segment::SegmentTail) that holds its ranges
+//! inline. Driving a long input to completion — including the unbounded
+//! `merge_gap` case, where the pending accumulator only ever widens — touches
+//! the heap zero times.
 //!
 //! Proving that needs an allocator that refuses, which is a process-wide
 //! setting, so this suite is one test in its own binary: nothing else runs while
-//! the refusal is armed. The refusal is size-gated above the fused path's own
-//! small allocations (the run vectors) and below the length-of-input gated
-//! vector it must never build, so the failure that would be observed is exactly
-//! the reintroduced intermediate and nothing else.
+//! the refusal is armed. The refusal is armed around the streaming drive alone,
+//! at a one-byte threshold, so *any* heap allocation on that path is caught.
 //!
-//! The failure mode differs from the other allocation suites. `chunk` and
-//! `aggregate` grow on a `Result`-returning path, so a refused allocation comes
-//! back as `WinditError::AllocFailed`. `SegmentPolicy::segment` is infallible: a
-//! reintroduced full-length intermediate allocation has no error channel to
-//! report on, so a refusal reaches `handle_alloc_error` and aborts the test
-//! binary. That abort *is* the regression signal — a fused path that stays fused
-//! simply never asks for the gated vector, so the armed run returns the ordinary
-//! answer instead.
+//! The failure mode: the streaming path has no error channel for an allocation
+//! (it never asks for one), so a refused allocation reaches `handle_alloc_error`
+//! and aborts the test binary. That abort *is* the regression signal — a path
+//! that stays allocation-free simply never asks, so the armed drive returns the
+//! ordinary answer instead.
 //!
-//! Gated on `alloc`: without it there is no segmentation to drive, and the file
-//! compiles to an empty test binary so the rest of the feature matrix still
-//! builds.
+//! Gated on `alloc`: without it there is no batch `runs` to cross-check against,
+//! and the file compiles to an empty test binary so the rest of the feature
+//! matrix still builds. (The `Segmenter` itself is featureless; this suite gates
+//! only because it compares against the `alloc`-tier `runs`.)
 #![cfg(any(feature = "std", feature = "alloc"))]
 
 use std::{
@@ -30,7 +29,7 @@ use std::{
 
 use windit::{
   plan::Span,
-  segment::{HysteresisSegment, Range, SegmentPolicy},
+  segment::{runs, Range, SegmentOptions, Segmenter},
   windowed::Windowed,
 };
 
@@ -41,10 +40,9 @@ struct Refusing;
 /// Whether the refusal is in effect.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// The size at or above which an armed allocation is refused. Set above the
-/// fused path's own small run vectors and below the length-of-input gated vector
-/// the fused path must never build, so the refusal lands on a reintroduced
-/// intermediate and on nothing else.
+/// The size at or above which an armed allocation is refused. Left at `MAX`
+/// (refuse nothing) except around the streaming drive, where it drops to one
+/// byte so any heap allocation is caught.
 static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 // SAFETY: every branch forwards to `System`, a correct allocator, or returns
@@ -74,17 +72,34 @@ unsafe impl GlobalAlloc for Refusing {
 #[global_allocator]
 static ALLOC: Refusing = Refusing;
 
-/// The refusal threshold, in bytes: above the fused path's own allocations (four
-/// runs of 16-byte `Range`s, well under a kilobyte) and far below the gated
-/// `Vec<Windowed<f32>>` the two-pass path used to build (`4096 * 32` bytes).
-const GATE_LIMIT: usize = 4096;
+/// Fold a finalized range into a checksum, so the armed drive can be verified to
+/// compute the same segmentation as the batch driver without collecting into a
+/// heap `Vec` under the armed allocator.
+fn mix(acc: u64, r: Range) -> u64 {
+  acc ^ (r.start() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (r.end() as u64).rotate_left(32)
+}
+
+/// Drive a fresh `Segmenter` over the gated input to completion, checksumming
+/// every finalized range. Allocates nothing itself, so it is safe to call with
+/// the refusal armed.
+fn drive_checksum(input: &[Windowed<f32>], opts: SegmentOptions) -> u64 {
+  let mut seg = Segmenter::new(opts);
+  let mut acc = 0u64;
+  for w in input {
+    if let Some(r) = seg.push(*w.value() >= 0.5, w.span()).unwrap() {
+      acc = mix(acc, r);
+    }
+  }
+  for r in seg.finish() {
+    acc = mix(acc, r);
+  }
+  acc
+}
 
 #[test]
-fn fused_hysteresis_segment_does_not_allocate_the_gated_sequence() {
+fn segmenter_push_and_finish_do_not_allocate() {
   // 4096 unit-span windows in eight 512-element blocks alternating 0.9 / 0.1 and
-  // starting active. With on 0.6 / off 0.3 the four active blocks segment to four
-  // 512-element runs; the inactive blocks separate them (default opts do not
-  // merge across the gaps).
+  // starting active — many run boundaries to exercise every transition.
   const N: usize = 4096;
   const BLOCK: usize = 512;
   let input: Vec<Windowed<f32>> = (0..N)
@@ -93,35 +108,37 @@ fn fused_hysteresis_segment_does_not_allocate_the_gated_sequence() {
       Windowed::new(if active { 0.9 } else { 0.1 }, Span::new(i, 1, 1))
     })
     .collect();
-  let policy = HysteresisSegment::new(0.6, 0.3);
-  let expected = vec![
-    Range::new(0, 512),
-    Range::new(1024, 1536),
-    Range::new(2048, 2560),
-    Range::new(3072, 3584),
-  ];
 
-  // Unarmed, the ordinary answer — which is what makes the armed run below
-  // evidence about allocation rather than about geometry.
-  let unarmed = policy.segment(&input);
-  assert_eq!(unarmed, expected);
+  // Two configurations: no merging (four separate runs) and an unbounded
+  // merge_gap (one ever-widening pending accumulator, the O(1) case).
+  let separate = SegmentOptions::new();
+  let unbounded = SegmentOptions::new().with_merge_gap(usize::MAX);
 
-  // The gate is honest only if the intermediate it must not build is above the
-  // refusal threshold: the length-of-input gated vector would be one allocation
-  // of `N * size_of::<Windowed<f32>>()` bytes, comfortably over `GATE_LIMIT`.
-  assert!(
-    input.len() * core::mem::size_of::<Windowed<f32>>() >= GATE_LIMIT,
-    "the gated vector must exceed the refusal threshold for this test to bite"
-  );
+  // The batch driver's answer, as a checksum, computed while the heap is free.
+  // This ties the streaming drive to `runs` — the parity the alloc pin backs up.
+  let expect_separate = runs(&input, |&v| v >= 0.5, &separate)
+    .unwrap()
+    .into_iter()
+    .fold(0u64, mix);
+  let expect_unbounded = runs(&input, |&v| v >= 0.5, &unbounded)
+    .unwrap()
+    .into_iter()
+    .fold(0u64, mix);
 
-  LIMIT.store(GATE_LIMIT, Ordering::Relaxed);
+  // Unarmed reference — makes the armed run evidence about allocation, not
+  // geometry.
+  assert_eq!(drive_checksum(&input, separate), expect_separate);
+  assert_eq!(drive_checksum(&input, unbounded), expect_unbounded);
+
+  // Arm the refusal at one byte around the streaming drives only. Reaching the
+  // assertions at all means neither drive asked the heap for anything: a refusal
+  // would have aborted this binary through `handle_alloc_error`.
+  LIMIT.store(1, Ordering::Relaxed);
   ARMED.store(true, Ordering::Relaxed);
-  let armed = policy.segment(&input);
+  let armed_separate = drive_checksum(&input, separate);
+  let armed_unbounded = drive_checksum(&input, unbounded);
   ARMED.store(false, Ordering::Relaxed);
 
-  // Reaching here at all means the fused path never asked for the gated vector: a
-  // refusal would have aborted this binary through `handle_alloc_error`. The
-  // equal result confirms the armed run computed the same segmentation.
-  assert_eq!(armed, expected);
-  assert_eq!(armed, unarmed);
+  assert_eq!(armed_separate, expect_separate);
+  assert_eq!(armed_unbounded, expect_unbounded);
 }

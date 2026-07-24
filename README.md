@@ -83,8 +83,9 @@ own by implementing the trait.
   for binary VAD).
 - **segment** — reduce a windowed score sequence to continuous element
   [`Range`]s: `runs`, `longest_run`, and `runs_sorted`, with `min_len` and
-  `merge_gap` post-passes. Policies [`Threshold`] and [`HysteresisSegment`]
-  package a predicate with its options.
+  `merge_gap` post-passes, all driving the incremental [`Segmenter`] (a bounded,
+  zero-allocation state machine, so batch equals streaming by construction).
+  Policy [`Threshold`] packages a predicate with its options.
 - **split** — decide how an input is divided before windowing. [`FixedWindow`]
   delegates to the planner; [`ContentAware`] (feature `text`) chunks strings.
 
@@ -101,8 +102,10 @@ let frames: Vec<Windowed<f32>> = probs
   .collect();
 
 // Find the longest continuous speech region, ignoring runs under two frames.
+// The batch drivers are fallible: they check the ascending-span contract and
+// surface an allocation failure, so planner-ordered spans just `unwrap`.
 let opts = SegmentOptions::new().with_min_len(2);
-let speech = longest_run(&frames, |&p| p >= 0.5, &opts);
+let speech = longest_run(&frames, |&p| p >= 0.5, &opts).unwrap();
 assert_eq!(speech, Some(Range::new(4, 7)));
 ```
 
@@ -236,7 +239,7 @@ dual licensed as above, without any additional terms or conditions.
 [`Hysteresis`]: https://docs.rs/windit/latest/windit/smooth/struct.Hysteresis.html
 [`Range`]: https://docs.rs/windit/latest/windit/segment/struct.Range.html
 [`Threshold`]: https://docs.rs/windit/latest/windit/segment/struct.Threshold.html
-[`HysteresisSegment`]: https://docs.rs/windit/latest/windit/segment/struct.HysteresisSegment.html
+[`Segmenter`]: https://docs.rs/windit/latest/windit/segment/struct.Segmenter.html
 [`FixedWindow`]: https://docs.rs/windit/latest/windit/split/struct.FixedWindow.html
 [`ContentAware`]: https://docs.rs/windit/latest/windit/split/struct.ContentAware.html
 [`MeasureText`]: https://docs.rs/windit/latest/windit/split/trait.MeasureText.html
