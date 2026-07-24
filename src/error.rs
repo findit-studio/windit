@@ -114,6 +114,23 @@ pub enum WinditError {
   AlphaOutOfRange,
   /// The input sequence was empty where at least one element was required.
   Empty,
+  /// A pushed span's `start` was strictly less than the previous pushed span's
+  /// `start`, with no intervening `discontinuity` or `reset` to re-arm the
+  /// timeline.
+  ///
+  /// The incremental segmentation core, and the batch drivers built on it
+  /// (`runs`, `longest_run`, `runs_sorted`), require spans in ascending
+  /// `start` order — the order planners produce. Equal starts are admitted
+  /// (degenerate but deterministic); a strictly backward start is a caller
+  /// bug rather than a supported case, so it is reported here instead of
+  /// silently producing unspecified geometry. A genuine backward seek is
+  /// expressed with a declared discontinuity, not with a backward span.
+  NonMonotonicSpan {
+    /// The most recent accepted span's `start`, in input elements.
+    prev_start: usize,
+    /// The rejected, out-of-order `start`, in input elements.
+    start: usize,
+  },
   /// A buffer whose size is set by the caller's geometry could not be allocated:
   /// the requested element count exceeded what the allocator can address, or the
   /// allocation was refused.
@@ -177,6 +194,12 @@ impl core::fmt::Display for WinditError {
       ),
       Self::AlphaOutOfRange => f.write_str("EMA smoothing factor alpha must be in [0, 1]"),
       Self::Empty => f.write_str("input sequence was empty"),
+      Self::NonMonotonicSpan { prev_start, start } => {
+        write!(
+          f,
+          "span start {start} is before the previous span start {prev_start}; spans must be in ascending start order"
+        )
+      }
       Self::AllocFailed { elements } => {
         write!(f, "could not allocate a buffer of {elements} elements")
       }
