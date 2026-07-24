@@ -9,17 +9,38 @@
 //! merge runs separated by at most `merge_gap` elements, then drop runs shorter
 //! than `min_len`.
 //!
-//! [`runs`], [`longest_run`], and [`runs_sorted`] are batch conveniences that
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`runs`], [`longest_run`], and [`runs_sorted`] are batch conveniences that"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`runs`, `longest_run`, and `runs_sorted` are batch conveniences that"
+)]
 //! *drive* a fresh `Segmenter` over a slice and collect what it emits, so batch
 //! output equals the streaming core plus [`finish`](Segmenter::finish) by
 //! construction rather than by two implementations kept in sync. `longest_run`
 //! ranks those ranges; the find-longest-continuous-range case (the longest
 //! speech region, say) is `longest_run`.
 //!
-//! `SegmentPolicy` packages a predicate with its options; [`Threshold`] admits
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "`SegmentPolicy` packages a predicate with its options; [`Threshold`] admits"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`SegmentPolicy` packages a predicate with its options; `Threshold` admits"
+)]
 //! values at or above a cutoff. These policies restart their state on every
 //! call — they are batch conveniences, not incremental decoders. For a latching
-//! two-threshold gate, feed a [`Hysteresis`](crate::smooth::Hysteresis) decision
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "two-threshold gate, feed a [`Hysteresis`](crate::smooth::Hysteresis) decision"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "two-threshold gate, feed a `Hysteresis` decision"
+)]
 //! stream into a `Segmenter` directly.
 //!
 //! The `Segmenter`, `SegmentTail`, `Range`, and `SegmentOptions` types live in
@@ -168,8 +189,22 @@ impl Default for SegmentOptions {
 /// decisions and emit finalized element [`Range`]s with exact batch parity.
 ///
 /// One concrete semantics, parameterized by [`SegmentOptions`] — there is no
-/// trait, because there is exactly one geometry. The batch drivers ([`runs`],
-/// [`longest_run`], [`runs_sorted`]) *are* this state machine driven over a
+#[cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "trait, because there is exactly one geometry. The batch drivers ([`runs`],"
+)]
+#[cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "trait, because there is exactly one geometry. The batch drivers (`runs`,"
+)]
+#[cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`longest_run`], [`runs_sorted`]) *are* this state machine driven over a"
+)]
+#[cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`longest_run`, `runs_sorted`) *are* this state machine driven over a"
+)]
 /// slice, so streaming and batch cannot drift apart.
 ///
 /// # State and bound
