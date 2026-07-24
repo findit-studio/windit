@@ -7,6 +7,7 @@ use super::{
 use crate::{
   error::WinditError,
   plan::{Span, WindowOptions, WindowPlan},
+  smooth::SmoothPolicy,
   windowed::Windowed,
 };
 
@@ -23,6 +24,36 @@ fn seq(values: &[f32]) -> Vec<Windowed<f32>> {
 /// A default `SegmentOptions`: no merging, no minimum length.
 fn plain() -> SegmentOptions {
   SegmentOptions::new()
+}
+
+/// The pre-fusion two-pass composition, kept as the differential reference for
+/// the fused [`HysteresisSegment::segment`]: latch the sequence with
+/// `smooth::Hysteresis`, then group the latched-on windows with [`runs`]. This
+/// is the behaviour that shipped before fusion, not an independent oracle — it
+/// proves the fused path is *equivalent* to it, not that either is *correct*.
+fn two_pass_reference(
+  on: f32,
+  off: f32,
+  opts: &SegmentOptions,
+  seq: &[Windowed<f32>],
+) -> Vec<Range> {
+  let gated = crate::smooth::Hysteresis::new(on, off).smooth(seq);
+  runs(&gated, |&v| v >= 0.5, opts)
+}
+
+/// xorshift64 — deterministic and dependency-free; the seed must be nonzero.
+fn xorshift(state: &mut u64) -> u64 {
+  let mut x = *state;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  *state = x;
+  x
+}
+
+/// A pseudo-random `f32` in `[0, 1)` from the generator's next 24 bits.
+fn next_unit(state: &mut u64) -> f32 {
+  (xorshift(state) >> 40) as f32 / (1u32 << 24) as f32
 }
 
 #[test]
@@ -221,9 +252,11 @@ fn threshold_policy_includes_boundary() {
 }
 
 #[test]
-fn hysteresis_segment_reuses_smooth_then_runs() {
+fn hysteresis_segment_latches_then_segments() {
   // Same latch as smooth::Hysteresis (on 0.6, off 0.3): [0,1,1,0,1] over the
-  // input, whose set frames form runs [1,3) and [4,5).
+  // input, whose set frames form runs [1,3) and [4,5). The fused single pass must
+  // match the two-pass composition here and everywhere else, which
+  // `fused_matches_two_pass_reference_*` enforce exhaustively.
   let s = seq(&[0.1, 0.7, 0.5, 0.2, 0.6]);
   let policy = HysteresisSegment::new(0.6, 0.3);
   assert_eq!(policy.segment(&s), vec![Range::new(1, 3), Range::new(4, 5)]);
@@ -314,4 +347,245 @@ fn segment_options_builder_and_default() {
   assert_eq!(d.min_len(), 0);
   assert_eq!(d.merge_gap(), 0);
   assert_eq!(d, SegmentOptions::new());
+}
+
+#[test]
+fn threshold_non_finite_scores_and_thresholds() {
+  // `thr = -inf` admits every finite score and both infinities, but a NaN score
+  // is still excluded because `NaN >= -inf` is false, so index 1 drops out.
+  let s = seq(&[0.1, f32::NAN, 0.5]);
+  assert_eq!(
+    Threshold::new(f32::NEG_INFINITY).segment(&s),
+    vec![Range::new(0, 1), Range::new(2, 3)]
+  );
+
+  // `thr = NaN`: `value >= NaN` is never true, so nothing is in-segment.
+  assert!(Threshold::new(f32::NAN).segment(&s).is_empty());
+
+  // `thr = +inf` admits only a `+inf` score.
+  let s = seq(&[f32::INFINITY, 1.0]);
+  assert_eq!(
+    Threshold::new(f32::INFINITY).segment(&s),
+    vec![Range::new(0, 1)]
+  );
+}
+
+#[test]
+fn hysteresis_segment_non_finite_thresholds() {
+  let s = seq(&[0.7, 0.1, 0.1]);
+  // `on = NaN`: the gate can never activate, so nothing is segmented.
+  assert!(HysteresisSegment::new(f32::NAN, 0.3).segment(&s).is_empty());
+  // `off = NaN`: once latched on at index 0 the gate never releases, so the whole
+  // sequence is a single run.
+  assert_eq!(
+    HysteresisSegment::new(0.6, f32::NAN).segment(&s),
+    vec![Range::new(0, 3)]
+  );
+}
+
+#[test]
+fn hysteresis_segment_nan_score_holds_inside_run() {
+  // on 0.6 off 0.3: index 0 latches on, the two NaN scores hold that on state,
+  // and 0.2 releases — so the run is elements [0, 3), the NaNs do not split it.
+  let s = seq(&[0.7, f32::NAN, f32::NAN, 0.2]);
+  assert_eq!(
+    HysteresisSegment::new(0.6, 0.3).segment(&s),
+    vec![Range::new(0, 3)]
+  );
+}
+
+#[test]
+fn overlapping_spans_union_and_merge() {
+  // (i) Two accepted overlapping windows inside one run cover the union of their
+  // spans: [0,4) then [2,6) -> [0,6). The second start (2) is at or before the
+  // open run's end (4), so it extends the run rather than starting a new one.
+  let s = [
+    Windowed::new(0.9, Span::new(0, 4, 4)),
+    Windowed::new(0.9, Span::new(2, 4, 4)),
+  ];
+  assert_eq!(runs(&s, |&v| v > 0.5, &plain()), vec![Range::new(0, 6)]);
+
+  // (ii) A rejected window between two accepted overlapping ranges splits them
+  // into raw runs [0,6) and [4,10); with merge_gap 0, `merge_adjacent` folds the
+  // overlap (start 4 before end 6) to a zero gap through `saturating_sub` and
+  // merges them into [0,10).
+  let s = [
+    Windowed::new(0.9, Span::new(0, 6, 6)),
+    Windowed::new(0.1, Span::new(2, 6, 6)),
+    Windowed::new(0.9, Span::new(4, 6, 6)),
+  ];
+  assert_eq!(
+    runs(&s, |&v| v > 0.5, &SegmentOptions::new().with_merge_gap(0)),
+    vec![Range::new(0, 10)]
+  );
+}
+
+#[test]
+fn merge_gap_applies_before_min_len() {
+  // Raw runs [0,2) and [3,5), a one-element gap. merge_gap 1 bridges them first,
+  // so min_len then sees one length-5 run: min_len 4 keeps it, min_len 6 drops
+  // it. If min_len ran before the merge it would drop both length-2 runs.
+  let s = seq(&[0.9, 0.9, 0.1, 0.9, 0.9]);
+  assert_eq!(
+    runs(
+      &s,
+      |&v| v > 0.5,
+      &SegmentOptions::new().with_merge_gap(1).with_min_len(4)
+    ),
+    vec![Range::new(0, 5)]
+  );
+  assert!(runs(
+    &s,
+    |&v| v > 0.5,
+    &SegmentOptions::new().with_merge_gap(1).with_min_len(6)
+  )
+  .is_empty());
+}
+
+#[test]
+fn non_monotonic_spans_return_deterministically_without_panicking() {
+  // `runs` documents ascending span order as a precondition. Non-monotonic input
+  // is a documented precondition violation, not a supported case: the guarantee
+  // is only that the call returns deterministically without panicking and every
+  // returned range is well-formed. *Which* ranges is unspecified, so this pins
+  // the guarantee and never the concrete geometry.
+  let s = [
+    Windowed::new(0.9, Span::new(5, 2, 2)),
+    Windowed::new(0.9, Span::new(0, 2, 2)),
+  ];
+  let first = runs(&s, |&v| v > 0.5, &plain());
+  let second = runs(&s, |&v| v > 0.5, &plain());
+  assert_eq!(first, second, "runs must be deterministic");
+  assert!(
+    first.iter().all(|r| r.start() <= r.end()),
+    "every returned range must be well-formed"
+  );
+}
+
+#[test]
+fn fused_matches_two_pass_reference_on_fixed_geometries() {
+  // The fused `HysteresisSegment::segment` must equal the two-pass reference on
+  // every input, not only finite ones. These fixed cases cover adjacent unit
+  // spans, the off-boundary hold, the gapped plan under each option, overlapping
+  // spans (union and merge), non-finite scores, and the degenerate `on < off`
+  // and NaN-threshold configurations.
+  let overlap_union = vec![
+    Windowed::new(0.9, Span::new(0, 4, 4)),
+    Windowed::new(0.9, Span::new(2, 4, 4)),
+  ];
+  let overlap_split = vec![
+    Windowed::new(0.9, Span::new(0, 6, 6)),
+    Windowed::new(0.1, Span::new(2, 6, 6)),
+    Windowed::new(0.9, Span::new(4, 6, 6)),
+  ];
+  let cases: Vec<(f32, f32, SegmentOptions, Vec<Windowed<f32>>)> = vec![
+    (0.6, 0.3, plain(), seq(&[0.1, 0.7, 0.5, 0.2, 0.6])),
+    (0.6, 0.3, plain(), seq(&[0.7, 0.3, 0.3, 0.2])),
+    (0.6, 0.3, plain(), gapped_plan()),
+    (
+      0.6,
+      0.3,
+      SegmentOptions::new().with_merge_gap(2),
+      gapped_plan(),
+    ),
+    (
+      0.6,
+      0.3,
+      SegmentOptions::new().with_merge_gap(3),
+      gapped_plan(),
+    ),
+    (
+      0.6,
+      0.3,
+      SegmentOptions::new().with_min_len(2),
+      gapped_plan(),
+    ),
+    (
+      0.6,
+      0.3,
+      SegmentOptions::new().with_min_len(3),
+      gapped_plan(),
+    ),
+    (0.6, 0.3, plain(), overlap_union),
+    (
+      0.6,
+      0.3,
+      SegmentOptions::new().with_merge_gap(0),
+      overlap_split,
+    ),
+    (0.6, 0.3, plain(), seq(&[f32::NAN, 0.7, f32::NAN, 0.2])),
+    (
+      0.6,
+      0.3,
+      plain(),
+      seq(&[f32::INFINITY, 0.5, f32::NEG_INFINITY]),
+    ),
+    (0.3, 0.6, plain(), seq(&[0.4, 0.5, 0.2, 0.35])),
+    (f32::NAN, 0.3, plain(), seq(&[0.7, 0.1, 0.1])),
+    (0.6, f32::NAN, plain(), seq(&[0.7, 0.1, 0.1])),
+  ];
+  for (on, off, opts, s) in cases {
+    let fused = HysteresisSegment::new(on, off).with_opts(opts).segment(&s);
+    let reference = two_pass_reference(on, off, &opts, &s);
+    assert_eq!(fused, reference, "on={on} off={off} opts={opts:?}");
+  }
+}
+
+#[test]
+fn fused_matches_two_pass_reference_on_randomized_finite_inputs() {
+  // ~200 deterministic pseudo-random finite cases: the fused single pass must
+  // equal the two-pass reference exactly for every one. Geometry is one of unit,
+  // adjacent (hop == window), gapped (hop > window), or overlapping (hop <
+  // window), all in ascending span order by construction; thresholds are either
+  // uniform or sampled from the generated scores, so exact `v == on` / `v == off`
+  // boundaries are exercised, and both `on >= off` and `on < off` orderings occur.
+  let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+  for _ in 0..200 {
+    let n = (xorshift(&mut state) % 257) as usize;
+    let window = (xorshift(&mut state) % 8 + 1) as usize;
+    let geometry = xorshift(&mut state) % 4;
+    let hop = match geometry {
+      0 => 1,                                                   // unit spans (len 1)
+      1 => window,                                              // adjacent
+      2 => window + 1 + (xorshift(&mut state) % 4) as usize,    // gapped (hop > window)
+      _ => 1 + (xorshift(&mut state) % window as u64) as usize, // overlapping (hop <= window)
+    };
+    let span_len = if geometry == 0 { 1 } else { window };
+
+    let mut scores: Vec<f32> = Vec::with_capacity(n);
+    let seq: Vec<Windowed<f32>> = (0..n)
+      .map(|i| {
+        let v = next_unit(&mut state);
+        scores.push(v);
+        Windowed::new(v, Span::new(i * hop, span_len, window))
+      })
+      .collect();
+
+    // Draw each threshold either uniformly in [0,1) or from an actual score, so
+    // exact-boundary equality is hit; independence makes both orderings appear.
+    let threshold = |state: &mut u64| -> f32 {
+      if xorshift(state).is_multiple_of(2) || scores.is_empty() {
+        next_unit(state)
+      } else {
+        scores[(xorshift(state) % scores.len() as u64) as usize]
+      }
+    };
+    let on = threshold(&mut state);
+    let off = threshold(&mut state);
+
+    let merge_gap = [0usize, 1, 3][(xorshift(&mut state) % 3) as usize];
+    let min_len = [0usize, 2, 5][(xorshift(&mut state) % 3) as usize];
+    let opts = SegmentOptions::new()
+      .with_merge_gap(merge_gap)
+      .with_min_len(min_len);
+
+    let fused = HysteresisSegment::new(on, off)
+      .with_opts(opts)
+      .segment(&seq);
+    let reference = two_pass_reference(on, off, &opts, &seq);
+    assert_eq!(
+      fused, reference,
+      "n={n} window={window} hop={hop} on={on} off={off} opts={opts:?}"
+    );
+  }
 }

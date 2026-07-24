@@ -10,17 +10,16 @@
 //! (the longest speech region, say) is `longest_run`.
 //!
 //! `SegmentPolicy` packages a predicate with its options. `Threshold` admits
-//! values at or above a cutoff; `HysteresisSegment` first latches the sequence
-//! through `smooth::Hysteresis` and then segments, which is the binary-VAD
-//! path.
+//! values at or above a cutoff; `HysteresisSegment` latches the sequence through
+//! `smooth::Hysteresis`'s gate and segments the latched-on windows in a single
+//! pass, which is the binary-VAD path.
+//!
+//! Each policy restarts its state on every call — these are batch conveniences,
+//! not incremental decoders.
 
 use std::vec::Vec;
 
-use crate::{
-  error::WinditError,
-  smooth::{Hysteresis, SmoothPolicy},
-  windowed::Windowed,
-};
+use crate::{error::WinditError, smooth::Hysteresis, windowed::Windowed};
 
 #[cfg(test)]
 mod tests;
@@ -85,8 +84,9 @@ impl Range {
   /// The number of elements the range covers (`end - start`).
   ///
   /// Never underflows: both constructors reject `start > end` in every build,
-  /// and the only writes that bypass them — [`runs`] and `merge_adjacent`
-  /// extending a run — move `end` upward alone.
+  /// and the only writes that bypass them — the in-crate geometry core
+  /// (`runs_from_flags`) and `merge_adjacent` extending a run — move `end`
+  /// upward alone.
   #[must_use]
   pub const fn len(&self) -> usize {
     // The saturation is therefore unreachable. It is kept as the last line of
@@ -163,7 +163,10 @@ impl Default for SegmentOptions {
 ///
 /// The sequence must be in span order (ascending `span.start`), as planners
 /// produce; a run's start is taken from its first window, not the minimum over
-/// the run.
+/// the run. Non-ascending input violates this precondition: the call still
+/// returns deterministically without panicking and every returned range is
+/// well-formed, but which ranges it returns is unspecified — sort by
+/// `span.start` first.
 ///
 /// A run is a maximal block of accepted windows that is also *geometrically
 /// continuous*: a window is added to the open run only when its `span.start` is
@@ -182,11 +185,25 @@ pub fn runs<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> V
 where
   F: Fn(&V) -> bool,
 {
+  // One predicate call per window, in order, exactly as before.
+  runs_from_flags(seq.iter().map(|w| (predicate(&w.value), w.span)), opts)
+}
+
+/// Group flagged windows into merged, length-filtered element ranges: the
+/// geometry core behind [`runs`] and the fused [`HysteresisSegment::segment`].
+///
+/// [`runs`] documents the full contract; the flags arrive pre-computed so a
+/// stateful producer (the hysteresis latch) can feed it without materializing a
+/// gated sequence.
+fn runs_from_flags<I>(flags: I, opts: &SegmentOptions) -> Vec<Range>
+where
+  I: Iterator<Item = (bool, crate::plan::Span)>,
+{
   let mut raw: Vec<Range> = Vec::new();
   let mut current: Option<Range> = None;
-  for w in seq {
-    if predicate(&w.value) {
-      let (start, end) = (w.span.start(), w.span.end());
+  for (accepted, span) in flags {
+    if accepted {
+      let (start, end) = (span.start(), span.end());
       match current {
         // A span beginning past the open run's end leaves elements that no span
         // covers. Closing the run here keeps `merge_gap` the only thing that can
@@ -265,6 +282,11 @@ fn merge_adjacent(ranges: Vec<Range>, merge_gap: usize) -> Vec<Range> {
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
 /// `V = f32` (speech probabilities, energies, logits).
+///
+/// Each call starts from fresh policy state: segmenting a sequence chunk by
+/// chunk is not equivalent to one whole-sequence call, because a hysteresis
+/// latch does not carry across calls. These policies are batch conveniences, not
+/// incremental decoders.
 pub trait SegmentPolicy<V> {
   /// Segment `seq` into the element ranges it selects, in input order.
   fn segment(&self, seq: &[Windowed<V>]) -> Vec<Range>;
@@ -274,6 +296,10 @@ pub trait SegmentPolicy<V> {
 ///
 /// A window is in-segment when `value >= thr`; the resulting runs are shaped by
 /// the policy's [`SegmentOptions`].
+///
+/// The comparison is IEEE: a `NaN` score is never in-segment (even with
+/// `thr = -inf`); a `NaN` `thr` selects nothing; `thr = -inf` selects every
+/// non-`NaN` score; `thr = +inf` selects only `+inf`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
   thr: f32,
@@ -319,10 +345,12 @@ impl SegmentPolicy<f32> for Threshold {
 
 /// Segment through a latching two-threshold gate: the binary-VAD path.
 ///
-/// The sequence is first smoothed by [`Hysteresis`]
-/// with these `on` / `off` thresholds (turn on at `>= on`, off strictly below
-/// `off`, hold between — a value exactly at `off` holds), then the latched-on
-/// windows are grouped by [`runs`] under `opts`.
+/// Latches the sequence through the same gate as [`Hysteresis`] (on at `>= on`,
+/// off strictly below `off`, hold between — a value exactly at `off` holds; and
+/// non-finite scores and thresholds behave exactly as documented there) and
+/// groups the latched-on windows by [`runs`] under `opts`. This is computed in a
+/// single pass that never materializes the gated sequence; the output is
+/// identical to smoothing with [`Hysteresis`] and then segmenting.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HysteresisSegment {
   on: f32,
@@ -373,8 +401,18 @@ impl HysteresisSegment {
 
 impl SegmentPolicy<f32> for HysteresisSegment {
   fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
-    let gated = Hysteresis::new(self.on, self.off).smooth(seq);
-    // The gate emits exactly 0.0 / 1.0, so `>= 0.5` selects the latched-on runs.
-    runs(&gated, |&v| v >= 0.5, &self.opts)
+    // One-bit latch state threaded through a single scan — the same transition
+    // as `Hysteresis::smooth`, shared through `Hysteresis::step`, so the gate
+    // decision cannot drift from the smoothing path. The gated `0.0` / `1.0`
+    // sequence the two-pass path used to build is never materialized: each
+    // latched flag feeds `runs_from_flags` directly.
+    let gate = Hysteresis::new(self.on, self.off);
+    runs_from_flags(
+      seq.iter().scan(false, |active, w| {
+        *active = gate.step(*active, w.value);
+        Some((*active, w.span))
+      }),
+      &self.opts,
+    )
   }
 }

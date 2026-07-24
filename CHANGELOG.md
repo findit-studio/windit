@@ -4,6 +4,37 @@ All notable changes to `windit` are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- `segment::HysteresisSegment` now segments in a single fused pass over the
+  source sequence, sharing `smooth::Hysteresis`'s latch transition
+  (`Hysteresis::step`) rather than smoothing into a full intermediate
+  `Vec<Windowed<f32>>` and segmenting that. The output is identical to the
+  previous two-pass composition for every input — finite, `NaN`, and `+/-inf`
+  scores alike — enforced by a differential test against the retained two-pass
+  reference (fixed geometries plus ~200 randomized finite cases). The
+  full-length intermediate gated vector is no longer allocated, which an
+  allocation-regression test pins. No public API or finite-input behaviour
+  change.
+
+### Documented
+
+- The non-finite score and threshold semantics of `smooth::Ema`,
+  `smooth::Hysteresis`, `segment::Threshold`, and `segment::HysteresisSegment`
+  are now documented contract with exact-value tests: EMA does not sanitize
+  inputs and a non-finite value poisons the rest of the call (including the
+  `0.0 * inf` and `inf - inf` degradations); Hysteresis holds on `NaN`,
+  latches and releases on infinities, and fails closed on a `NaN` `on`;
+  Threshold membership is raw IEEE `>=`. The contradictory "never leaks a NaN
+  downstream" comment on the EMA path is corrected.
+- Both `SmoothPolicy` and `SegmentPolicy` are documented as restarting policy
+  state on every call — batch conveniences, not incremental decoders.
+- `segment::runs`' ascending-span precondition is sharpened: non-monotonic
+  input still returns deterministically without panicking and yields
+  well-formed ranges, but which ranges it returns is unspecified.
+
 ## 0.1.1
 
 ### Fixed
