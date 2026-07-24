@@ -1,5 +1,5 @@
 //! The incremental [`Segmenter`](windit::segment::Segmenter) allocates nothing:
-//! `push` advances four machine words of state, and `finish` returns a
+//! `push` advances four fields of state (a fixed 80 bytes), and `finish` returns a
 //! fixed-size [`SegmentTail`](windit::segment::SegmentTail) that holds its ranges
 //! inline. Driving a long input to completion — including the unbounded
 //! `merge_gap` case, where the pending accumulator only ever widens — touches

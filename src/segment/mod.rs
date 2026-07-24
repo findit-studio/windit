@@ -174,8 +174,8 @@ impl Default for SegmentOptions {
 ///
 /// # State and bound
 ///
-/// The state is four machine words — `opts`, the currently-extending run
-/// (`open`), the closed-and-merged candidate awaiting its gap verdict
+/// The state is four fields (a fixed 80 bytes) — `opts`, the currently-extending
+/// run (`open`), the closed-and-merged candidate awaiting its gap verdict
 /// (`pending`), and the last start seen (`last_start`) — and is **O(1) for
 /// every configuration**, including an unbounded `merge_gap`. A large
 /// `merge_gap` never grows the state: `pending` only ever widens, and its
@@ -206,7 +206,7 @@ pub struct Segmenter {
   /// run merges into it. `None` until the first run closes, and again after it
   /// is finalized.
   pending: Option<Range>,
-  /// The `start` of the most recent accepted span, for the monotonicity check.
+  /// The `start` of the most recent pushed span, for the monotonicity check.
   last_start: Option<usize>,
 }
 

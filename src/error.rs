@@ -126,7 +126,7 @@ pub enum WinditError {
   /// silently producing unspecified geometry. A genuine backward seek is
   /// expressed with a declared discontinuity, not with a backward span.
   NonMonotonicSpan {
-    /// The most recent accepted span's `start`, in input elements.
+    /// The most recent pushed span's `start`, in input elements.
     prev_start: usize,
     /// The rejected, out-of-order `start`, in input elements.
     start: usize,
