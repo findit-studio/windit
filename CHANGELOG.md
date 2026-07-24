@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.1.2 - 2026-07-25
+
 ### Changed
 
 - `segment::HysteresisSegment` now segments in a single fused pass over the
