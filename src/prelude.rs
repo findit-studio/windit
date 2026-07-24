@@ -4,10 +4,11 @@
 //! use windit::prelude::*;
 //! ```
 //!
-//! The value, geometry, and scalar types are always available. The
-//! `Vec`-returning algorithms — the planner, the pre-processing helpers, and the
-//! four strategy families — are re-exported under the `alloc` feature, matching
-//! where they are defined. The content-aware chunker `ContentAware`, its `Chunk`
+//! The value, geometry, and scalar types are always available, as is the
+//! featureless segmentation core (`Segmenter`, `SegmentTail`, `Range`,
+//! `SegmentOptions`). The `Vec`-returning algorithms — the planner, the
+//! pre-processing helpers, and the four strategy families — are re-exported
+//! under the `alloc` feature, matching where they are defined. The content-aware chunker `ContentAware`, its `Chunk`
 //! payload, and the `MeasureText` measurer it reads length through join them
 //! under the `text` feature, and `AggregatePolicyKind` under `serde`.
 
@@ -15,6 +16,8 @@ pub use crate::{
   error::WinditError,
   plan::{Span, TailPolicy, WindowOptions},
   scalar::{Real, Scalar},
+  // The incremental segmentation core is featureless, so it is always available.
+  segment::{Range, SegmentOptions, SegmentTail, Segmenter},
   windowed::{ComputeOf, Vector, WindowEmbedding, Windowed},
 };
 
@@ -26,10 +29,7 @@ pub use crate::{
   },
   plan::WindowPlan,
   pre::{slice_pad_mask, try_slice_pad_mask},
-  segment::{
-    longest_run, runs, runs_sorted, HysteresisSegment, Range, SegmentOptions, SegmentPolicy,
-    Threshold,
-  },
+  segment::{longest_run, runs, runs_sorted, SegmentPolicy, Threshold},
   smooth::{Ema, Hysteresis, SmoothPolicy},
   split::{FixedWindow, SplitPolicy},
 };

@@ -252,13 +252,13 @@ fn vad_frame_segment_longest_run() {
     .collect();
 
   let opts = SegmentOptions::new();
-  let speech = runs(&frames, |&p| p >= 0.5, &opts);
+  let speech = runs(&frames, |&p| p >= 0.5, &opts).unwrap();
   assert_eq!(
     speech,
     vec![Range::new(10, 20), Range::new(30, 60), Range::new(70, 75),]
   );
   assert_eq!(
-    longest_run(&frames, |&p| p >= 0.5, &opts),
+    longest_run(&frames, |&p| p >= 0.5, &opts).unwrap(),
     Some(Range::new(30, 60))
   );
 }

@@ -1,33 +1,61 @@
 //! Segmentation: reduce a windowed score sequence to continuous element ranges.
 //!
-//! The core is `runs`: it walks a `&[Windowed<V>]`, groups the windows a
-//! caller-supplied predicate accepts into runs that are continuous in both the
-//! sequence and the input geometry, maps each run to a half-open `Range` in
-//! input-element units through its spans, then applies
-//! two `SegmentOptions` passes — merge runs separated by at most `merge_gap`
-//! elements, then drop runs shorter than `min_len`. `longest_run` and
-//! `runs_sorted` rank those ranges; the find-longest-continuous-range case
-//! (the longest speech region, say) is `longest_run`.
+//! The heart of the module is the incremental [`Segmenter`]: a bounded, O(1)
+//! state machine that consumes `(active, span)` gate decisions one at a time and
+//! emits finalized element [`Range`]s no future input can change. It groups the
+//! accepted windows into runs that are continuous in both the sequence and the
+//! input geometry, maps each run to a half-open `Range` in input-element units
+//! through its spans, and applies the two [`SegmentOptions`] morphology passes —
+//! merge runs separated by at most `merge_gap` elements, then drop runs shorter
+//! than `min_len`.
 //!
-//! `SegmentPolicy` packages a predicate with its options. `Threshold` admits
-//! values at or above a cutoff; `HysteresisSegment` latches the sequence through
-//! `smooth::Hysteresis`'s gate and segments the latched-on windows in a single
-//! pass, which is the binary-VAD path.
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`runs`], [`longest_run`], and [`runs_sorted`] are batch conveniences that"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`runs`, `longest_run`, and `runs_sorted` are batch conveniences that"
+)]
+//! *drive* a fresh `Segmenter` over a slice and collect what it emits, so batch
+//! output equals the streaming core plus [`finish`](Segmenter::finish) by
+//! construction rather than by two implementations kept in sync. `longest_run`
+//! ranks those ranges; the find-longest-continuous-range case (the longest
+//! speech region, say) is `longest_run`.
 //!
-//! Each policy restarts its state on every call — these are batch conveniences,
-//! not incremental decoders.
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "`SegmentPolicy` packages a predicate with its options; [`Threshold`] admits"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`SegmentPolicy` packages a predicate with its options; `Threshold` admits"
+)]
+//! values at or above a cutoff. These policies restart their state on every
+//! call — they are batch conveniences, not incremental decoders. For a latching
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "two-threshold gate, feed a [`Hysteresis`](crate::smooth::Hysteresis) decision"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "two-threshold gate, feed a `Hysteresis` decision"
+)]
+//! stream into a `Segmenter` directly.
+//!
+//! The `Segmenter`, `SegmentTail`, `Range`, and `SegmentOptions` types live in
+//! the featureless core tier (they allocate nothing); the `Vec`-returning batch
+//! drivers and policies are gated on the `alloc` feature.
 
-use std::vec::Vec;
+use crate::{error::WinditError, plan::Span};
 
-use crate::{error::WinditError, smooth::Hysteresis, windowed::Windowed};
-
-#[cfg(test)]
+#[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
 /// A half-open range of input elements, `[start, end)`.
 ///
 /// Units are input elements (samples, tokens, patches, frames) — the same units
-/// as [`Span`](crate::plan::Span) — so a range is independent of the window
+/// as [`Span`] — so a range is independent of the window
 /// geometry that produced it. A well-formed range has `start <= end`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Range {
@@ -84,9 +112,8 @@ impl Range {
   /// The number of elements the range covers (`end - start`).
   ///
   /// Never underflows: both constructors reject `start > end` in every build,
-  /// and the only writes that bypass them — the in-crate geometry core
-  /// (`runs_from_flags`) and `merge_adjacent` extending a run — move `end`
-  /// upward alone.
+  /// and the only writes that bypass them — the in-crate [`Segmenter`] core
+  /// extending a run or folding a merge — move `end` upward alone.
   #[must_use]
   pub const fn len(&self) -> usize {
     // The saturation is therefore unreachable. It is kept as the last line of
@@ -158,15 +185,340 @@ impl Default for SegmentOptions {
   }
 }
 
+/// Incremental run builder and morphology: consume `(active, span)` gate
+/// decisions and emit finalized element [`Range`]s with exact batch parity.
+///
+/// One concrete semantics, parameterized by [`SegmentOptions`] — there is no
+#[cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "trait, because there is exactly one geometry. The batch drivers ([`runs`],"
+)]
+#[cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "trait, because there is exactly one geometry. The batch drivers (`runs`,"
+)]
+#[cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`longest_run`], [`runs_sorted`]) *are* this state machine driven over a"
+)]
+#[cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`longest_run`, `runs_sorted`) *are* this state machine driven over a"
+)]
+/// slice, so streaming and batch cannot drift apart.
+///
+/// # State and bound
+///
+/// The state is four fields (a fixed 80 bytes) — `opts`, the currently-extending
+/// run (`open`), the closed-and-merged candidate awaiting its gap verdict
+/// (`pending`), and the last start seen (`last_start`) — and is **O(1) for
+/// every configuration**, including an unbounded `merge_gap`. A large
+/// `merge_gap` never grows the state: `pending` only ever widens, and its
+/// emission simply defers to [`finish`](Segmenter::finish). Every
+/// [`push`](Segmenter::push) allocates nothing.
+///
+/// # Emission and commit latency
+///
+/// A pushed decision emits at most one finalized range; [`finish`](Segmenter::finish)
+/// emits at most two. A range `pending` is emitted on the first pushed span
+/// whose `start` clears `pending.end + merge_gap` — the earliest witness that
+/// no future run can merge into it, since starts only grow — or at `finish`.
+///
+/// # Contract
+///
+/// Spans must arrive in ascending `start` order (equal starts admitted); a
+/// strictly backward start returns [`WinditError::NonMonotonicSpan`]. A genuine
+/// timeline break is declared with [`discontinuity`](Segmenter::discontinuity),
+/// which finalizes pending output and never bridges `merge_gap` across the
+/// break, then re-arms fresh state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Segmenter {
+  opts: SegmentOptions,
+  /// The run currently being extended by geometrically continuous accepted
+  /// spans; `None` between runs.
+  open: Option<Range>,
+  /// The closed, gap-merged accumulator awaiting the verdict of whether a later
+  /// run merges into it. `None` until the first run closes, and again after it
+  /// is finalized.
+  pending: Option<Range>,
+  /// The `start` of the most recent pushed span, for the monotonicity check.
+  last_start: Option<usize>,
+}
+
+impl Segmenter {
+  /// A fresh segmenter that shapes its runs with `opts`.
+  #[must_use]
+  pub const fn new(opts: SegmentOptions) -> Self {
+    Self {
+      opts,
+      open: None,
+      pending: None,
+      last_start: None,
+    }
+  }
+
+  /// The morphology options this segmenter applies.
+  #[must_use]
+  pub const fn opts(&self) -> SegmentOptions {
+    self.opts
+  }
+
+  /// Feed one gate decision with the [`Span`] it covers.
+  ///
+  /// `Ok(Some(range))` is a finalized range that no future input can change;
+  /// `Ok(None)` means this decision extended a run, closed one into the merge
+  /// fold without finalizing anything, or was rejected with nothing pending.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::NonMonotonicSpan`] if `span.start()` is strictly
+  /// less than the previous pushed span's start, with no intervening
+  /// [`discontinuity`](Segmenter::discontinuity) or [`reset`](Segmenter::reset).
+  /// The offending push leaves the segmenter unchanged.
+  pub fn push(&mut self, active: bool, span: Span) -> Result<Option<Range>, WinditError> {
+    let start = span.start();
+    // Rule 1 — monotonicity. Checked before any state mutation, so an
+    // out-of-order push is a no-op that reports the violation.
+    if let Some(prev) = self.last_start {
+      if start < prev {
+        return Err(WinditError::NonMonotonicSpan {
+          prev_start: prev,
+          start,
+        });
+      }
+    }
+    self.last_start = Some(start);
+
+    // Rule 3 — an accepted span geometrically continuous with the open run
+    // (its start at or before the run's current end) extends it and emits
+    // nothing: the run is still growing, so nothing can be finalized yet.
+    if active {
+      if let Some(run) = self.open.as_mut() {
+        if start <= run.end {
+          run.end = run.end.max(span.end());
+          return Ok(None);
+        }
+      }
+    }
+
+    // Otherwise the open run (if any) closes into the merge fold (rules 3–5).
+    let closed_emit = match self.open.take() {
+      Some(closed) => self.feed_raw_run(closed),
+      None => None,
+    };
+    // Rule 2 — early finalization. With nothing now open, a span beyond the gap
+    // horizon finalizes `pending`. Only when the fold above emitted nothing, so
+    // a push finalizes at most one range; a deferred finalization surfaces on a
+    // later push or at `finish`.
+    let emitted = match closed_emit {
+      Some(_) => closed_emit,
+      None => self.early_finalize(start),
+    };
+    // Rule 3 — a non-continuous accepted span opens a fresh run.
+    if active {
+      self.open = Some(Range {
+        start,
+        end: span.end(),
+      });
+    }
+    Ok(emitted)
+  }
+
+  /// End of stream: close the open run, resolve the merge fold, and emit
+  /// everything pending — at most two ranges — as a fixed-size iterator.
+  ///
+  /// Consuming `self` makes use-after-finish unrepresentable; the continue-past
+  /// case is [`discontinuity`](Segmenter::discontinuity).
+  #[must_use]
+  pub fn finish(mut self) -> SegmentTail {
+    let first = match self.open.take() {
+      Some(run) => self.feed_raw_run(run),
+      None => None,
+    };
+    let second = match self.pending.take() {
+      Some(p) => self.keep(p),
+      None => None,
+    };
+    SegmentTail::new(first, second)
+  }
+
+  /// Declared timeline break: emit as [`finish`](Segmenter::finish) would, never
+  /// bridging `merge_gap` across the break, then re-arm fresh state for the next
+  /// epoch.
+  ///
+  /// Span positions may restart after the break; the monotonicity check is
+  /// re-armed too. The caller owns the epoch bookkeeping — it is the one
+  /// declaring the break — so windit stays unit-agnostic.
+  #[must_use]
+  pub fn discontinuity(&mut self) -> SegmentTail {
+    let first = match self.open.take() {
+      Some(run) => self.feed_raw_run(run),
+      None => None,
+    };
+    let second = match self.pending.take() {
+      Some(p) => self.keep(p),
+      None => None,
+    };
+    // `open` and `pending` were just drained; re-arm the timeline so the next
+    // epoch may restart span positions.
+    self.last_start = None;
+    SegmentTail::new(first, second)
+  }
+
+  /// Destructive discard: return to the freshly-constructed state, **dropping**
+  /// any unemitted pending output.
+  ///
+  /// [`discontinuity`](Segmenter::discontinuity) is the non-lossy alternative
+  /// when the timeline continues.
+  pub fn reset(&mut self) {
+    self.open = None;
+    self.pending = None;
+    self.last_start = None;
+  }
+
+  /// Merge a just-closed run into the `pending` accumulator (the streaming form
+  /// of the batch merge-adjacent left fold), returning the accumulator it
+  /// finalizes, if any.
+  ///
+  /// Runs close in ascending start order, so this is a left fold: a run within
+  /// `merge_gap` of the accumulator folds into it (`end` grows), otherwise the
+  /// accumulator is complete and the run starts a fresh one. `min_len` is
+  /// applied only here, at finalization — never at close — so a short run a
+  /// later run merges with survives, exactly as the batch merge-then-filter
+  /// order.
+  fn feed_raw_run(&mut self, run: Range) -> Option<Range> {
+    let merge_gap = self.opts.merge_gap();
+    // Comparing the gap with `saturating_sub` avoids the `pending.end +
+    // merge_gap` overflow an unbounded `merge_gap` would cause, and folds an
+    // overlapping run (start before the accumulator's end) to a zero gap
+    // exactly as the batch `merge_adjacent` did.
+    let completed: Option<Range> = match self.pending {
+      None => {
+        self.pending = Some(run);
+        None
+      }
+      Some(ref mut p) if run.start.saturating_sub(p.end) <= merge_gap => {
+        p.end = p.end.max(run.end);
+        None
+      }
+      Some(ref mut p) => {
+        let done = *p;
+        *p = run;
+        Some(done)
+      }
+    };
+    completed.and_then(|r| self.keep(r))
+  }
+
+  /// Finalize `pending` when a span at `start` proves no future run can merge
+  /// into it (`start` clears `pending.end + merge_gap`, and starts only grow).
+  ///
+  /// Sound only when nothing is `open`: an open run within `merge_gap` of
+  /// `pending` will still fold into it, so this is invoked only where `open` is
+  /// `None`.
+  fn early_finalize(&mut self, start: usize) -> Option<Range> {
+    let p = self.pending?;
+    if start.saturating_sub(p.end) > self.opts.merge_gap() {
+      self.pending = None;
+      self.keep(p)
+    } else {
+      None
+    }
+  }
+
+  /// Apply the `min_len` filter at finalization: emit `r` if it is long enough,
+  /// otherwise drop it silently.
+  fn keep(&self, r: Range) -> Option<Range> {
+    if r.len() >= self.opts.min_len() {
+      Some(r)
+    } else {
+      None
+    }
+  }
+}
+
+/// Bounded terminal emission from [`Segmenter::finish`] and
+/// [`Segmenter::discontinuity`]: an iterator over at most two finalized ranges.
+///
+/// A concrete, fixed-size iterator that allocates nothing — it holds the ranges
+/// inline. Implements [`Iterator<Item = Range>`](Iterator) and
+/// [`ExactSizeIterator`], yielding the finalized ranges in ascending start
+/// order.
+#[derive(Clone, Debug)]
+pub struct SegmentTail {
+  /// The finalized ranges, compacted so the present ones lead and any absent
+  /// slot trails.
+  ranges: [Option<Range>; 2],
+  /// The next slot to yield.
+  idx: usize,
+}
+
+impl SegmentTail {
+  /// Build a tail from the two candidate emissions, dropping the absent ones so
+  /// iteration yields only present ranges (in order).
+  fn new(first: Option<Range>, second: Option<Range>) -> Self {
+    let mut ranges = [None, None];
+    for (slot, r) in [first, second].into_iter().flatten().enumerate() {
+      ranges[slot] = Some(r);
+    }
+    Self { ranges, idx: 0 }
+  }
+}
+
+impl Iterator for SegmentTail {
+  type Item = Range;
+
+  fn next(&mut self) -> Option<Range> {
+    let taken = self.ranges.get_mut(self.idx)?.take();
+    if taken.is_some() {
+      self.idx += 1;
+    }
+    taken
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let remaining = self.ranges[self.idx..]
+      .iter()
+      .filter(|r| r.is_some())
+      .count();
+    (remaining, Some(remaining))
+  }
+}
+
+impl ExactSizeIterator for SegmentTail {}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+use crate::windowed::Windowed;
+#[cfg(any(feature = "std", feature = "alloc"))]
+use std::vec::Vec;
+
+/// Push a finalized range onto the output, surfacing an allocation failure as
+/// [`WinditError::AllocFailed`] rather than aborting.
+///
+/// `try_reserve(1)` is a no-op when spare capacity exists and grows (amortized)
+/// otherwise, so the checked entry points stay checked without changing the
+/// allocation pattern.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn push_checked(out: &mut Vec<Range>, r: Range) -> Result<(), WinditError> {
+  out.try_reserve(1).map_err(|_| WinditError::AllocFailed {
+    elements: out.len().saturating_add(1),
+  })?;
+  out.push(r);
+  Ok(())
+}
+
 /// Group the windows `predicate` accepts into merged, length-filtered element
 /// ranges, in input order.
 ///
+/// This drives a fresh [`Segmenter`] over `seq` and collects everything it
+/// emits, so the result is exactly the streaming core plus
+/// [`finish`](Segmenter::finish).
+///
 /// The sequence must be in span order (ascending `span.start`), as planners
 /// produce; a run's start is taken from its first window, not the minimum over
-/// the run. Non-ascending input violates this precondition: the call still
-/// returns deterministically without panicking and every returned range is
-/// well-formed, but which ranges it returns is unspecified — sort by
-/// `span.start` first.
+/// the run. A strictly backward start is a precondition violation reported as
+/// [`WinditError::NonMonotonicSpan`], not silent nonsense — sort by `span.start`
+/// first if the order was ever unknown.
 ///
 /// A run is a maximal block of accepted windows that is also *geometrically
 /// continuous*: a window is added to the open run only when its `span.start` is
@@ -177,116 +529,101 @@ impl Default for SegmentOptions {
 /// [`SegmentOptions::merge_gap`]'s decision alone.
 ///
 /// Each run becomes the [`Range`] from its first window's `span.start` to the
-/// largest [`Span::end`](crate::plan::Span::end) among its windows (so
+/// largest [`Span::end`] among its windows (so
 /// overlapping-window runs cover the union of their spans). The runs are then
 /// merged when separated by at most [`SegmentOptions::merge_gap`] elements, and
 /// any run shorter than [`SegmentOptions::min_len`] is dropped.
-pub fn runs<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Vec<Range>
+///
+/// # Errors
+///
+/// - [`WinditError::NonMonotonicSpan`] if a span's `start` is strictly before
+///   its predecessor's.
+/// - [`WinditError::AllocFailed`] if the output ranges cannot be allocated.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub fn runs<V, F>(
+  seq: &[Windowed<V>],
+  predicate: F,
+  opts: &SegmentOptions,
+) -> Result<Vec<Range>, WinditError>
 where
   F: Fn(&V) -> bool,
 {
-  // One predicate call per window, in order, exactly as before.
-  runs_from_flags(seq.iter().map(|w| (predicate(&w.value), w.span)), opts)
-}
-
-/// Group flagged windows into merged, length-filtered element ranges: the
-/// geometry core behind [`runs`] and the fused [`HysteresisSegment::segment`].
-///
-/// [`runs`] documents the full contract; the flags arrive pre-computed so a
-/// stateful producer (the hysteresis latch) can feed it without materializing a
-/// gated sequence.
-fn runs_from_flags<I>(flags: I, opts: &SegmentOptions) -> Vec<Range>
-where
-  I: Iterator<Item = (bool, crate::plan::Span)>,
-{
-  let mut raw: Vec<Range> = Vec::new();
-  let mut current: Option<Range> = None;
-  for (accepted, span) in flags {
-    if accepted {
-      let (start, end) = (span.start(), span.end());
-      match current {
-        // A span beginning past the open run's end leaves elements that no span
-        // covers. Closing the run here keeps `merge_gap` the only thing that can
-        // bridge them; extending instead would select them unconditionally.
-        Some(run) if start > run.end => {
-          raw.push(run);
-          current = Some(Range::new(start, end));
-        }
-        Some(ref mut run) => run.end = run.end.max(end),
-        // `Span::end` is `start + len` with a non-zero `len`, so `start < end`
-        // and the range is well formed.
-        None => current = Some(Range::new(start, end)),
-      }
-    } else if let Some(run) = current.take() {
-      raw.push(run);
+  let mut seg = Segmenter::new(*opts);
+  let mut out: Vec<Range> = Vec::new();
+  for w in seq {
+    if let Some(r) = seg.push(predicate(w.value()), w.span())? {
+      push_checked(&mut out, r)?;
     }
   }
-  if let Some(run) = current.take() {
-    raw.push(run);
+  for r in seg.finish() {
+    push_checked(&mut out, r)?;
   }
-
-  let mut merged = merge_adjacent(raw, opts.merge_gap());
-  merged.retain(|r| r.len() >= opts.min_len());
-  merged
+  Ok(out)
 }
 
 /// The longest range from [`runs`], breaking ties toward the earliest.
 ///
-/// Returns `None` when [`runs`] is empty.
-pub fn longest_run<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Option<Range>
+/// Returns `Ok(None)` when [`runs`] is empty.
+///
+/// # Errors
+///
+/// Propagates [`runs`]: [`WinditError::NonMonotonicSpan`] or
+/// [`WinditError::AllocFailed`].
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub fn longest_run<V, F>(
+  seq: &[Windowed<V>],
+  predicate: F,
+  opts: &SegmentOptions,
+) -> Result<Option<Range>, WinditError>
 where
   F: Fn(&V) -> bool,
 {
   let mut best: Option<Range> = None;
-  for r in runs(seq, predicate, opts) {
+  for r in runs(seq, predicate, opts)? {
     match best {
       // Keep the incumbent on a tie, so the earliest of equal-length runs wins.
       Some(b) if b.len() >= r.len() => {}
       _ => best = Some(r),
     }
   }
-  best
+  Ok(best)
 }
 
 /// The ranges from [`runs`], sorted by length descending.
 ///
 /// The sort is stable, so equal-length ranges keep their input order.
-pub fn runs_sorted<V, F>(seq: &[Windowed<V>], predicate: F, opts: &SegmentOptions) -> Vec<Range>
+///
+/// # Errors
+///
+/// Propagates [`runs`]: [`WinditError::NonMonotonicSpan`] or
+/// [`WinditError::AllocFailed`].
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub fn runs_sorted<V, F>(
+  seq: &[Windowed<V>],
+  predicate: F,
+  opts: &SegmentOptions,
+) -> Result<Vec<Range>, WinditError>
 where
   F: Fn(&V) -> bool,
 {
-  let mut all = runs(seq, predicate, opts);
+  let mut all = runs(seq, predicate, opts)?;
   all.sort_by_key(|r| core::cmp::Reverse(r.len()));
-  all
-}
-
-/// Merge runs whose gap to the previous run is at most `merge_gap`.
-///
-/// `ranges` must be sorted by `start` (as [`runs`] produces them).
-fn merge_adjacent(ranges: Vec<Range>, merge_gap: usize) -> Vec<Range> {
-  let mut out: Vec<Range> = Vec::with_capacity(ranges.len());
-  for r in ranges {
-    match out.last_mut() {
-      // `saturating_sub` folds an overlapping range (a start before the previous
-      // end, reachable with overlapping windows) into a zero gap, so it merges.
-      Some(last) if r.start.saturating_sub(last.end) <= merge_gap => {
-        last.end = last.end.max(r.end);
-      }
-      _ => out.push(r),
-    }
-  }
-  out
+  Ok(all)
 }
 
 /// A policy that segments a windowed value sequence into element [`Range`]s.
 ///
-/// Generic over the value type `V`; the shipped built-ins implement it for
+/// Generic over the value type `V`; the shipped built-in implements it for
 /// `V = f32` (speech probabilities, energies, logits).
 ///
-/// Each call starts from fresh policy state: segmenting a sequence chunk by
-/// chunk is not equivalent to one whole-sequence call, because a hysteresis
-/// latch does not carry across calls. These policies are batch conveniences, not
-/// incremental decoders.
+/// Each call starts from fresh policy state — these are batch conveniences over
+/// [`runs`], not incremental decoders. The incremental decoder is
+/// [`Segmenter`].
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub trait SegmentPolicy<V> {
   /// Segment `seq` into the element ranges it selects, in input order.
   fn segment(&self, seq: &[Windowed<V>]) -> Vec<Range>;
@@ -300,12 +637,15 @@ pub trait SegmentPolicy<V> {
 /// The comparison is IEEE: a `NaN` score is never in-segment (even with
 /// `thr = -inf`); a `NaN` `thr` selects nothing; `thr = -inf` selects every
 /// non-`NaN` score; `thr = +inf` selects only `+inf`.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
   thr: f32,
   opts: SegmentOptions,
 }
 
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl Threshold {
   /// Admit values at or above `thr`, shaping the runs with the default
   /// [`SegmentOptions`].
@@ -337,82 +677,20 @@ impl Threshold {
   }
 }
 
+#[cfg(any(feature = "std", feature = "alloc"))]
 impl SegmentPolicy<f32> for Threshold {
+  /// Segment `seq` at the threshold.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the spans are not in ascending `start` order, or if the output
+  /// ranges cannot be allocated — the precondition and resource failures the
+  /// infallible [`runs`] counterpart reports through
+  /// [`WinditError`]. This convenience is for the callers whose planner-produced
+  /// spans satisfy the precondition; drive [`runs`] directly to handle untrusted
+  /// order.
   fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
     runs(seq, |&v| v >= self.thr, &self.opts)
-  }
-}
-
-/// Segment through a latching two-threshold gate: the binary-VAD path.
-///
-/// Latches the sequence through the same gate as [`Hysteresis`] (on at `>= on`,
-/// off strictly below `off`, hold between — a value exactly at `off` holds; and
-/// non-finite scores and thresholds behave exactly as documented there) and
-/// groups the latched-on windows by [`runs`] under `opts`. This is computed in a
-/// single pass that never materializes the gated sequence; the output is
-/// identical to smoothing with [`Hysteresis`] and then segmenting.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct HysteresisSegment {
-  on: f32,
-  off: f32,
-  opts: SegmentOptions,
-}
-
-impl HysteresisSegment {
-  /// Latch on at `>= on` and off strictly below `off`, shaping the resulting
-  /// runs with the default [`SegmentOptions`].
-  ///
-  /// Configure `on >= off`; [`Hysteresis`] documents the hold region and how
-  /// the gate degrades otherwise.
-  #[must_use]
-  pub const fn new(on: f32, off: f32) -> Self {
-    Self {
-      on,
-      off,
-      opts: SegmentOptions::new(),
-    }
-  }
-
-  /// Shape the runs with `opts` rather than the default.
-  #[must_use]
-  pub const fn with_opts(mut self, opts: SegmentOptions) -> Self {
-    self.opts = opts;
-    self
-  }
-
-  /// The turn-on threshold, forwarded to [`Hysteresis`].
-  #[must_use]
-  pub const fn on(&self) -> f32 {
-    self.on
-  }
-
-  /// The turn-off threshold, forwarded to [`Hysteresis`].
-  #[must_use]
-  pub const fn off(&self) -> f32 {
-    self.off
-  }
-
-  /// The gap-merging and minimum-length options applied to the runs.
-  #[must_use]
-  pub const fn opts(&self) -> SegmentOptions {
-    self.opts
-  }
-}
-
-impl SegmentPolicy<f32> for HysteresisSegment {
-  fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
-    // One-bit latch state threaded through a single scan — the same transition
-    // as `Hysteresis::smooth`, shared through `Hysteresis::step`, so the gate
-    // decision cannot drift from the smoothing path. The gated `0.0` / `1.0`
-    // sequence the two-pass path used to build is never materialized: each
-    // latched flag feeds `runs_from_flags` directly.
-    let gate = Hysteresis::new(self.on, self.off);
-    runs_from_flags(
-      seq.iter().scan(false, |active, w| {
-        *active = gate.step(*active, w.value);
-        Some((*active, w.span))
-      }),
-      &self.opts,
-    )
+      .expect("Threshold::segment requires spans in ascending start order and allocatable output")
   }
 }
