@@ -131,6 +131,24 @@ impl Hysteresis {
   pub const fn off(&self) -> f32 {
     self.off
   }
+
+  /// Advance the latch by one value and return the resulting state: on at
+  /// `>= on`, off strictly below `off`, hold otherwise (so a value exactly at
+  /// `off`, and any NaN, holds the previous state). The turn-on test is
+  /// evaluated first and wins.
+  ///
+  /// The single definition of the gate transition: [`Hysteresis::smooth`] and
+  /// the fused `segment::HysteresisSegment` both step through it, so the two
+  /// paths cannot drift apart.
+  pub(crate) const fn step(&self, active: bool, value: f32) -> bool {
+    if value >= self.on {
+      true
+    } else if value < self.off {
+      false
+    } else {
+      active
+    }
+  }
 }
 
 impl SmoothPolicy<f32> for Ema {
@@ -167,13 +185,7 @@ impl SmoothPolicy<f32> for Hysteresis {
     let mut out = Vec::with_capacity(seq.len());
     let mut on = false;
     for w in seq {
-      if w.value >= self.on {
-        on = true;
-      } else if w.value < self.off {
-        // Strict: a value exactly at `off` holds the previous state instead of
-        // turning off (see the struct doc for the hold region and why).
-        on = false;
-      }
+      on = self.step(on, w.value);
       out.push(Windowed::new(if on { 1.0 } else { 0.0 }, w.span));
     }
     out
