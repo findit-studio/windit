@@ -13,6 +13,9 @@
 //! values at or above a cutoff; `HysteresisSegment` first latches the sequence
 //! through `smooth::Hysteresis` and then segments, which is the binary-VAD
 //! path.
+//!
+//! Each policy restarts its state on every call — these are batch conveniences,
+//! not incremental decoders.
 
 use std::vec::Vec;
 
@@ -163,7 +166,10 @@ impl Default for SegmentOptions {
 ///
 /// The sequence must be in span order (ascending `span.start`), as planners
 /// produce; a run's start is taken from its first window, not the minimum over
-/// the run.
+/// the run. Non-ascending input violates this precondition: the call still
+/// returns deterministically without panicking and every returned range is
+/// well-formed, but which ranges it returns is unspecified — sort by
+/// `span.start` first.
 ///
 /// A run is a maximal block of accepted windows that is also *geometrically
 /// continuous*: a window is added to the open run only when its `span.start` is
@@ -265,6 +271,11 @@ fn merge_adjacent(ranges: Vec<Range>, merge_gap: usize) -> Vec<Range> {
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
 /// `V = f32` (speech probabilities, energies, logits).
+///
+/// Each call starts from fresh policy state: segmenting a sequence chunk by
+/// chunk is not equivalent to one whole-sequence call, because a hysteresis
+/// latch does not carry across calls. These policies are batch conveniences, not
+/// incremental decoders.
 pub trait SegmentPolicy<V> {
   /// Segment `seq` into the element ranges it selects, in input order.
   fn segment(&self, seq: &[Windowed<V>]) -> Vec<Range>;
@@ -274,6 +285,10 @@ pub trait SegmentPolicy<V> {
 ///
 /// A window is in-segment when `value >= thr`; the resulting runs are shaped by
 /// the policy's [`SegmentOptions`].
+///
+/// The comparison is IEEE: a `NaN` score is never in-segment (even with
+/// `thr = -inf`); a `NaN` `thr` selects nothing; `thr = -inf` selects every
+/// non-`NaN` score; `thr = +inf` selects only `+inf`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
   thr: f32,

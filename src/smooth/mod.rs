@@ -7,6 +7,9 @@
 //! - `Ema` is an exponential moving average (temporal low-pass).
 //! - `Hysteresis` is the latching two-threshold gate used for binary VAD
 //!   smoothing, generalized to any f32 score sequence.
+//!
+//! Each policy restarts its state on every call — these are batch conveniences,
+//! not incremental decoders.
 
 use std::vec::Vec;
 
@@ -21,6 +24,11 @@ mod tests;
 /// `V = f32`. An implementor that carries values through unchanged (rather
 /// than computing new ones, as [`Ema`] and [`Hysteresis`] do) declares its own
 /// `V: Clone` bound on its `impl`.
+///
+/// Each call starts from fresh policy state: smoothing a sequence chunk by chunk
+/// is not equivalent to one whole-sequence call, because a running average or
+/// latch does not carry across calls. These policies are batch conveniences, not
+/// incremental decoders.
 pub trait SmoothPolicy<V> {
   /// Return a smoothed sequence the same length as `seq`, each element keeping
   /// its input [`Span`](crate::plan::Span).
@@ -33,8 +41,15 @@ pub trait SmoothPolicy<V> {
 /// smaller one smooths harder. This policy is infallible, so [`Ema::new`] clamps
 /// `alpha` into `[0, 1]` deterministically: a non-finite (NaN) `alpha` clamps to
 /// `0.0` (hold the seed). With a clamped alpha and finite inputs, the recurrence
-/// introduces no NaN. `Ema` does not sanitize inputs, though: a non-finite
-/// (`NaN`/infinite) input value still propagates through the recurrence.
+/// introduces no NaN.
+///
+/// `Ema` does not sanitize inputs: a non-finite input (`NaN` or `+inf`/`-inf`)
+/// enters the recurrence and poisons the state for the remainder of the call —
+/// every output from that index on is non-finite. A `NaN` stays `NaN`; an
+/// infinity propagates as that infinity until a zero coefficient multiplies it
+/// (`0.0 * inf = NaN`, so an `alpha` of 0 or 1 degrades an infinity to `NaN` one
+/// step later) or opposite infinities meet (`inf - inf = NaN`). In particular,
+/// `alpha = 0` holds the seed only against finite inputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ema {
   alpha: f32,
@@ -78,6 +93,13 @@ impl Ema {
 /// suppresses chatter. If misconfigured with `on < off`, the turn-on test is
 /// evaluated first and wins, so the gate degrades to a single threshold at `on`.
 /// This is the binary VAD smoothing generalized to any f32 score.
+///
+/// Comparisons are IEEE, and every comparison with `NaN` is false, so: a `NaN`
+/// score holds the previous state (including the initial off state); `+inf`
+/// activates whenever `on` is not `NaN`; `-inf` releases unless `on` is `-inf`
+/// (activation wins) or `off` is `NaN` (then it holds); a `NaN` `on` can never
+/// activate, so the output is all `0.0`; and a `NaN` `off` never releases once
+/// on.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hysteresis {
   on: f32,
@@ -115,10 +137,12 @@ impl SmoothPolicy<f32> for Ema {
   fn smooth(&self, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
     // `Ema::new` is the only way to set `alpha` and clamps it there, so this
     // re-clamp is currently unreachable. It is kept as the last line of defence
-    // for the output contract — an infallible policy that never leaks a NaN
-    // downstream — because that contract must survive any future construction
-    // path that bypasses `new`, a serde derive on this type being the obvious
-    // one. NaN is handled explicitly since `f32::clamp` would propagate it.
+    // for the recurrence's coefficient invariant — `alpha` in `[0, 1]` and never
+    // NaN — because that invariant must survive any future construction path that
+    // bypasses `new`, a serde derive on this type being the obvious one. It
+    // guards the coefficients only: a non-finite input value still propagates, as
+    // the type docs specify. NaN is handled explicitly since `f32::clamp` would
+    // propagate it.
     let alpha = if self.alpha.is_nan() {
       0.0
     } else {
