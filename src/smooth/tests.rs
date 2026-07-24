@@ -158,6 +158,13 @@ fn hysteresis_infinite_thresholds() {
   // `on = +inf`: only a `+inf` score activates; the finite below `off` releases.
   let out = Hysteresis::new(f32::INFINITY, 0.3).smooth(&seq(&[1.0, f32::INFINITY, 0.5, 0.2]));
   assert_eq!(values(&out), vec![0.0, 1.0, 1.0, 0.0]);
+
+  // `off = -inf`: `value < off` is never true (`-inf < -inf` is false, and no
+  // value is less than `-inf`), so once on the gate can never release — even a
+  // `-inf` score holds, same as a NaN `off` in `hysteresis_nan_thresholds_...`.
+  let out =
+    Hysteresis::new(0.6, f32::NEG_INFINITY).smooth(&seq(&[0.7, f32::NEG_INFINITY, 0.1, -1e30]));
+  assert_eq!(values(&out), vec![1.0, 1.0, 1.0, 1.0]);
 }
 
 #[test]

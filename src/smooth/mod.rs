@@ -47,8 +47,9 @@ pub trait SmoothPolicy<V> {
 /// enters the recurrence and poisons the state for the remainder of the call —
 /// every output from that index on is non-finite. A `NaN` stays `NaN`; an
 /// infinity propagates as that infinity until a zero coefficient multiplies it
-/// (`0.0 * inf = NaN`, so an `alpha` of 0 or 1 degrades an infinity to `NaN` one
-/// step later) or opposite infinities meet (`inf - inf = NaN`). In particular,
+/// (`0.0 * inf = NaN`, so `alpha = 1` degrades an infinite state to `NaN` one
+/// step later, while `alpha = 0` degrades an infinite input to `NaN` at its own
+/// index) or opposite infinities meet (`inf - inf = NaN`). In particular,
 /// `alpha = 0` holds the seed only against finite inputs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ema {
@@ -97,7 +98,8 @@ impl Ema {
 /// Comparisons are IEEE, and every comparison with `NaN` is false, so: a `NaN`
 /// score holds the previous state (including the initial off state); `+inf`
 /// activates whenever `on` is not `NaN`; `-inf` releases unless `on` is `-inf`
-/// (activation wins) or `off` is `NaN` (then it holds); a `NaN` `on` can never
+/// (activation wins) or `off` is `NaN` or `-inf` (then it holds — `off = -inf`
+/// can never release, since no value is `< -inf`); a `NaN` `on` can never
 /// activate, so the output is all `0.0`; and a `NaN` `off` never releases once
 /// on.
 #[derive(Clone, Copy, Debug, PartialEq)]
