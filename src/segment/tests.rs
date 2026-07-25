@@ -1,8 +1,8 @@
-use std::{vec, vec::Vec};
+use std::{boxed::Box, cell::Cell, rc::Rc, vec, vec::Vec};
 
 use super::{
-  longest_run, runs, runs_sorted, Gate, GatePolicy, Hysteresis, Range, SegmentOptions, SegmentTail,
-  Segmenter, Threshold,
+  longest_run, runs, runs_sorted, Dwell, DwellState, Gate, GatePolicy, Hangover, HangoverState,
+  Hysteresis, Range, SegmentOptions, SegmentTail, Segmenter, Threshold,
 };
 use crate::{
   error::WinditError,
@@ -1191,4 +1191,766 @@ fn chunk_partition_invariance_over_random_splits() {
     let batch = runs(&values, |&v| v >= 0.5, &opts).unwrap();
     assert_eq!(whole, batch, "batch parity: n={n} hop={hop} opts={opts:?}");
   }
+}
+
+// ── Dwell / Hangover combinators ─────────────────────────────────────────────
+
+/// A test-local [`Gate`] that replays a fixed flag script, one `bool` per push,
+/// ignoring the pushed value and span entirely — both a scan-oracle driver for
+/// the combinators and, via `Gate<()>`, the non-`f32` `V` witness that pins
+/// `Dwell`/`Hangover`'s value-freeness (driven over `Windowed<()>`).
+///
+/// Deliberately concrete over `V = ()` rather than a blanket `impl<V>`: a
+/// blanket impl would make `DwellState<ScriptGate>: Gate<V>` hold for every
+/// `V` simultaneously, and calling `reset`/`discontinuity` — whose signatures
+/// name no `V` — on such a value is genuinely ambiguous (multiple applicable
+/// trait impls, none selectable from the call). Pinning `V = ()` here keeps
+/// every call in this file unambiguous without a turbofish.
+#[derive(Clone, Debug, PartialEq)]
+struct ScriptGate {
+  script: Vec<bool>,
+  idx: usize,
+}
+
+impl ScriptGate {
+  fn new(script: &[bool]) -> Self {
+    Self {
+      script: script.to_vec(),
+      idx: 0,
+    }
+  }
+}
+
+impl Gate<()> for ScriptGate {
+  fn push(&mut self, _w: &Windowed<()>) -> Result<bool, WinditError> {
+    let v = self.script.get(self.idx).copied().unwrap_or(false);
+    self.idx += 1;
+    Ok(v)
+  }
+
+  fn reset(&mut self) {
+    self.idx = 0;
+  }
+}
+
+/// A test-local [`Gate<f32>`] recording whether [`reset`](Gate::reset) or
+/// [`discontinuity`](Gate::discontinuity) fired — the regression probe for
+/// conformance flag F3 (a wrapper or `Box` forwarding impl that fell back to
+/// the trait default would call `reset` here instead of `discontinuity`).
+///
+/// The counters live behind a shared `Rc<Cell<_>>` so a test can keep a handle
+/// after moving the probe into a wrapper or a `Box<dyn Gate<f32>>`, where the
+/// concrete `ProbeGate` is no longer nameable to inspect directly. Concrete
+/// over `f32`, for the same ambiguity reason as [`ScriptGate`].
+#[derive(Clone, Debug)]
+struct ProbeGate {
+  active: bool,
+  reset_calls: Rc<Cell<usize>>,
+  discontinuity_calls: Rc<Cell<usize>>,
+}
+
+impl ProbeGate {
+  /// A fresh probe plus the two counter handles the test retains.
+  fn new(active: bool) -> (Self, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+    let reset_calls = Rc::new(Cell::new(0));
+    let discontinuity_calls = Rc::new(Cell::new(0));
+    (
+      Self {
+        active,
+        reset_calls: reset_calls.clone(),
+        discontinuity_calls: discontinuity_calls.clone(),
+      },
+      reset_calls,
+      discontinuity_calls,
+    )
+  }
+}
+
+impl Gate<f32> for ProbeGate {
+  fn push(&mut self, _w: &Windowed<f32>) -> Result<bool, WinditError> {
+    Ok(self.active)
+  }
+
+  fn reset(&mut self) {
+    self.reset_calls.set(self.reset_calls.get() + 1);
+  }
+
+  fn discontinuity(&mut self) {
+    self
+      .discontinuity_calls
+      .set(self.discontinuity_calls.get() + 1);
+  }
+}
+
+/// Reference implementation of [`Dwell`]'s semantics (the type's own doc),
+/// computed directly over `(inner_flag, span)` pairs rather than through
+/// [`DwellState`] — the independent oracle the exhaustive sweep checks the
+/// real state machine against.
+fn dwell_oracle(flags: &[(bool, Span)], confirm: usize) -> Vec<bool> {
+  let mut origin: Option<usize> = None;
+  let mut out = Vec::with_capacity(flags.len());
+  for &(active, span) in flags {
+    if active {
+      let o = *origin.get_or_insert(span.start());
+      out.push(span.end().saturating_sub(o) >= confirm);
+    } else {
+      origin = None;
+      out.push(false);
+    }
+  }
+  out
+}
+
+/// Reference implementation of [`Hangover`]'s semantics, the `Hangover`
+/// counterpart of [`dwell_oracle`].
+fn hangover_oracle(flags: &[(bool, Span)], hold: usize) -> Vec<bool> {
+  let mut last_yes_end: Option<usize> = None;
+  let mut out = Vec::with_capacity(flags.len());
+  for &(active, span) in flags {
+    if active {
+      last_yes_end = Some(last_yes_end.map_or(span.end(), |end| end.max(span.end())));
+      out.push(true);
+    } else {
+      out.push(match last_yes_end {
+        Some(end) => span.start().saturating_sub(end) < hold,
+        None => false,
+      });
+    }
+  }
+  out
+}
+
+/// Drive a fresh `DwellState<ScriptGate>` over `spans`, scripting the inner
+/// gate's flags directly and pushing `Windowed<()>` — the streaming
+/// counterpart of [`dwell_oracle`], and the value-freeness witness at once.
+fn drive_dwell(inner_flags: &[bool], spans: &[Span], confirm: usize) -> Vec<bool> {
+  let mut state = DwellState {
+    inner: ScriptGate::new(inner_flags),
+    confirm,
+    origin: None,
+    last_start: None,
+  };
+  spans
+    .iter()
+    .map(|&span| state.push(&Windowed::new((), span)).unwrap())
+    .collect()
+}
+
+/// The `Hangover` counterpart of [`drive_dwell`].
+fn drive_hangover(inner_flags: &[bool], spans: &[Span], hold: usize) -> Vec<bool> {
+  let mut state = HangoverState {
+    inner: ScriptGate::new(inner_flags),
+    hold,
+    last_yes_end: None,
+    last_start: None,
+  };
+  spans
+    .iter()
+    .map(|&span| state.push(&Windowed::new((), span)).unwrap())
+    .collect()
+}
+
+/// Feed `(flag, span)` pairs through a fresh [`Segmenter`] under `opts` and
+/// collect every finalized range, including [`finish`](Segmenter::finish)'s
+/// tail — shared by the Dwell/Hangover worked examples below.
+fn finalize(flags: &[bool], spans: &[Span], opts: &SegmentOptions) -> Vec<Range> {
+  let mut seg = Segmenter::new(*opts);
+  let mut out = Vec::new();
+  for (&flag, &span) in flags.iter().zip(spans) {
+    if let Some(r) = seg.push(flag, span).unwrap() {
+      out.push(r);
+    }
+  }
+  out.extend(seg.finish());
+  out
+}
+
+#[test]
+fn dwell_new_exposes_inner_and_confirm() {
+  let d = Dwell::new(Threshold::new(0.5), 7);
+  assert_eq!(d.confirm(), 7);
+  assert_eq!(d.inner().thr(), 0.5);
+}
+
+#[test]
+fn hangover_new_exposes_inner_and_hold() {
+  let h = Hangover::new(Threshold::new(0.5), 9);
+  assert_eq!(h.hold(), 9);
+  assert_eq!(h.inner().thr(), 0.5);
+}
+
+#[test]
+fn dwell_confirm_zero_is_pass_through() {
+  let inner_flags = [true, false, true, true, false, true];
+  let spans: Vec<Span> = (0..inner_flags.len()).map(|i| Span::new(i, 1, 1)).collect();
+  let got = drive_dwell(&inner_flags, &spans, 0);
+  assert_eq!(got, inner_flags);
+}
+
+#[test]
+fn hangover_hold_zero_is_pass_through() {
+  // hold = 0: an adjacent window has gap 0, which is not < 0, so it releases
+  // immediately and the output equals the inner flags exactly.
+  let inner_flags = [true, false, true, true, false, false, true];
+  let spans: Vec<Span> = (0..inner_flags.len()).map(|i| Span::new(i, 1, 1)).collect();
+  let got = drive_hangover(&inner_flags, &spans, 0);
+  assert_eq!(got, inner_flags);
+}
+
+#[test]
+fn dwell_rising_edge_lag_example() {
+  // Unit spans, confirm = 3: inner-true at positions 0, 1, 2 confirms on the
+  // third push (end 3 - origin 0 >= 3) — the exact example from the type doc.
+  let inner_flags = [true, true, true, true];
+  let spans: Vec<Span> = (0..4).map(|i| Span::new(i, 1, 1)).collect();
+  let got = drive_dwell(&inner_flags, &spans, 3);
+  assert_eq!(got, vec![false, false, true, true]);
+}
+
+#[test]
+fn dwell_confirm_at_or_below_first_window_len_never_suppresses() {
+  // A single window of len 5 confirms immediately whenever confirm <= 5.
+  let span = Span::new(0, 5, 5);
+  for confirm in [0usize, 1, 5] {
+    let got = drive_dwell(&[true], &[span], confirm);
+    assert_eq!(got, vec![true], "confirm={confirm}");
+  }
+}
+
+#[test]
+fn dwell_counts_uncovered_elements_on_a_gapped_plan() {
+  // hop 5 > window 2: elements 2..5 are covered by no span, but confirmation
+  // distance is positional, so they still count toward `confirm` (F8).
+  let spans = [Span::new(0, 2, 2), Span::new(5, 2, 2)];
+  // First window: end 2, origin 0, 2 - 0 = 2 < confirm(3) -> false.
+  // Second window: end 7, origin 0, 7 - 0 = 7 >= 3 -> true, despite the
+  // 3-element gap no span covers.
+  let got = drive_dwell(&[true, true], &spans, 3);
+  assert_eq!(got, vec![false, true]);
+}
+
+#[test]
+fn dwell_usize_max_never_activates() {
+  let spans: Vec<Span> = (0..50).map(|i| Span::new(i, 1, 1)).collect();
+  let inner_flags = vec![true; 50];
+  let got = drive_dwell(&inner_flags, &spans, usize::MAX);
+  assert!(got.iter().all(|&f| !f));
+}
+
+#[test]
+fn dwell_head_trim_vs_min_len_worked_example() {
+  // Inner-true run over unit spans [0, 6), confirm = 3: confirms at position 2
+  // (end 3 - origin 0 >= 3), so the finalized range starts at 2, not 0 — the
+  // causal/finalized-plane worked example from the type doc.
+  let confirm = 3;
+  let inner_flags = [true, true, true, true, true, true];
+  let spans: Vec<Span> = (0..6).map(|i| Span::new(i, 1, 1)).collect();
+
+  let flags = drive_dwell(&inner_flags, &spans, confirm);
+  assert_eq!(finalize(&flags, &spans, &plain()), vec![Range::new(2, 6)]);
+
+  // min_len instead keeps the full extent of any run it does not drop
+  // entirely — it does not trim a kept run's head.
+  let kept_whole = finalize(&inner_flags, &spans, &SegmentOptions::new().with_min_len(3));
+  assert_eq!(kept_whole, vec![Range::new(0, 6)]);
+}
+
+#[test]
+fn dwell_suppression_only_invariant_on_randomized_runs() {
+  // Dual of Hangover's extension-only: Dwell only ever turns an inner `true`
+  // into `false` (a suppressed head), never the reverse.
+  let mut state: u64 = 0x0123_4567_89AB_CDEF;
+  for _ in 0..200 {
+    let len = (xorshift(&mut state) % 40) as usize;
+    let confirm = [0usize, 1, 2, 5, 10][(xorshift(&mut state) % 5) as usize];
+    let hop = 1 + (xorshift(&mut state) % 3) as usize;
+    let inner_flags: Vec<bool> = (0..len)
+      .map(|_| xorshift(&mut state).is_multiple_of(2))
+      .collect();
+    let spans: Vec<Span> = (0..len).map(|i| Span::new(i * hop, 1, 1)).collect();
+    let got = drive_dwell(&inner_flags, &spans, confirm);
+    for i in 0..len {
+      assert!(
+        !got[i] || inner_flags[i],
+        "suppression-only violated at {i}: confirm={confirm} hop={hop}"
+      );
+    }
+  }
+}
+
+#[test]
+fn hangover_extension_only_invariant_on_randomized_runs() {
+  let mut state: u64 = 0xABCD_EF01_2345_6789;
+  for _ in 0..200 {
+    let len = (xorshift(&mut state) % 40) as usize;
+    let hold = [0usize, 1, 2, 5, 10][(xorshift(&mut state) % 5) as usize];
+    let hop = 1 + (xorshift(&mut state) % 3) as usize;
+    let inner_flags: Vec<bool> = (0..len)
+      .map(|_| xorshift(&mut state).is_multiple_of(2))
+      .collect();
+    let spans: Vec<Span> = (0..len).map(|i| Span::new(i * hop, 1, 1)).collect();
+    let got = drive_hangover(&inner_flags, &spans, hold);
+    for i in 0..len {
+      assert!(
+        !inner_flags[i] || got[i],
+        "extension-only violated at {i}: hold={hold} hop={hop}"
+      );
+    }
+  }
+}
+
+#[test]
+fn dwell_matches_oracle_over_exhaustive_flags_and_geometry() {
+  let geometries = [(1usize, 1usize), (2, 2), (2, 3), (2, 1)]; // (span_len, hop)
+  let confirms = [0usize, 1, 2, 5, usize::MAX];
+  for len in 0..=8usize {
+    for bits in 0u32..(1 << len) {
+      let inner_flags: Vec<bool> = (0..len).map(|i| (bits >> i) & 1 == 1).collect();
+      for &(span_len, hop) in &geometries {
+        let spans: Vec<Span> = (0..len)
+          .map(|i| Span::new(i * hop, span_len, span_len))
+          .collect();
+        let pairs: Vec<(bool, Span)> = inner_flags
+          .iter()
+          .copied()
+          .zip(spans.iter().copied())
+          .collect();
+        for &confirm in &confirms {
+          let expected = dwell_oracle(&pairs, confirm);
+          let got = drive_dwell(&inner_flags, &spans, confirm);
+          assert_eq!(
+            got, expected,
+            "flags={inner_flags:?} span_len={span_len} hop={hop} confirm={confirm}"
+          );
+
+          // The finalized-range plane must agree too: driving the oracle
+          // flags through a fresh Segmenter must equal driving DwellState's
+          // own output through one.
+          let opts = plain();
+          assert_eq!(
+            finalize(&got, &spans, &opts),
+            finalize(&expected, &spans, &opts),
+            "ranges: flags={inner_flags:?} span_len={span_len} hop={hop} confirm={confirm}"
+          );
+        }
+      }
+    }
+  }
+}
+
+#[test]
+fn hangover_matches_oracle_over_exhaustive_flags_and_geometry() {
+  let geometries = [(1usize, 1usize), (2, 2), (2, 3), (2, 1)];
+  let holds = [0usize, 1, 2, 5, usize::MAX];
+  for len in 0..=8usize {
+    for bits in 0u32..(1 << len) {
+      let inner_flags: Vec<bool> = (0..len).map(|i| (bits >> i) & 1 == 1).collect();
+      for &(span_len, hop) in &geometries {
+        let spans: Vec<Span> = (0..len)
+          .map(|i| Span::new(i * hop, span_len, span_len))
+          .collect();
+        let pairs: Vec<(bool, Span)> = inner_flags
+          .iter()
+          .copied()
+          .zip(spans.iter().copied())
+          .collect();
+        for &hold in &holds {
+          let expected = hangover_oracle(&pairs, hold);
+          let got = drive_hangover(&inner_flags, &spans, hold);
+          assert_eq!(
+            got, expected,
+            "flags={inner_flags:?} span_len={span_len} hop={hop} hold={hold}"
+          );
+
+          let opts = plain();
+          assert_eq!(
+            finalize(&got, &spans, &opts),
+            finalize(&expected, &spans, &opts),
+            "ranges: flags={inner_flags:?} span_len={span_len} hop={hop} hold={hold}"
+          );
+        }
+      }
+    }
+  }
+}
+
+#[test]
+fn hangover_release_boundary_is_strict() {
+  let hold = 5;
+  // gap = hold - 1 (start 5, last_yes_end 1): still < hold, held.
+  let mut held = HangoverState {
+    inner: ScriptGate::new(&[true]),
+    hold,
+    last_yes_end: None,
+    last_start: None,
+  };
+  assert!(held.push(&Windowed::new((), Span::new(0, 1, 1))).unwrap());
+  assert!(held.push(&Windowed::new((), Span::new(5, 1, 1))).unwrap());
+
+  // gap = hold exactly (start 6, last_yes_end 1): not < hold, released.
+  let mut released = HangoverState {
+    inner: ScriptGate::new(&[true]),
+    hold,
+    last_yes_end: None,
+    last_start: None,
+  };
+  assert!(released
+    .push(&Windowed::new((), Span::new(0, 1, 1)))
+    .unwrap());
+  assert!(!released
+    .push(&Windowed::new((), Span::new(6, 1, 1)))
+    .unwrap());
+}
+
+#[test]
+fn hangover_overlapping_window_has_gap_zero_and_is_held() {
+  // An inner-false window starting BEFORE the coverage horizon (an
+  // overlapping window) saturates its gap to 0, which is always < any
+  // positive hold.
+  let mut state = HangoverState {
+    inner: ScriptGate::new(&[true, false]),
+    hold: 1,
+    last_yes_end: None,
+    last_start: None,
+  };
+  assert!(state.push(&Windowed::new((), Span::new(0, 5, 5))).unwrap()); // last_yes_end = 5
+  assert!(state.push(&Windowed::new((), Span::new(2, 2, 2))).unwrap()); // start 2 < 5: gap 0
+}
+
+#[test]
+fn hangover_relatch_during_hold_bridges_the_gap_into_one_run() {
+  // hold = 3: an inner true, a short false gap within the hold, then another
+  // inner true re-folds the horizon, causally bridging the two into one run.
+  let hold = 3;
+  let inner_flags = [true, false, false, true, false, false, false, false];
+  let spans: Vec<Span> = (0..8).map(|i| Span::new(i, 1, 1)).collect();
+  let got = drive_hangover(&inner_flags, &spans, hold);
+  assert_eq!(got, vec![true, true, true, true, true, true, true, false]);
+}
+
+#[test]
+fn hangover_usize_max_never_releases_after_activation() {
+  let spans: Vec<Span> = (0..50).map(|i| Span::new(i * 3, 1, 1)).collect();
+  let mut inner_flags = vec![false; 50];
+  inner_flags[0] = true;
+  let got = drive_hangover(&inner_flags, &spans, usize::MAX);
+  assert!(
+    got.iter().all(|&f| f),
+    "usize::MAX hold must never release: {got:?}"
+  );
+}
+
+#[test]
+fn hangover_held_flags_do_not_bridge_uncovered_elements_without_merge_gap() {
+  // hop 5 > window 2: an inner-true window at [0, 2), then an inner-false
+  // window that stays held (within `hold`). The CAUSAL flag stays true, but
+  // the FINALIZED plane still splits at the geometric gap unless `merge_gap`
+  // bridges it — the two-plane worked example from the type doc.
+  let hold = 10;
+  let spans = [Span::new(0, 2, 2), Span::new(5, 2, 2)];
+  let inner_flags = [true, false];
+  let flags = drive_hangover(&inner_flags, &spans, hold);
+  assert_eq!(flags, vec![true, true], "held across the gap causally");
+
+  assert_eq!(
+    finalize(&flags, &spans, &plain()),
+    vec![Range::new(0, 2), Range::new(5, 7)],
+    "still two ranges without merge_gap"
+  );
+  assert_eq!(
+    finalize(&flags, &spans, &SegmentOptions::new().with_merge_gap(3)),
+    vec![Range::new(0, 7)],
+    "merge_gap bridges it, orthogonally"
+  );
+}
+
+#[test]
+fn hangover_folds_the_horizon_by_max_not_last_write() {
+  // F2: span (0, len 6) then an overlapping (2, len 2) — ends 6 then 4. A
+  // last-write-wins horizon would regress to 4 and release too early; the
+  // max-fold keeps the horizon at 6.
+  let mut state = HangoverState {
+    inner: ScriptGate::new(&[true, true]),
+    hold: 3,
+    last_yes_end: None,
+    last_start: None,
+  };
+  assert!(state.push(&Windowed::new((), Span::new(0, 6, 6))).unwrap());
+  assert!(state.push(&Windowed::new((), Span::new(2, 2, 2))).unwrap());
+  assert_eq!(state.last_yes_end, Some(6));
+
+  // gap from end 6: start 8 -> gap 2 < hold(3): held.
+  assert!(state.push(&Windowed::new((), Span::new(8, 1, 1))).unwrap());
+  // start 9 -> gap 3, not < hold(3): released. (Measured from 6, not 4: a
+  // last-write horizon would have released one step earlier, at start 7.)
+  assert!(!state.push(&Windowed::new((), Span::new(9, 1, 1))).unwrap());
+}
+
+#[test]
+fn dwell_reset_clears_origin_and_inner_state() {
+  let mut g = Dwell::new(Threshold::new(0.5), 3).gate();
+  assert!(!g.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(!g.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap());
+  g.reset();
+  // Post-reset: origin is cleared and a fresh run must reconfirm from
+  // scratch, exactly like a freshly constructed gate; the monotonicity check
+  // is re-armed too (span restarts at 0).
+  assert!(!g.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(!g.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap());
+  assert!(g.push(&Windowed::new(0.9, Span::new(2, 1, 1))).unwrap());
+}
+
+#[test]
+fn hangover_reset_clears_horizon_and_inner_state() {
+  let mut g = Hangover::new(Threshold::new(0.5), 3).gate();
+  assert!(g.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  g.reset();
+  // Post-reset: last_yes_end is cleared, so an inner-false push right after
+  // is NOT held (no inner true has been seen yet this epoch); the span
+  // restarts at 0 too.
+  assert!(!g.push(&Windowed::new(0.1, Span::new(0, 1, 1))).unwrap());
+}
+
+#[test]
+fn dwell_backward_start_errs_with_wrapper_and_inner_unchanged() {
+  let mut state = DwellState {
+    inner: ScriptGate::new(&[true, true, true]),
+    confirm: 0,
+    origin: None,
+    last_start: None,
+  };
+  assert!(state.push(&Windowed::new((), Span::new(5, 2, 2))).unwrap());
+  assert_eq!(
+    state.push(&Windowed::new((), Span::new(0, 2, 2))),
+    Err(WinditError::NonMonotonicSpan {
+      prev_start: 5,
+      start: 0,
+    })
+  );
+  // The offending push was a no-op: last_start/origin are untouched, and the
+  // inner gate's script cursor did not advance (the check runs before the
+  // inner push).
+  assert_eq!(state.last_start, Some(5));
+  assert_eq!(state.origin, Some(5));
+  assert_eq!(state.inner.idx, 1);
+  // A valid continuation behaves as if the bad push never happened.
+  assert!(state.push(&Windowed::new((), Span::new(7, 2, 2))).unwrap());
+  assert_eq!(state.inner.idx, 2);
+}
+
+#[test]
+fn nested_combinators_surface_exactly_one_error() {
+  // Hangover(Dwell(Threshold)): a backward start is caught by the OUTERMOST
+  // span-reading stage before the inner combinator ever sees it, so exactly
+  // one NonMonotonicSpan error surfaces.
+  let policy = Hangover::new(Dwell::new(Threshold::new(0.5), 2), 3);
+  let mut gate = policy.gate();
+  assert!(!gate.push(&Windowed::new(0.9, Span::new(5, 1, 1))).unwrap());
+  assert_eq!(
+    gate.push(&Windowed::new(0.9, Span::new(0, 1, 1))),
+    Err(WinditError::NonMonotonicSpan {
+      prev_start: 5,
+      start: 0,
+    })
+  );
+}
+
+#[test]
+fn dwell_batch_segment_equals_streaming_drive() {
+  let policy = Dwell::new(Threshold::new(0.5), 3);
+  let s = seq(&[0.9, 0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.9]);
+  let batch = policy.segment(&plain(), &s).unwrap();
+
+  let mut gate = policy.gate();
+  let flags: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+  let spans: Vec<Span> = s.iter().map(|w| w.span()).collect();
+  assert_eq!(batch, finalize(&flags, &spans, &plain()));
+}
+
+#[test]
+fn hangover_batch_segment_equals_streaming_drive() {
+  let policy = Hangover::new(Threshold::new(0.5), 3);
+  let s = seq(&[0.9, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1, 0.1]);
+  let batch = policy.segment(&plain(), &s).unwrap();
+
+  let mut gate = policy.gate();
+  let flags: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+  let spans: Vec<Span> = s.iter().map(|w| w.span()).collect();
+  assert_eq!(batch, finalize(&flags, &spans, &plain()));
+}
+
+#[test]
+fn composition_hangover_of_dwell_streams_and_batch_drives_and_matches_oracle() {
+  // The canonical nesting (placeholder inner: Threshold stands in for Vote,
+  // which T3 adds and upgrades this composition to). Compiles as a config
+  // value, streams via Gate::push, and batch-drives via GatePolicy::segment;
+  // both equal the composed scan oracles (Threshold -> dwell_oracle ->
+  // hangover_oracle).
+  let confirm = 2;
+  let hold = 3;
+  let policy = Hangover::new(Dwell::new(Threshold::new(0.5), confirm), hold);
+
+  let mut state: u64 = 0x2468_1357_9BDF_0246;
+  for _ in 0..50 {
+    let n = (xorshift(&mut state) % 30) as usize;
+    let hop = 1 + (xorshift(&mut state) % 3) as usize;
+    let scores: Vec<f32> = (0..n).map(|_| next_unit(&mut state)).collect();
+    let spans: Vec<Span> = (0..n).map(|i| Span::new(i * hop, 1, 1)).collect();
+    let s: Vec<Windowed<f32>> = scores
+      .iter()
+      .zip(&spans)
+      .map(|(&v, &sp)| Windowed::new(v, sp))
+      .collect();
+
+    let mut gate = policy.gate();
+    let streamed: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+    let batch_ranges = policy.segment(&plain(), &s).unwrap();
+
+    let thr_pairs: Vec<(bool, Span)> = scores
+      .iter()
+      .zip(&spans)
+      .map(|(&v, &sp)| (v >= 0.5, sp))
+      .collect();
+    let dwell_flags = dwell_oracle(&thr_pairs, confirm);
+    let dwell_pairs: Vec<(bool, Span)> = dwell_flags
+      .iter()
+      .zip(&spans)
+      .map(|(&f, &sp)| (f, sp))
+      .collect();
+    let hangover_flags = hangover_oracle(&dwell_pairs, hold);
+
+    assert_eq!(streamed, hangover_flags, "n={n} hop={hop}");
+    assert_eq!(
+      batch_ranges,
+      finalize(&hangover_flags, &spans, &plain()),
+      "n={n} hop={hop}"
+    );
+  }
+}
+
+#[test]
+fn nesting_order_changes_behavior() {
+  // Dwell(Hangover(_)) and Hangover(Dwell(_)) are not interchangeable — a
+  // brief blip that never reaches `confirm` on its own is invisible to
+  // Dwell(Hangover(_)) (Hangover cannot make it longer than one blip's worth
+  // by itself once released), but Hangover extends the SAME blip long enough
+  // for Dwell to see it confirmed under Hangover(Dwell(_)).
+  let confirm = 2;
+  let hold = 2;
+  let inner = Threshold::new(0.5);
+
+  let a = Hangover::new(Dwell::new(inner, confirm), hold);
+  let b = Dwell::new(Hangover::new(inner, hold), confirm);
+
+  let scores = [0.9f32, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1];
+  let spans: Vec<Span> = (0..scores.len()).map(|i| Span::new(i, 1, 1)).collect();
+  let s: Vec<Windowed<f32>> = scores
+    .iter()
+    .zip(&spans)
+    .map(|(&v, &sp)| Windowed::new(v, sp))
+    .collect();
+
+  let flags_a: Vec<bool> = {
+    let mut g = a.gate();
+    s.iter().map(|w| g.push(w).unwrap()).collect()
+  };
+  let flags_b: Vec<bool> = {
+    let mut g = b.gate();
+    s.iter().map(|w| g.push(w).unwrap()).collect()
+  };
+
+  assert_ne!(
+    flags_a, flags_b,
+    "nesting order must not be interchangeable"
+  );
+}
+
+#[test]
+fn dwell_and_hangover_are_object_safe_as_boxed_gates() {
+  let mut boxed_dwell: Box<dyn Gate<f32>> = Box::new(Dwell::new(Threshold::new(0.5), 2).gate());
+  assert!(!boxed_dwell
+    .push(&Windowed::new(0.9, Span::new(0, 1, 1)))
+    .unwrap());
+  assert!(boxed_dwell
+    .push(&Windowed::new(0.9, Span::new(1, 1, 1)))
+    .unwrap());
+
+  let mut boxed_hangover: Box<dyn Gate<f32>> =
+    Box::new(Hangover::new(Threshold::new(0.5), 2).gate());
+  assert!(boxed_hangover
+    .push(&Windowed::new(0.9, Span::new(0, 1, 1)))
+    .unwrap());
+  assert!(boxed_hangover
+    .push(&Windowed::new(0.1, Span::new(1, 1, 1)))
+    .unwrap());
+  assert!(!boxed_hangover
+    .push(&Windowed::new(0.1, Span::new(3, 1, 1)))
+    .unwrap());
+}
+
+#[test]
+fn dwell_discontinuity_forwards_to_inner_discontinuity_not_reset() {
+  let (probe, reset_calls, discontinuity_calls) = ProbeGate::new(false);
+  let mut state = DwellState {
+    inner: probe,
+    confirm: 3,
+    origin: None,
+    last_start: None,
+  };
+  let _ = state.push(&Windowed::new(0.0, Span::new(0, 1, 1))).unwrap();
+  state.discontinuity();
+  assert_eq!(discontinuity_calls.get(), 1);
+  assert_eq!(reset_calls.get(), 0);
+  state.reset();
+  assert_eq!(reset_calls.get(), 1);
+}
+
+#[test]
+fn hangover_discontinuity_forwards_to_inner_discontinuity_not_reset() {
+  let (probe, reset_calls, discontinuity_calls) = ProbeGate::new(false);
+  let mut state = HangoverState {
+    inner: probe,
+    hold: 3,
+    last_yes_end: None,
+    last_start: None,
+  };
+  let _ = state.push(&Windowed::new(0.0, Span::new(0, 1, 1))).unwrap();
+  state.discontinuity();
+  assert_eq!(discontinuity_calls.get(), 1);
+  assert_eq!(reset_calls.get(), 0);
+  state.reset();
+  assert_eq!(reset_calls.get(), 1);
+}
+
+#[test]
+fn box_dyn_gate_forwards_discontinuity_explicitly() {
+  // F3 at the Box layer: a bare ProbeGate boxed as `Box<dyn Gate<f32>>` must
+  // still route `discontinuity` to the concrete gate's `discontinuity`.
+  let (probe, reset_calls, discontinuity_calls) = ProbeGate::new(false);
+  let mut boxed: Box<dyn Gate<f32>> = Box::new(probe);
+  boxed.discontinuity();
+  assert_eq!(discontinuity_calls.get(), 1);
+  assert_eq!(reset_calls.get(), 0);
+  boxed.reset();
+  assert_eq!(reset_calls.get(), 1);
+}
+
+#[test]
+fn box_of_dwell_of_probe_forwards_discontinuity_through_both_layers() {
+  // F3 through both layers at once: Box -> DwellState -> ProbeGate.
+  let (probe, reset_calls, discontinuity_calls) = ProbeGate::new(false);
+  let inner_state = DwellState {
+    inner: probe,
+    confirm: 2,
+    origin: None,
+    last_start: None,
+  };
+  let mut boxed: Box<dyn Gate<f32>> = Box::new(inner_state);
+  boxed.discontinuity();
+  assert_eq!(
+    discontinuity_calls.get(),
+    1,
+    "Box -> DwellState -> ProbeGate discontinuity chain broken"
+  );
+  assert_eq!(reset_calls.get(), 0);
 }
