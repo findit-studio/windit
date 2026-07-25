@@ -1,53 +1,50 @@
-//! Segmentation: reduce a windowed score sequence to continuous element ranges.
+//! Segmentation: gate a windowed score sequence and reduce it to element ranges.
 //!
-//! The heart of the module is the incremental [`Segmenter`]: a bounded, O(1)
-//! state machine that consumes `(active, span)` gate decisions one at a time and
-//! emits finalized element [`Range`]s no future input can change. It groups the
-//! accepted windows into runs that are continuous in both the sequence and the
-//! input geometry, maps each run to a half-open `Range` in input-element units
-//! through its spans, and applies the two [`SegmentOptions`] morphology passes —
-//! merge runs separated by at most `merge_gap` elements, then drop runs shorter
-//! than `min_len`.
+//! Two stages: a [`Gate`] turns each windowed value into a binary active/inactive
+//! decision, and the incremental [`Segmenter`] groups those decisions into
+//! finalized element [`Range`]s. The `Segmenter` is a bounded, O(1) state machine
+//! that consumes `(active, span)` decisions one at a time and emits ranges no
+//! future input can change: it groups the accepted windows into runs that are
+//! continuous in both the sequence and the input geometry, maps each run to a
+//! half-open `Range` in input-element units through its spans, and applies the two
+//! [`SegmentOptions`] morphology passes — merge runs separated by at most
+//! `merge_gap` elements, then drop runs shorter than `min_len`.
 //!
+//! The shipped gates are [`Threshold`] (active at or above a fixed cutoff) and
+//! [`Hysteresis`] (a latching two-threshold gate). A [`GatePolicy`] is the
+//! configuration that constructs a [`Gate`]; it also
 #![cfg_attr(
   any(feature = "std", feature = "alloc"),
-  doc = "[`runs`], [`longest_run`], and [`runs_sorted`] are batch conveniences that"
+  doc = "drives that gate through the `Segmenter` as the batch"
+)]
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`segment`](GatePolicy::segment) convenience. [`runs`], [`longest_run`], and"
 )]
 #![cfg_attr(
   not(any(feature = "std", feature = "alloc")),
-  doc = "`runs`, `longest_run`, and `runs_sorted` are batch conveniences that"
+  doc = "drives that gate through the `Segmenter` as the batch `segment` convenience."
 )]
-//! *drive* a fresh `Segmenter` over a slice and collect what it emits, so batch
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`runs_sorted`] are the predicate-driven counterparts. Every batch driver"
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`runs`, `longest_run`, and `runs_sorted` are the predicate-driven counterparts. Every batch driver"
+)]
+//! *drives* a fresh `Segmenter` over a slice and collects what it emits, so batch
 //! output equals the streaming core plus [`finish`](Segmenter::finish) by
-//! construction rather than by two implementations kept in sync. `longest_run`
-//! ranks those ranges; the find-longest-continuous-range case (the longest
-//! speech region, say) is `longest_run`.
+//! construction rather than by two implementations kept in sync. Each restarts
+//! from fresh state on every call — a batch convenience, not an incremental
+//! decoder. For streaming, drive a [`Gate`] into a `Segmenter` directly.
 //!
-#![cfg_attr(
-  any(feature = "std", feature = "alloc"),
-  doc = "`SegmentPolicy` packages a predicate with its options; [`Threshold`] admits"
-)]
-#![cfg_attr(
-  not(any(feature = "std", feature = "alloc")),
-  doc = "`SegmentPolicy` packages a predicate with its options; `Threshold` admits"
-)]
-//! values at or above a cutoff. These policies restart their state on every
-//! call — they are batch conveniences, not incremental decoders. For a latching
-#![cfg_attr(
-  any(feature = "std", feature = "alloc"),
-  doc = "two-threshold gate, feed a [`Hysteresis`](crate::smooth::Hysteresis) decision"
-)]
-#![cfg_attr(
-  not(any(feature = "std", feature = "alloc")),
-  doc = "two-threshold gate, feed a `Hysteresis` decision"
-)]
-//! stream into a `Segmenter` directly.
-//!
-//! The `Segmenter`, `SegmentTail`, `Range`, and `SegmentOptions` types live in
-//! the featureless core tier (they allocate nothing); the `Vec`-returning batch
-//! drivers and policies are gated on the `alloc` feature.
+//! The [`Gate`]/[`GatePolicy`] traits, the gate configs, the `Segmenter`,
+//! `SegmentTail`, `Range`, and `SegmentOptions` all live in the featureless core
+//! tier (they allocate nothing); only the `Vec`-returning batch drivers gate on
+//! the `alloc` feature.
 
-use crate::{error::WinditError, plan::Span};
+use crate::{error::WinditError, plan::Span, windowed::Windowed};
 
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
@@ -488,8 +485,6 @@ impl Iterator for SegmentTail {
 impl ExactSizeIterator for SegmentTail {}
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-use crate::windowed::Windowed;
-#[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;
 
 /// Push a finalized range onto the output, surfacing an allocation failure as
@@ -614,83 +609,242 @@ where
   Ok(all)
 }
 
-/// A policy that segments a windowed value sequence into element [`Range`]s.
+/// Stateful binary decision over a windowed value sequence: one window in, one
+/// `bool` out.
 ///
-/// Generic over the value type `V`; the shipped built-in implements it for
-/// `V = f32` (speech probabilities, energies, logits).
+/// The decision plane feeding the [`Segmenter`] — `Ok(true)` means the window is
+/// active (accepted), `Ok(false)` inactive. A `Gate` carries whatever state its
+/// decision needs (a latch, a running count) in O(1) space and allocates nothing,
+/// so it lives in the featureless core tier. The configuration that constructs one
+/// is a [`GatePolicy`].
 ///
-/// Each call starts from fresh policy state — these are batch conveniences over
-/// [`runs`], not incremental decoders. The incremental decoder is
-/// [`Segmenter`].
-#[cfg(any(feature = "std", feature = "alloc"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
-pub trait SegmentPolicy<V> {
-  /// Segment `seq` into the element ranges it selects, in input order.
-  fn segment(&self, seq: &[Windowed<V>]) -> Vec<Range>;
+/// `Box<dyn Gate<f32>>` is a valid object, so a gate can be selected at run time.
+pub trait Gate<V> {
+  /// Advance by one window; `Ok(true)` means active/accepted.
+  ///
+  /// # Errors
+  ///
+  /// Returns a [`WinditError`] for a stage that reads spans out of order; the
+  /// shipped gates ([`Threshold`], [`Hysteresis`]) are infallible and always
+  /// return `Ok`, returning `Result` only for uniformity with the composable
+  /// stages.
+  fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError>;
+
+  /// Return to the freshly-constructed state.
+  fn reset(&mut self);
+
+  /// Declare a timeline break; for a gate that carries no pending output across
+  /// epochs this is [`reset`](Gate::reset).
+  fn discontinuity(&mut self) {
+    self.reset();
+  }
 }
 
-/// Segment where the score is at or above a fixed threshold.
+/// A gating configuration: names the strategy, constructs its streaming [`Gate`],
+/// and drives it as a batch segmentation convenience.
 ///
-/// A window is in-segment when `value >= thr`; the resulting runs are shaped by
-/// the policy's [`SegmentOptions`].
+/// Generic over the value type `V`; the shipped built-ins implement it for
+/// `V = f32` (speech probabilities, energies, logits). Implement the factory
+/// [`gate`](GatePolicy::gate) to add a strategy — the batch
+#[cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "[`segment`](GatePolicy::segment) method is provided over it."
+)]
+#[cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "`segment` method is provided over it."
+)]
+pub trait GatePolicy<V> {
+  /// The streaming state this configuration constructs.
+  type Gate: Gate<V>;
+
+  /// Fresh streaming state for this configuration.
+  fn gate(&self) -> Self::Gate;
+
+  /// Batch convenience: gate every window in `seq` through a fresh [`Gate`] and
+  /// shape the accepted runs with `opts`, in input order.
+  ///
+  /// This drives the gate decisions through a fresh [`Segmenter`] and collects
+  /// what it emits, so the result equals the streaming core plus
+  /// [`finish`](Segmenter::finish) by construction. Fresh state per call, exactly
+  /// as the 0.1.x policies documented.
+  ///
+  /// The sequence must be in span order (ascending `span.start`), as planners
+  /// produce; a strictly backward start is a precondition violation reported as
+  /// [`WinditError::NonMonotonicSpan`], not silent nonsense.
+  ///
+  /// # Errors
+  ///
+  /// - [`WinditError::NonMonotonicSpan`] if a span's `start` is strictly before
+  ///   its predecessor's.
+  /// - [`WinditError::AllocFailed`] if the output ranges cannot be allocated.
+  #[cfg(any(feature = "std", feature = "alloc"))]
+  #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+  fn segment(&self, opts: &SegmentOptions, seq: &[Windowed<V>]) -> Result<Vec<Range>, WinditError> {
+    let mut gate = self.gate();
+    let mut seg = Segmenter::new(*opts);
+    let mut out: Vec<Range> = Vec::new();
+    for w in seq {
+      let active = gate.push(w)?;
+      if let Some(r) = seg.push(active, w.span())? {
+        push_checked(&mut out, r)?;
+      }
+    }
+    for r in seg.finish() {
+      push_checked(&mut out, r)?;
+    }
+    Ok(out)
+  }
+}
+
+/// Gate where the score is at or above a fixed threshold.
 ///
-/// The comparison is IEEE: a `NaN` score is never in-segment (even with
-/// `thr = -inf`); a `NaN` `thr` selects nothing; `thr = -inf` selects every
-/// non-`NaN` score; `thr = +inf` selects only `+inf`.
-#[cfg(any(feature = "std", feature = "alloc"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+/// A window is active when `value >= thr`. The comparison is raw IEEE: a `NaN`
+/// score is never active (even with `thr = -inf`); a `NaN` `thr` accepts nothing;
+/// `thr = -inf` accepts every non-`NaN` score; `thr = +inf` accepts only `+inf`.
+///
+/// The morphology that shapes the accepted runs — `merge_gap`, `min_len` — is no
+/// longer bundled here; it is passed to the segmentation call through
+/// [`SegmentOptions`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Threshold {
   thr: f32,
-  opts: SegmentOptions,
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
 impl Threshold {
-  /// Admit values at or above `thr`, shaping the runs with the default
-  /// [`SegmentOptions`].
+  /// A gate that accepts values at or above `thr`.
   #[must_use]
   pub const fn new(thr: f32) -> Self {
-    Self {
-      thr,
-      opts: SegmentOptions::new(),
-    }
+    Self { thr }
   }
 
-  /// Shape the runs with `opts` rather than the default.
-  #[must_use]
-  pub const fn with_opts(mut self, opts: SegmentOptions) -> Self {
-    self.opts = opts;
-    self
-  }
-
-  /// The cutoff at or above which a value is in-segment.
+  /// The cutoff at or above which a value is active.
   #[must_use]
   pub const fn thr(&self) -> f32 {
     self.thr
   }
+}
 
-  /// The gap-merging and minimum-length options applied to the runs.
-  #[must_use]
-  pub const fn opts(&self) -> SegmentOptions {
-    self.opts
+/// The streaming state of a [`Threshold`] gate: the immutable cutoff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ThresholdState {
+  thr: f32,
+}
+
+impl Gate<f32> for ThresholdState {
+  fn push(&mut self, w: &Windowed<f32>) -> Result<bool, WinditError> {
+    Ok(*w.value() >= self.thr)
+  }
+
+  fn reset(&mut self) {}
+}
+
+impl GatePolicy<f32> for Threshold {
+  type Gate = ThresholdState;
+
+  fn gate(&self) -> ThresholdState {
+    ThresholdState { thr: self.thr }
   }
 }
 
-#[cfg(any(feature = "std", feature = "alloc"))]
-impl SegmentPolicy<f32> for Threshold {
-  /// Segment `seq` at the threshold.
+/// Latching two-threshold gate.
+///
+/// The gate turns on when a value rises to `on` or above, turns off when a value
+/// falls strictly below `off`, and otherwise holds its previous state — so a
+/// value exactly at `off` holds rather than turning off. It starts off. Configure
+/// `on >= off`; the half-open band `off <= value < on` is the hold region that
+/// suppresses chatter. If misconfigured with `on < off`, the turn-on test is
+/// evaluated first and wins, so the gate degrades to a single threshold at `on`.
+/// This is the binary VAD smoothing generalized to any f32 score.
+///
+/// Comparisons are IEEE, and every comparison with `NaN` is false, so: a `NaN`
+/// score holds the previous state (including the initial off state); `+inf`
+/// activates whenever `on` is not `NaN`; `-inf` releases unless `on` is `-inf`
+/// (activation wins) or `off` is `NaN` or `-inf` (then it holds — `off = -inf`
+/// can never release, since no value is `< -inf`); a `NaN` `on` can never
+/// activate, so the gate stays off; and a `NaN` `off` never releases once on.
+///
+/// This is a [`Gate`], not a smoother: it yields a typed `bool` decision. A caller
+/// that genuinely needs a `0.0`/`1.0` float latch sequence maps the decision
+/// itself — `if active { 1.0 } else { 0.0 }` — rather than the crate carrying that
+/// role.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hysteresis {
+  on: f32,
+  off: f32,
+}
+
+impl Hysteresis {
+  /// A gate that latches on at `>= on` and off at `< off`.
   ///
-  /// # Panics
+  /// Configure `on >= off`; the band `off <= value < on` is the hold region, so
+  /// a value exactly at `off` holds rather than turning off. An `on < off` pair
+  /// is deliberately not rejected: the type documents the single-threshold
+  /// behaviour it degrades to, which is defined and deterministic rather than
+  /// invalid.
+  #[must_use]
+  pub const fn new(on: f32, off: f32) -> Self {
+    Self { on, off }
+  }
+
+  /// The turn-on threshold: a value `>= on` latches the gate on.
+  #[must_use]
+  pub const fn on(&self) -> f32 {
+    self.on
+  }
+
+  /// The turn-off threshold: a value `< off` latches the gate off; a value
+  /// exactly at `off` holds instead.
+  #[must_use]
+  pub const fn off(&self) -> f32 {
+    self.off
+  }
+
+  /// Advance the latch by one value and return the resulting state: on at
+  /// `>= on`, off strictly below `off`, hold otherwise (so a value exactly at
+  /// `off`, and any NaN, holds the previous state). The turn-on test is
+  /// evaluated first and wins.
   ///
-  /// Panics if the spans are not in ascending `start` order, or if the output
-  /// ranges cannot be allocated — the precondition and resource failures the
-  /// infallible [`runs`] counterpart reports through
-  /// [`WinditError`]. This convenience is for the callers whose planner-produced
-  /// spans satisfy the precondition; drive [`runs`] directly to handle untrusted
-  /// order.
-  fn segment(&self, seq: &[Windowed<f32>]) -> Vec<Range> {
-    runs(seq, |&v| v >= self.thr, &self.opts)
-      .expect("Threshold::segment requires spans in ascending start order and allocatable output")
+  /// The single definition of the gate transition, shared by
+  /// [`HysteresisState::push`](Gate::push) and any batch driver, so the streaming
+  /// and batch paths cannot drift apart.
+  pub(crate) const fn step(&self, active: bool, value: f32) -> bool {
+    if value >= self.on {
+      true
+    } else if value < self.off {
+      false
+    } else {
+      active
+    }
+  }
+}
+
+/// The streaming state of a [`Hysteresis`] gate: the thresholds plus the latch,
+/// which starts off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HysteresisState {
+  cfg: Hysteresis,
+  active: bool,
+}
+
+impl Gate<f32> for HysteresisState {
+  fn push(&mut self, w: &Windowed<f32>) -> Result<bool, WinditError> {
+    self.active = self.cfg.step(self.active, *w.value());
+    Ok(self.active)
+  }
+
+  fn reset(&mut self) {
+    self.active = false;
+  }
+}
+
+impl GatePolicy<f32> for Hysteresis {
+  type Gate = HysteresisState;
+
+  fn gate(&self) -> HysteresisState {
+    HysteresisState {
+      cfg: *self,
+      active: false,
+    }
   }
 }
