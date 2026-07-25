@@ -1,7 +1,39 @@
 use std::{boxed::Box, vec, vec::Vec};
 
-use super::{CadenceEma, Ema, Identity, SmoothPolicy, Smoother};
+use super::{CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother};
 use crate::{error::WinditError, plan::Span, windowed::Windowed};
+
+/// Signed distance between two `f32`s in representable steps. Quantitative
+/// accuracy claims are stated in ulps, so they are checked in ulps: an absolute
+/// tolerance cannot express "within N representable values" at all — the `1e-6`
+/// this replaced was over 33 ulps at `exp(-1)`, far too slack to enforce the
+/// claim it accompanied.
+fn ulps32(a: f32, b: f32) -> i64 {
+  a.to_bits() as i64 - b.to_bits() as i64
+}
+
+/// One representable step at `|v|`, as an `f64` so it can be compared against
+/// the retained state directly.
+fn ulp64(v: f64) -> f64 {
+  let m = v.abs();
+  f64::from_bits(m.to_bits() + 1) - m
+}
+
+/// One representable `f32` step at `|v|` — the resolution of the *emitted*
+/// value, `2^29` times coarser than the accumulator's.
+fn ulp32(v: f32) -> f32 {
+  let m = v.abs();
+  f32::from_bits(m.to_bits() + 1) - m
+}
+
+/// The retained `f64` inside a seeded [`CadenceEmaState`].
+///
+/// Absorption is only observable here: the emitted `f32` is `2^29` times
+/// coarser than the accumulator, so a step can be recorded, or lost, with the
+/// output identical either way.
+fn retained(s: &CadenceEmaState) -> f64 {
+  s.prev.expect("smoother must be seeded before it is read").1
+}
 
 /// One `Windowed<f32>` per value, each covering a single element (window 1).
 fn seq(values: &[f32]) -> Vec<Windowed<f32>> {
@@ -305,6 +337,35 @@ fn ema_sub_epsilon_alpha_accumulates_rather_than_holding() {
   // is `alpha * x`, so a large input ramps proportionally faster.
   let scaled = values(&drive(&ema, &seq(&[0.0, 8.0, 8.0])));
   assert_eq!(scaled, vec![0.0, ALPHA * 8.0, 2.0 * ALPHA * 8.0]);
+}
+
+#[test]
+fn ema_sub_epsilon_ramp_reaches_its_plateau_after_exactly_two_pow_24_pushes() {
+  // The push count the type doc states — the ramp "stalls at `alpha * x * 2^24`
+  // ... reached after exactly `2^24` pushes". The test above pins the plateau
+  // *value* by seeding one step below it, deliberately skipping the climb, so
+  // the count itself went unenforced. Driving the climb costs 2^24 `f32`
+  // operations and settles it.
+  const ALPHA: f32 = 1.0 / 33_554_432.0; // 2^-25
+  const PUSHES: u32 = 1 << 24;
+  let ramp = |n: u32| {
+    let mut s = 0.0f32;
+    for _ in 0..n {
+      s = ALPHA * 1.0 + (1.0 - ALPHA) * s;
+    }
+    s
+  };
+
+  let plateau = ramp(PUSHES);
+  assert_eq!(plateau, 0.5, "the ramp must land exactly on x / 2");
+  assert_eq!(
+    ALPHA * 1.0 + (1.0 - ALPHA) * plateau,
+    plateau,
+    "and the very next push must not move it"
+  );
+  // One push earlier the state is still climbing, so `2^24` is the exact count
+  // and not merely an upper bound.
+  assert_eq!(ramp(PUSHES - 1), 0.5 - ALPHA);
 }
 
 #[test]
@@ -749,6 +810,47 @@ fn cadence_ema_tiny_cadence_ratio_yields_a_nonzero_coefficient() {
 }
 
 #[test]
+fn cadence_ema_coefficient_and_step_floors_are_the_documented_powers_of_two() {
+  // The three edge figures the *Fine cadences* bullet quotes but nothing
+  // enforced: the smallest coefficient a validated `tau` can produce, the floor
+  // under `|alpha * x|`, and the zero-state escape.
+
+  // "with a validated `tau` it cannot fall below about `2^-128` at `delta = 1`":
+  // the largest `tau` is `f32::MAX`, and the coefficient there is exactly
+  // `2^-128` — nonzero, so the filter still responds.
+  let widest = CadenceEma::new(f32::MAX);
+  let floor = widest.alpha_for(1);
+  assert!(floor > 0.0, "the coefficient must not round away: {floor}");
+  assert_eq!(floor, libm::ldexpf(1.0, -128), "the documented 2^-128");
+
+  // "`|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input":
+  // that floor keeps a single step clear of `f64`'s subnormals (2^-1074), so
+  // the relative reading of `ulp(s)` stays the operative one.
+  let tiniest = f32::from_bits(1); // f32's smallest positive subnormal, 2^-149
+  let product = f64::from(floor) * f64::from(tiniest);
+  assert_eq!(product, libm::ldexp(1.0, -277), "the documented 2^-277");
+  assert!(product > f64::MIN_POSITIVE * f64::EPSILON);
+
+  // "a state of exactly `0.0` has no relative resolution to lose, so
+  // `s = alpha * x` survives whatever `alpha` is": at the floor coefficient a
+  // zero state still moves, where any nonzero state of ordinary magnitude
+  // would absorb the same step outright.
+  let mut s = widest.smoother();
+  assert_eq!(
+    s.push(Windowed::new(0.0, Span::new(0, 1, 1)))
+      .unwrap()
+      .value,
+    0.0
+  );
+  let _ = s.push(Windowed::new(1.0, Span::new(1, 1, 1))).unwrap();
+  assert_eq!(
+    retained(&s),
+    f64::from(floor),
+    "zero state records alpha * x"
+  );
+}
+
+#[test]
 fn cadence_ema_is_cadence_invariant_below_f32_epsilon() {
   // The property the type exists for, asserted directly: one signal sampled at
   // three cadences must smooth to the same value at a shared position. Here
@@ -848,12 +950,20 @@ fn cadence_ema_is_cadence_invariant_on_a_falling_step() {
 fn cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone() {
   // The counterexample to any flat `delta / tau` invariance bound, in both
   // directions. A push contributes `alpha * (x - s)` into a state of magnitude
-  // `|s|`, so it survives only while `alpha * |x - s|` exceeds half an ulp of
-  // `|s|` — a condition on the *product* of coefficient and contrast. At the
-  // finest contrast an `f32` caller can express, one ulp, the boundary therefore
-  // sits at `alpha = 2^-30` and not at the `2^-53`-ish figure unit contrast
-  // suggests: 2^24 times sooner than the `delta / tau > 2^-54` the docs used to
-  // claim unconditionally.
+  // `|s|`, so it survives only while `alpha * |x - s|` clears a small multiple
+  // of `ulp(s)` — a condition on the *product* of coefficient and contrast, not
+  // on `alpha` alone, which is what this test exists to show.
+  //
+  // The `2^-29` / `2^-30` boundary below is this geometry's, NOT the general
+  // one. The seed is `1.0`: a dyadic state at the bottom of a binade, where
+  // `1 - alpha`, `(1 - alpha) * s` and the final sum are all exact, so the
+  // recurrence behaves as one fused correctly-rounded step and absorption sits
+  // at exactly half an ulp. A non-dyadic state pays up to three roundings and
+  // absorbs a step almost three times larger — which is why the published bound
+  // is `4 * ulp(s)` and `alpha > 2^-26`, and why
+  // `cadence_ema_two_rounded_products_absorb_a_step_the_retired_bound_admitted`
+  // has to carry a non-dyadic state to exhibit it. Keep both: this one pins the
+  // product-versus-coefficient shape, that one pins the constant.
   //
   // The observation is `CadenceEmaState`'s `PartialEq`, which compares the
   // retained `f64`. At this contrast every emitted `f32` is the seed on both
@@ -951,6 +1061,192 @@ fn cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone() {
 }
 
 #[test]
+fn cadence_ema_two_rounded_products_absorb_a_step_the_retired_bound_admitted() {
+  // The counterexample that retired the `ulp(s) / 2` absorption bound and its
+  // `alpha > 2^-29` emitted-`f32` corollary. Every retired threshold is cleared
+  // here and the step is *still* absorbed, because the recurrence rounds two
+  // products and their sum rather than taking one fused step. Pinned on the
+  // exact IEEE bits: the emitted `f32` is unchanged whether the step lands or
+  // not, so nothing coarser can witness this.
+  //
+  // The retained state is deliberately non-dyadic. A dyadic one — the `1.0` in
+  // `cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone` —
+  // makes all three roundings exact and cannot exhibit the absorption at all.
+  const TAU: f32 = 536_870_880.0; // 0x4dffffff, the largest f32 below 2^29
+                                  // Spelled as bits: the counterexample is bit-exact, and a decimal literal for
+                                  // it (49_083.347_656_25) is one clippy's `excessive_precision` rewrites.
+  const X: f32 = f32::from_bits(0x473F_BB59);
+  const RETIRED_ALPHA: f64 = 1.0 / 536_870_912.0; // 2^-29
+  const RETIRED_PRODUCT: f64 = 1.0 / 9_007_199_254_740_992.0; // 2^-53
+
+  let cfg = CadenceEma::new(TAU);
+  let seed = |cfg: &CadenceEma| {
+    let mut s = cfg.smoother();
+    for (start, x) in [(0usize, 100_000.0f32), (222_626_350, -50_000.0)] {
+      let _ = s.push(Windowed::new(x, Span::new(start, 1, 1))).unwrap();
+    }
+    s
+  };
+  let mut s = seed(&cfg);
+  let before = retained(&s);
+  assert_eq!(before.to_bits(), 0x40E7_F76B_0747_0000);
+
+  // Every retired threshold is cleared by the push that follows.
+  let alpha = f64::from(cfg.alpha_for(1));
+  assert_eq!(cfg.alpha_for(1).to_bits(), 0x3100_0001);
+  assert!(alpha > RETIRED_ALPHA, "alpha must clear the retired 2^-29");
+  let contrast = (f64::from(X) - before).abs();
+  let rho = contrast / before.abs();
+  assert!(
+    alpha * rho > RETIRED_PRODUCT,
+    "alpha * rho must clear the retired 2^-53: {}",
+    alpha * rho
+  );
+  // Including the corollary's threshold: half an `f32` ulp at this magnitude is
+  // 0.001953125, so this is a contrast the emitted `f32` can express.
+  assert!(
+    contrast >= 0.001_953_125,
+    "contrast {contrast} is expressible"
+  );
+
+  // And the state does not move — bit for bit, and permanently, the absorbed
+  // state being a fixed point of its own map.
+  let out = s
+    .push(Windowed::new(X, Span::new(222_626_351, 1, 1)))
+    .unwrap();
+  assert_eq!(
+    retained(&s).to_bits(),
+    before.to_bits(),
+    "the unit step must be absorbed exactly"
+  );
+  assert_eq!(out.value.to_bits(), 0x473F_BB58);
+  for k in 0..64 {
+    let _ = s
+      .push(Windowed::new(X, Span::new(222_626_352 + k, 1, 1)))
+      .unwrap();
+  }
+  assert_eq!(
+    retained(&s).to_bits(),
+    before.to_bits(),
+    "and stay absorbed for every further unit push"
+  );
+
+  // The published bound excludes it, with room: the step is under one ulp of
+  // the state, well inside the `4 * ulp(s)` the docs now promise, and above the
+  // half-ulp the retired bound promised.
+  let step = alpha * contrast;
+  let ulp = ulp64(before);
+  assert!(
+    step < 4.0 * ulp,
+    "step {step} is inside the published bound"
+  );
+  assert!(step > 0.5 * ulp, "and outside the retired half-ulp one");
+
+  // The invariance break itself: the same 16 elements taken as one coarser hop
+  // carry 16x the coefficient and are not absorbed. Same signal, same tau, same
+  // elapsed distance, two cadences, two retained states.
+  let mut coarse = seed(&cfg);
+  let _ = coarse
+    .push(Windowed::new(X, Span::new(222_626_366, 1, 1)))
+    .unwrap();
+  assert_ne!(
+    retained(&coarse).to_bits(),
+    before.to_bits(),
+    "the coarse partition over the same elements must still move"
+  );
+}
+
+#[test]
+fn cadence_ema_published_absorption_bound_survives_a_randomized_sweep() {
+  // The published bound, enforced rather than described: a step above
+  // `4 * ulp(s)` must leave the retained `f64` different, and a contrast the
+  // emitted `f32` can express must do so whenever `alpha` clears `2^-26`.
+  //
+  // States are built with full 52-bit mantissas at exponents spanning the
+  // useful range, and `x` is engineered to straddle the bar — the geometry the
+  // three retired bounds were never searched against.
+  const PUBLISHED_ULPS: f64 = 4.0;
+  const COROLLARY_ALPHA: f64 = 1.0 / 67_108_864.0; // 2^-26
+
+  let mut rng: u64 = 0x243F_6A88_85A3_08D3;
+  let mut enforced = 0u32;
+  let mut corollary = 0u32;
+
+  for _ in 0..3_000 {
+    // A `tau` spanning the whole validated range, and a cadence to match.
+    let exp = (xorshift(&mut rng) % 41) as i32;
+    let tau = libm::ldexpf(1.0 + next_unit(&mut rng), exp);
+    let delta = 1 + (xorshift(&mut rng) % 64) as usize;
+    let cfg = CadenceEma::new(tau);
+    let alpha = f64::from(cfg.alpha_for(delta));
+    // A saturated or vanished coefficient has no absorption boundary to probe.
+    if alpha.is_nan() || alpha <= 0.0 || alpha >= 1.0 {
+      continue;
+    }
+
+    // A non-dyadic retained state: full mantissa, random sign and exponent.
+    let bits = xorshift(&mut rng);
+    let pexp = ((xorshift(&mut rng) % 60) as i64 - 30 + 1023) as u64;
+    let p = f64::from_bits(((bits >> 63) << 63) | (pexp << 52) | (bits & ((1u64 << 52) - 1)));
+    if !p.is_finite() || p == 0.0 {
+      continue;
+    }
+    let ulp = ulp64(p);
+
+    // Offsets that put the exact step right across the published bar.
+    for i in 0..24u32 {
+      let target = 0.5 + f64::from(i) * 0.5; // 0.5 .. 12 ulp
+      for sign in [1.0f64, -1.0] {
+        let x = (p + sign * target * ulp / alpha) as f32;
+        if !x.is_finite() {
+          continue;
+        }
+        let contrast = (f64::from(x) - p).abs();
+        let step = alpha * contrast;
+        if !step.is_finite() || step == 0.0 {
+          continue;
+        }
+
+        let mut st = CadenceEmaState {
+          tau,
+          prev: Some((0, p)),
+        };
+        let _ = st.push(Windowed::new(x, Span::new(delta, 1, 1))).unwrap();
+        let moved = retained(&st).to_bits() != p.to_bits();
+
+        if step > PUBLISHED_ULPS * ulp {
+          enforced += 1;
+          assert!(
+            moved,
+            "published bound violated: tau {tau} delta {delta} p {p:?} x {x:?} \
+             step {step:?} = {:.4} ulp",
+            step / ulp
+          );
+        }
+        // Half an `f32` ulp at this magnitude is the finest contrast the
+        // emitted value can express.
+        let half_ulp32 = f64::from(ulp32(p as f32)) / 2.0;
+        if alpha > COROLLARY_ALPHA && contrast >= half_ulp32 {
+          corollary += 1;
+          assert!(
+            moved,
+            "corollary violated: alpha {alpha:?} > 2^-26 with an expressible \
+             contrast {contrast:?} on p {p:?} did not move the state"
+          );
+        }
+      }
+    }
+  }
+
+  // Neither arm may pass vacuously.
+  assert!(
+    enforced > 10_000,
+    "too few probes above the bar: {enforced}"
+  );
+  assert!(corollary > 1_000, "too few corollary probes: {corollary}");
+}
+
+#[test]
 fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
   // The narrowed agreement claim. `alpha` is an `f32`, so the retained fraction
   // `1 - alpha` carries an absolute error of about `2^-25`, and that error
@@ -963,13 +1259,12 @@ fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
   // "cadences agree to about an ulp".
   const TAU: f32 = 1024.0;
   // 8 * 2^-25. The worst ratio measured over `tau` 3..10007 and distances
-  // `tau/4`..`12 tau` was 4x; this leaves one binary order of headroom.
+  // `tau/4`..`12 tau` was 2x; this leaves two binary orders of headroom.
   const SWING_ERR: f64 = 8.0 / 33_554_432.0;
-  let cfg = CadenceEma::new(TAU);
-  let n = TAU as usize;
 
   // `x0` at position 0, then a constant `x1` over `d` elements at `hop` cadence.
-  let sampled = |hop: usize, d: usize, x0: f32, x1: f32| -> f32 {
+  let sampled = |tau: f32, hop: usize, d: usize, x0: f32, x1: f32| -> f32 {
+    let cfg = CadenceEma::new(tau);
     let mut samples: Vec<(usize, f32)> = vec![(0, x0)];
     let mut p = 0usize;
     while p + hop <= d {
@@ -979,82 +1274,171 @@ fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
     drive(&cfg, &cadence_seq(&samples)).last().unwrap().value
   };
 
-  for mult in [1usize, 2, 4, 8, 12] {
-    let d = n * mult;
+  // The absolute bound, over the `tau` range and distances the claim names —
+  // not at one `tau`, which is all this used to check and which cannot enforce
+  // a statement quantified over a range.
+  for tau in [3.0f32, 7.0, 17.5, 64.0, 251.0, 1024.0, 4093.0, 10007.0] {
+    let n = tau as usize;
+    for mult in [1usize, 2, 4, 8, 12] {
+      let d = n * mult;
+      for (x0, x1) in [(0.0f32, 1.0f32), (1.0, 0.0), (-1.0, 1.0), (2.0, -2.0)] {
+        let fine = sampled(tau, 1, d, x0, x1);
+        let coarse = sampled(tau, d, d, x0, x1);
+        let bound = SWING_ERR * f64::from(x1 - x0).abs();
+        assert!(
+          (f64::from(fine) - f64::from(coarse)).abs() <= bound,
+          "tau {tau}, d/tau {mult}, {x0} -> {x1}: |{fine} - {coarse}| exceeds {bound}"
+        );
+      }
+    }
+  }
+  // The quarter-tau distance the claim also names, kept separate because
+  // `n * mult` cannot express it.
+  for tau in [64.0f32, 1024.0, 10007.0] {
+    let d = (tau as usize) / 4;
     for (x0, x1) in [(0.0f32, 1.0f32), (1.0, 0.0)] {
-      let fine = sampled(1, d, x0, x1);
-      let coarse = sampled(d, d, x0, x1);
+      let fine = sampled(tau, 1, d, x0, x1);
+      let coarse = sampled(tau, d, d, x0, x1);
       let bound = SWING_ERR * f64::from(x1 - x0).abs();
       assert!(
         (f64::from(fine) - f64::from(coarse)).abs() <= bound,
-        "d/tau {mult}, {x0} -> {x1}: |{fine} - {coarse}| exceeds {bound}"
+        "tau {tau}, d = tau/4, {x0} -> {x1}: |{fine} - {coarse}| exceeds {bound}"
       );
     }
   }
 
-  // The same absolute agreement in ulps of the result, at both ends.
-  let ulps = |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+  let n = TAU as usize;
+  let sampled = |hop: usize, d: usize, x0: f32, x1: f32| sampled(TAU, hop, d, x0, x1);
+
+  // The same absolute agreement in ulps of the result, at both ends. The
+  // rising direction happens to agree to an ulp at this `tau`; that is a
+  // property of this geometry, NOT the general one-tau bound — the falling
+  // direction reaches 2 ulps at `tau = 238`, which
+  // `cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one`
+  // measures across the range.
   let (fine, coarse) = (sampled(1, n, 0.0, 1.0), sampled(n, n, 0.0, 1.0));
   assert!(
-    ulps(fine, coarse) <= 1,
-    "a result of order the swing must agree to an ulp: {fine} vs {coarse}"
+    ulps32(fine, coarse).abs() <= 1,
+    "a result of order the swing must agree to an ulp here: {fine} vs {coarse}"
   );
+  // At `d / tau = 12` the residual is exponentially smaller than the error, so
+  // the same absolute agreement reads as ~10^4 ulps. Bounded on BOTH sides: a
+  // bare `> 1_000` would also admit 10^6 and so could not enforce the figure
+  // the docs quote (measured 10833..10865 over `tau` 3..10007).
   let d = n * 12;
   let (fine, coarse) = (sampled(1, d, 1.0, 0.0), sampled(d, d, 1.0, 0.0));
+  let apart = ulps32(fine, coarse).abs();
   assert!(
-    ulps(fine, coarse) > 1_000,
-    "a residual decayed by 12 tau must NOT agree to an ulp: {fine} vs {coarse}"
+    (5_000..=20_000).contains(&apart),
+    "a residual decayed by 12 tau must be ~10^4 ulps apart, got {apart}: {fine} vs {coarse}"
   );
 }
 
-#[test]
-fn cadence_ema_falling_step_decays_by_one_over_e_over_one_tau() {
-  // The defining decay, over the full time constant, at the cadence where the
-  // per-step coefficient is smaller than the state's own resolution: a unit
-  // cadence must reach `exp(-1)` after `tau` elements exactly as a single
-  // `delta = tau` step does.
-  //
-  // The horizon is forced, not chosen: absorption at `delta = 1` needs an
-  // `alpha` of `2^-25` or below, so covering one `tau` at that cadence always
-  // costs at least `2^25` pushes. The sequence is therefore driven push by push
-  // rather than materialized — forty million `Windowed`s would be gigabytes.
-  let tau = 4e7f32;
-  let n = tau as usize;
-  let cfg = CadenceEma::new(tau);
-
+/// Drive a falling unit cadence from a seed of `1.0` over `n` elements, push by
+/// push rather than materialized: one `tau` at a unit cadence can run to tens of
+/// millions of pushes, and that many `Windowed`s would be gigabytes.
+fn one_tau_fine(cfg: &CadenceEma, n: usize) -> f32 {
   let mut s = cfg.smoother();
-  let mut fine = s
+  let mut out = s
     .push(Windowed::new(1.0, Span::new(0, 1, 1)))
     .unwrap()
     .value;
-  assert_eq!(fine, 1.0, "seed must be s_0 = x_0");
+  assert_eq!(out, 1.0, "seed must be s_0 = x_0");
   for p in 1..=n {
-    fine = s
+    out = s
       .push(Windowed::new(0.0, Span::new(p, 1, 1)))
       .unwrap()
       .value;
   }
+  out
+}
 
-  // One coarse step over the same elapsed distance: `alpha = 1 - exp(-1)`, so
-  // `(1 - alpha) * 1.0 = exp(-1)` directly.
-  let coarse = drive(&cfg, &cadence_seq(&[(0, 1.0), (n, 0.0)]))
+/// The same elapsed distance taken as a single `delta = n` step.
+fn one_tau_coarse(cfg: &CadenceEma, n: usize) -> f32 {
+  drive(cfg, &cadence_seq(&[(0, 1.0), (n, 0.0)]))
     .last()
     .unwrap()
-    .value;
+    .value
+}
 
-  let want = 1.0 / core::f64::consts::E; // 0.36787944...
-  assert!(
-    (f64::from(fine) - want).abs() <= 1e-6,
-    "unit cadence over one tau: {fine} vs 1/e {want}"
-  );
-  assert!(
-    (f64::from(coarse) - want).abs() <= 1e-6,
-    "single tau-sized step: {coarse} vs 1/e {want}"
-  );
-  assert!(
-    (fine - coarse).abs() <= 1e-6,
-    "cadences must agree over one tau: fine {fine} vs coarse {coarse}"
-  );
+#[test]
+fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
+  // The defining decay, over the full time constant: a unit cadence must reach
+  // `exp(-1)` after `tau` elements much as a single `delta = tau` step does.
+  //
+  // "Much as", not "to an ulp". The claim this replaces said the two land on
+  // `exp(-1)` *within one* ulp, and was enforced by a `1e-6` tolerance — over
+  // 33 ulps at this magnitude, so slack enough to admit any of the answers
+  // below. The measured worst case over every integer `tau` from 2 to 40000
+  // plus sampled fractional `tau` to 4e7 is 2 ulps from `exp(-1)` and 3 ulps
+  // between the cadences; `4` is the conservative figure published, and is what
+  // this sweep enforces, in exact representable steps rather than a tolerance.
+  const BOUND: i64 = 4;
+  let inv_e = (1.0f64 / core::f64::consts::E) as f32;
+  assert_eq!(inv_e.to_bits(), 0x3EBC_5AB2, "nearest f32 to exp(-1)");
+
+  // The two exact witnesses that falsify "within one": both land two
+  // representable values below `exp(-1)`, and two below the coarse step.
+  for tau in [14usize, 238] {
+    let cfg = CadenceEma::new(tau as f32);
+    let fine = one_tau_fine(&cfg, tau);
+    let coarse = one_tau_coarse(&cfg, tau);
+    assert_eq!(fine.to_bits(), 0x3EBC_5AB0, "tau {tau} fine");
+    assert_eq!(coarse.to_bits(), 0x3EBC_5AB2, "tau {tau} coarse");
+    assert_eq!(ulps32(fine, inv_e), -2, "tau {tau} vs exp(-1)");
+    assert_eq!(ulps32(fine, coarse), -2, "tau {tau} fine vs coarse");
+  }
+
+  // Every integer tau across the swept range, plus fractional ones, in exact
+  // ulps. `n = tau` keeps the elapsed distance at exactly one time constant.
+  for tau in 2..=1_024usize {
+    let cfg = CadenceEma::new(tau as f32);
+    let fine = one_tau_fine(&cfg, tau);
+    let coarse = one_tau_coarse(&cfg, tau);
+    assert!(
+      ulps32(fine, inv_e).abs() <= BOUND,
+      "tau {tau}: fine {fine} is {} ulp from exp(-1)",
+      ulps32(fine, inv_e)
+    );
+    assert!(
+      ulps32(fine, coarse).abs() <= BOUND,
+      "tau {tau}: cadences {} ulp apart ({fine} vs {coarse})",
+      ulps32(fine, coarse)
+    );
+  }
+
+  // Fractional taus, where one time constant is not a whole number of elements
+  // and the target is `exp(-n / tau)` rather than `exp(-1)`.
+  let mut rng: u64 = 0xB5AD_4ECE_DA10_1010;
+  for _ in 0..256 {
+    let tau = 2.0 + next_unit(&mut rng) * 1_022.0;
+    let n = tau as usize;
+    let cfg = CadenceEma::new(tau);
+    let fine = one_tau_fine(&cfg, n);
+    let coarse = one_tau_coarse(&cfg, n);
+    let want = libm::exp(-(n as f64) / f64::from(tau)) as f32;
+    assert!(
+      ulps32(fine, want).abs() <= BOUND,
+      "tau {tau}: fine {fine} is {} ulp from exp(-{n}/tau) {want}",
+      ulps32(fine, want)
+    );
+    assert!(
+      ulps32(fine, coarse).abs() <= BOUND,
+      "tau {tau}: cadences {} ulp apart ({fine} vs {coarse})",
+      ulps32(fine, coarse)
+    );
+  }
+
+  // The deep regime the type exists for, kept from the test this replaces: at
+  // `tau = 4e7` the per-step coefficient is smaller than the state's own `f32`
+  // resolution, so covering one `tau` at a unit cadence costs 4e7 pushes and an
+  // `f32` accumulator would not move at all.
+  let cfg = CadenceEma::new(4e7);
+  let n = 4e7f32 as usize;
+  let fine = one_tau_fine(&cfg, n);
+  let coarse = one_tau_coarse(&cfg, n);
+  assert_eq!(ulps32(fine, inv_e), -1, "tau 4e7 vs exp(-1)");
+  assert_eq!(ulps32(fine, coarse), -1, "tau 4e7 fine vs coarse");
 }
 
 #[test]

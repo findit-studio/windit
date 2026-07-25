@@ -373,25 +373,41 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 ///   magnitude `|s|`, so it survives only while
 ///
 ///   ```text
-///   alpha * |x - s|  >  ulp(s) / 2
+///   alpha * |x - s|  >  4 * ulp(s)
 ///   ```
 ///
-///   Below that the push leaves the state bit-identical and that cadence stops
-///   moving for good, however far `alpha` sits above any flat threshold on
-///   `delta / tau` alone. Dividing by `|s|` and writing
-///   the *contrast* `rho = |x - s| / |s|`, an `f64` state makes the condition
-///   `alpha * rho > 2^-53` (`2^-54` at the top of a binade) — a bound on the
-///   product, not on `alpha` alone. Unit contrast recovers `alpha > 2^-53`; a
-///   contrast of one `f32` ulp (`rho = 2^-23`) is already absorbed at
-///   `alpha = 2^-30`, `2^23` times sooner. The guarantee worth relying on is
-///   therefore the one stated over *representable* differences: an `f32`
-///   half-ulp is exactly `2^29` `f64` half-ulps at the same magnitude, so every
-///   difference the emitted `f32` can express still moves the state while
-///   `alpha` stays above `2^-29` (~1.9e-9) — a factor of 64 below `f32`'s
-///   epsilon, reached by a `tau` past about `2^29` (~5.4e8) elements at a unit
-///   cadence. Differences finer than that never reach the output anyway. Two
-///   edges bound the picture: a state of exactly `0.0` has no relative
-///   resolution to lose, so `s = alpha * x` survives whatever `alpha` is; and
+///   Below that the push may leave the state bit-identical, and a cadence
+///   absorbed once is absorbed for good — the state is then a fixed point of
+///   its own map — however far `alpha` sits above any flat threshold on
+///   `delta / tau` alone.
+///
+///   The `4` is not the half-ulp a single correctly-rounded step would give.
+///   The recurrence evaluates two *separately rounded* products and adds them,
+///   so a step is measured against three roundings rather than one: `1 - alpha`,
+///   the product `(1 - alpha) * s`, and the final sum each cost up to half an
+///   ulp of `|s|`, which bounds absorption at `(1.5 + alpha) * ulp(s)`. The
+///   published `4` is deliberately looser than that derivation *and* than
+///   measurement: an adversarial search of ~1.4e9 probes — every `alpha`
+///   exponent, `tau` across its whole validated range, non-dyadic retained
+///   states, binade edges, both signs — found nothing absorbed above
+///   `1.48 * ulp(s)`. The three bounds this one replaces were each derived and
+///   published without such a search, and each was falsified by a case the
+///   derivation did not model.
+///
+///   Dividing by `|s|` and writing the *contrast* `rho = |x - s| / |s|`, an
+///   `f64` state makes the condition `alpha * rho > 2^-50` (`2^-51` at the top
+///   of a binade) — a bound on the product, not on `alpha` alone. Unit contrast
+///   recovers `alpha > 2^-50`; a contrast of one `f32` ulp (`rho = 2^-23`) is
+///   already absorbed at `alpha = 2^-27`, `2^23` times sooner. The guarantee
+///   worth relying on is therefore the one stated over *representable*
+///   differences: an `f32` half-ulp is `2^28` `f64` ulps at the same magnitude,
+///   so every difference the emitted `f32` can express clears the `4 * ulp(s)`
+///   bar — and still moves the state — while `alpha` stays above `2^-26`
+///   (~1.5e-8), a factor of 8 below `f32`'s epsilon, reached by a `tau` past
+///   about `2^26` (~6.7e7) elements at a unit cadence. Differences finer than
+///   that never reach the output anyway. Two edges bound the picture: a state
+///   of exactly `0.0` has no relative resolution to lose, so `s = alpha * x`
+///   survives whatever `alpha` is; and
 ///   `|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input,
 ///   so the state cannot be pushed into `f64`'s subnormals in one step and the
 ///   relative reading of `ulp(s)` is the operative one until a long decay run
@@ -403,9 +419,15 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 ///   input, so two cadences covering the same elapsed distance differ by a small
 ///   multiple of `2^-25 * |x - s_0|` — measured at no more than four times that,
 ///   over `tau` from 3 to 10007 and distances from `tau/4` to `12 tau`. Where the
-///   result is a healthy fraction of that swing this is about an ulp of the
-///   result: a unit cadence and a single `tau`-sized step both land on `exp(-1)`
-///   within one. Where the state has instead decayed by many `tau`, the residual
+///   result is a healthy fraction of that swing this is a *few* ulps of the
+///   result, not one: over one `tau` of elapsed distance a unit cadence lands
+///   within `4` ulps of the nearest `f32` to `exp(-1)`, and within `4` ulps of a
+///   single `tau`-sized step. Measurement puts those at `2` and `3` — the worst
+///   case over every integer `tau` from 2 to 40000 plus sampled fractional `tau`
+///   out to 4e7 — so `4` is again the conservative published figure. `tau = 14`
+///   and `tau = 238` both land exactly two ulps below `exp(-1)`, which is why
+///   the claim is no longer "within one". Where the state has instead decayed
+///   by many `tau`, the residual
 ///   is exponentially smaller than the error, and the same absolute agreement is
 ///   many ulps of that residual — about `2^-25 * exp(delta / tau)` in relative
 ///   terms, which measures at ~10^4 ulps by `delta / tau = 12`. Invariance is to
@@ -537,10 +559,18 @@ impl Smoother<f32> for CadenceEmaState {
         // -> f64 accumulator was three rounds of exactly that), never removes
         // it, since invariance is unachievable in finite precision. The contract
         // is documented instead: see the *Fine cadences* bullet on `CadenceEma`
-        // for the contrast-dependent condition that actually holds. Rearranging
-        // to `prev + alpha * (x - prev)` puts the loss back into an addend, but
-        // is absorbed at the same threshold *and* forfeits exact tracking at
-        // `alpha == 1`, where `prev + (x - prev)` is not `x` for a large `prev`.
+        // for the contrast-dependent condition that actually holds.
+        //
+        // Rearranging to `prev + alpha * (x - prev)` puts the loss back into a
+        // single addend and IS sharper — measured absorption ceilings of
+        // `0.50 * ulp(prev)` against this form's `1.48`, since one rounding
+        // replaces three. It is still declined, because it forfeits exact
+        // tracking at `alpha == 1`: `prev + (x - prev)` returns `0.0`, not `x`,
+        // once `prev` is large enough that `x - prev` rounds to `-prev`
+        // (`cadence_ema_large_gap_forgets_and_washes_infinity_to_nan` pins that
+        // at `prev = 1e30`). Trading a documented three-rounding bound for a
+        // silent loss of the exact-forget edge is the worse deal; the bound is
+        // published conservatively instead.
         //
         // Keeping the algebra means every coefficient edge still falls out of
         // the one expression: `alpha == 1` gives `1 * x + 0 * prev`, which
