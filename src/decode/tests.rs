@@ -4,8 +4,11 @@ use super::Decoder;
 use crate::{
   error::WinditError,
   plan::Span,
-  segment::{Gate, GatePolicy, Hysteresis, Range, SegmentOptions, Threshold, ThresholdState},
-  smooth::{Ema, EmaState, Identity, SmoothPolicy, Smoother},
+  segment::{
+    Dwell, Gate, GatePolicy, Hangover, Hysteresis, Range, SegmentOptions, Threshold,
+    ThresholdState, Vote,
+  },
+  smooth::{CadenceEma, Ema, EmaState, Identity, SmoothPolicy, Smoother},
   windowed::Windowed,
 };
 
@@ -171,9 +174,9 @@ fn parity_grid_p2_policies() {
     for &(hop, len, window) in &GEOMETRIES {
       let seq = windows(pattern, hop, len, window);
       for opts in options_grid() {
-        // The P2 policy grid: {Identity, Ema} x {Threshold, Hysteresis}. T5
-        // extends this grid to the P3 policies (CadenceEma, Vote, Dwell,
-        // Hangover, and the canonical nesting).
+        // The P2 policy grid: {Identity, Ema} x {Threshold, Hysteresis}. The P3
+        // policies (CadenceEma, Vote, Dwell, Hangover, and the canonical nesting)
+        // get the parallel `parity_grid_p3_policies`.
         assert_parity(&Identity::new(), &Threshold::new(0.5), opts, &seq);
         assert_parity(&Ema::new(0.5), &Threshold::new(0.5), opts, &seq);
         assert_parity(&Identity::new(), &Hysteresis::new(0.6, 0.3), opts, &seq);
@@ -203,6 +206,141 @@ fn parity_randomized_with_non_finite() {
       1 => assert_parity(&Ema::new(alpha), &Threshold::new(thr), opts, &seq),
       2 => assert_parity(&Identity::new(), &Hysteresis::new(on, off), opts, &seq),
       _ => assert_parity(&Ema::new(alpha), &Hysteresis::new(on, off), opts, &seq),
+    }
+  }
+}
+
+/// A valid N-of-M vote configuration drawn from the generator: `1 <= need <= of
+/// <= 64`, the exact admissible range `Vote::try_new` enforces, so construction
+/// never panics on a generated pair.
+fn random_vote(state: &mut u64) -> (usize, usize) {
+  let of = 1 + (xorshift(state) % 64) as usize; // 1..=64
+  let need = 1 + (xorshift(state) % of as u64) as usize; // 1..=of
+  (need, of)
+}
+
+/// Assert end-to-end parity for one gate policy against a randomly chosen
+/// smoother — the smoother axis of the P3 grid. Including `CadenceEma` here
+/// threads its span-derived coefficient through both the streaming and the batch
+/// path, so the differential covers a span-reading smoother, not just the
+/// value-only `Identity`/`Ema`.
+fn parity_random_smoother<CG: GatePolicy<f32>>(
+  state: &mut u64,
+  cg: &CG,
+  opts: SegmentOptions,
+  seq: &[Windowed<f32>],
+) {
+  match xorshift(state) % 3 {
+    0 => assert_parity(&Identity::new(), cg, opts, seq),
+    1 => assert_parity(&Ema::new(next_unit(state)), cg, opts, seq),
+    // tau in [1, 21): finite and positive, so `CadenceEma::new` never panics.
+    _ => assert_parity(
+      &CadenceEma::new(1.0 + next_unit(state) * 20.0),
+      cg,
+      opts,
+      seq,
+    ),
+  }
+}
+
+#[test]
+fn parity_grid_p3_policies() {
+  // The full P3 policy grid: {Identity, Ema, CadenceEma} smoothers x {Threshold,
+  // Hysteresis, Vote, Dwell(.), Hangover(.), Hangover(Dwell(Vote))} gates — the
+  // last the canonical onset-confirm-then-release nesting.
+  // Streaming must equal the batch composition on BOTH planes for every cell,
+  // over the same pattern/geometry/options grid the P2 oracle uses. The equality
+  // is by construction (one core, two drivers); this pins it against any future
+  // reordering of the pipeline or drift in a P3 state machine.
+  let patterns: [&[f32]; 6] = [
+    &[],
+    &[0.9],
+    &[0.1, 0.9, 0.9, 0.1, 0.9],
+    &[0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+    &[0.1, 0.1, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.1],
+    &[0.9, 0.1, 0.9, 0.1, 0.9, 0.1, 0.9],
+  ];
+
+  // Every gate config is exercised against all three smoothers at the current
+  // `opts`/`seq`. Each gate config is `Copy`, so binding it once and referencing
+  // it three times re-runs no construction.
+  macro_rules! all_smoothers {
+    ($gate:expr, $opts:expr, $seq:expr) => {{
+      let g = $gate;
+      assert_parity(&Identity::new(), &g, $opts, $seq);
+      assert_parity(&Ema::new(0.5), &g, $opts, $seq);
+      assert_parity(&CadenceEma::new(6.0), &g, $opts, $seq);
+    }};
+  }
+
+  for pattern in patterns {
+    for &(hop, len, window) in &GEOMETRIES {
+      let seq = windows(pattern, hop, len, window);
+      for opts in options_grid() {
+        all_smoothers!(Threshold::new(0.5), opts, &seq);
+        all_smoothers!(Hysteresis::new(0.6, 0.3), opts, &seq);
+        all_smoothers!(Vote::new(2, 3, 0.5), opts, &seq);
+        all_smoothers!(Dwell::new(Threshold::new(0.5), 2), opts, &seq);
+        all_smoothers!(Hangover::new(Threshold::new(0.5), 3), opts, &seq);
+        all_smoothers!(
+          Hangover::new(Dwell::new(Vote::new(2, 3, 0.5), 2), 3),
+          opts,
+          &seq
+        );
+      }
+    }
+  }
+}
+
+#[test]
+fn parity_randomized_p3_policies() {
+  // 200 randomized cases over the P3 gate family (random valid parameters) x a
+  // random smoother, with non-finite score injection. A distinct seed from the P2
+  // randomized run so the two cover disjoint sequences.
+  let mut state = 0xdece_a5ed_600d_c0deu64;
+  for _ in 0..200 {
+    let len = (xorshift(&mut state) % 32) as usize;
+    let scores: Vec<f32> = (0..len).map(|_| random_score(&mut state)).collect();
+    let (hop, span_len, window) = GEOMETRIES[(xorshift(&mut state) % 4) as usize];
+    let seq = windows(&scores, hop, span_len, window);
+    let opts = SegmentOptions::new()
+      .with_min_len((xorshift(&mut state) % 6) as usize)
+      .with_merge_gap((xorshift(&mut state) % 8) as usize);
+    let thr = next_unit(&mut state);
+    let on = next_unit(&mut state);
+    let off = next_unit(&mut state);
+    // Small element-denominated delays, so activation is reachable on the short
+    // (<= 31-window) sequences rather than always suppressed.
+    let confirm = (xorshift(&mut state) % 10) as usize;
+    let hold = (xorshift(&mut state) % 10) as usize;
+    match xorshift(&mut state) % 6 {
+      0 => parity_random_smoother(&mut state, &Threshold::new(thr), opts, &seq),
+      1 => parity_random_smoother(&mut state, &Hysteresis::new(on, off), opts, &seq),
+      2 => {
+        let (need, of) = random_vote(&mut state);
+        parity_random_smoother(&mut state, &Vote::new(need, of, thr), opts, &seq);
+      }
+      3 => parity_random_smoother(
+        &mut state,
+        &Dwell::new(Threshold::new(thr), confirm),
+        opts,
+        &seq,
+      ),
+      4 => parity_random_smoother(
+        &mut state,
+        &Hangover::new(Threshold::new(thr), hold),
+        opts,
+        &seq,
+      ),
+      _ => {
+        let (need, of) = random_vote(&mut state);
+        parity_random_smoother(
+          &mut state,
+          &Hangover::new(Dwell::new(Vote::new(need, of, thr), confirm), hold),
+          opts,
+          &seq,
+        );
+      }
     }
   }
 }
