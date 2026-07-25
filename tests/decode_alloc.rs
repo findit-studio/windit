@@ -145,6 +145,9 @@ fn decoder_drive_does_not_allocate_and_state_sizes_are_pinned() {
   // The usize-carrying states are pinned on 64-bit, where `usize` is eight bytes.
   #[cfg(target_pointer_width = "64")]
   {
+    // Unchanged by the f64 accumulator: `Option<(usize, f64)>` is the same 24
+    // bytes `Option<(usize, f32)>` was, the wider payload riding in the padding
+    // the 8-byte alignment already forced.
     assert_eq!(size_of::<CadenceEmaState>(), 32);
     assert_eq!(align_of::<CadenceEmaState>(), 8);
     // `DwellState` carries its run as `(origin, coverage horizon)`: one word

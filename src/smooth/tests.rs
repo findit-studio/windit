@@ -506,6 +506,17 @@ fn cadence_ema_large_gap_forgets_and_washes_infinity_to_nan() {
   let out = drive(&cfg, &cadence_seq(&[(0, 0.5), (10_000_000, 0.9)]));
   assert_eq!(out[1].value, 0.9, "large gap must track the input exactly");
 
+  // Exactness is a property of the recurrence, not of a conveniently small
+  // prior state: with `alpha` exactly 1.0, `1 * x + 0 * prev` is `x` however
+  // far away `prev` is. This pins the product form specifically — the
+  // increment-shaped rewrite `prev + alpha * (x - prev)`, which absorbs the
+  // sub-ulp decay just as an f32 accumulator does, returns `0.0` here.
+  let out = drive(&cfg, &cadence_seq(&[(0, 1e30), (10_000_000, 0.9)]));
+  assert_eq!(
+    out[1].value, 0.9,
+    "exact tracking must not depend on the prior state's magnitude"
+  );
+
   // With alpha exactly 1.0, `1 - alpha` is exactly 0.0, and `0.0 * inf = NaN`
   // washes a finite-tracking step over an infinite prior state to NaN.
   let out = drive(&cfg, &cadence_seq(&[(0, f32::INFINITY), (10_000_000, 0.9)]));
@@ -699,6 +710,13 @@ fn cadence_ema_is_cadence_invariant_below_f32_epsilon() {
   // regime where a `1 - expf` coefficient collapses to zero and pins the fine
   // sampling to its seed for the whole horizon while the coarse samplings of
   // the same signal move normally.
+  //
+  // This geometry rises from a seed of `0.0`, so it constrains the
+  // *coefficient* and only weakly the accumulator: the running state stays
+  // near zero, where an ulp is minute and every increment lands. The falling
+  // counterpart — `cadence_ema_is_cadence_invariant_on_a_falling_step` — is
+  // the one that constrains the accumulator, and the two must be kept as a
+  // pair; a rising-only invariance test cannot fail on state precision.
   const N: usize = 40_000;
   let tau = 4e7f32;
   let cfg = CadenceEma::new(tau);
@@ -733,6 +751,104 @@ fn cadence_ema_is_cadence_invariant_below_f32_epsilon() {
 }
 
 #[test]
+fn cadence_ema_is_cadence_invariant_on_a_falling_step() {
+  // The mirror of the rising invariance test above, and the geometry that
+  // constrains the *accumulator* rather than the coefficient: the same signal
+  // sampled at three cadences, but falling from a seed of `1.0` toward `0.0`.
+  //
+  // At `tau = 4e7` a unit cadence has `alpha = 2.5e-8`, below half an ulp of a
+  // state near 1.0 (`2^-25` ~ 2.98e-8). A recurrence that carries its state in
+  // f32 therefore rounds `1 - alpha` to exactly `1.0`, subtracts nothing, and
+  // leaves the fine cadence pinned at its seed forever — 1.0 against the
+  // ~0.9990005 the coarse cadence reaches over the same elapsed distance —
+  // while the rising geometry above passes, because a state near zero has ulps
+  // far smaller than its increments. Neither the `expm1f` coefficient nor any
+  // other algebraic form of the recurrence lifts this; only accumulator
+  // precision does.
+  const N: usize = 40_000;
+  let tau = 4e7f32;
+  let cfg = CadenceEma::new(tau);
+
+  // Seed 1.0 at position 0, then a constant 0.0 over the next `N` elements.
+  let sampled = |hop: usize| -> f32 {
+    let mut samples: Vec<(usize, f32)> = vec![(0, 1.0)];
+    let mut p = 0usize;
+    while p + hop <= N {
+      p += hop;
+      samples.push((p, 0.0));
+    }
+    drive(&cfg, &cadence_seq(&samples)).last().unwrap().value
+  };
+  let fine = sampled(1);
+  let mid = sampled(100);
+  let coarse = sampled(N);
+
+  // The decay at the shared endpoint, in f64 — an independent precision path,
+  // not the recurrence under test.
+  let want = libm::exp(-(N as f64) / f64::from(tau));
+  for (name, got) in [("fine", fine), ("mid", mid), ("coarse", coarse)] {
+    assert!(
+      (f64::from(got) - want).abs() <= 1e-6,
+      "{name} cadence: {got} vs closed form {want}"
+    );
+  }
+  assert!(
+    (fine - coarse).abs() <= 1e-6 && (fine - mid).abs() <= 1e-6,
+    "cadences must agree: fine {fine} mid {mid} coarse {coarse}"
+  );
+}
+
+#[test]
+fn cadence_ema_falling_step_decays_by_one_over_e_over_one_tau() {
+  // The defining decay, over the full time constant, at the cadence where the
+  // per-step coefficient is smaller than the state's own resolution: a unit
+  // cadence must reach `exp(-1)` after `tau` elements exactly as a single
+  // `delta = tau` step does.
+  //
+  // The horizon is forced, not chosen: absorption at `delta = 1` needs an
+  // `alpha` of `2^-25` or below, so covering one `tau` at that cadence always
+  // costs at least `2^25` pushes. The sequence is therefore driven push by push
+  // rather than materialized — forty million `Windowed`s would be gigabytes.
+  let tau = 4e7f32;
+  let n = tau as usize;
+  let cfg = CadenceEma::new(tau);
+
+  let mut s = cfg.smoother();
+  let mut fine = s
+    .push(Windowed::new(1.0, Span::new(0, 1, 1)))
+    .unwrap()
+    .value;
+  assert_eq!(fine, 1.0, "seed must be s_0 = x_0");
+  for p in 1..=n {
+    fine = s
+      .push(Windowed::new(0.0, Span::new(p, 1, 1)))
+      .unwrap()
+      .value;
+  }
+
+  // One coarse step over the same elapsed distance: `alpha = 1 - exp(-1)`, so
+  // `(1 - alpha) * 1.0 = exp(-1)` directly.
+  let coarse = drive(&cfg, &cadence_seq(&[(0, 1.0), (n, 0.0)]))
+    .last()
+    .unwrap()
+    .value;
+
+  let want = 1.0 / core::f64::consts::E; // 0.36787944...
+  assert!(
+    (f64::from(fine) - want).abs() <= 1e-6,
+    "unit cadence over one tau: {fine} vs 1/e {want}"
+  );
+  assert!(
+    (f64::from(coarse) - want).abs() <= 1e-6,
+    "single tau-sized step: {coarse} vs 1/e {want}"
+  );
+  assert!(
+    (fine - coarse).abs() <= 1e-6,
+    "cadences must agree over one tau: fine {fine} vs coarse {coarse}"
+  );
+}
+
+#[test]
 fn cadence_ema_matches_f64_zoh_reference_at_sub_epsilon_cadence() {
   // The differential below bounds `delta / tau` under 88 to keep `expf` off its
   // large-end underflow; that bound also keeps it clear of the *small* end,
@@ -740,11 +856,12 @@ fn cadence_ema_matches_f64_zoh_reference_at_sub_epsilon_cadence() {
   // above the cadence, over a horizon long enough that the per-step coefficient
   // accumulates into a visible response.
   //
-  // The seed is `0.0` and the horizon covers only a few thousandths of `tau`,
-  // so the running state stays near zero. That keeps the comparison a statement
-  // about the *coefficient*: an f32 accumulator of magnitude `m` cannot record
-  // a step smaller than half an ulp of `m`, an absorption limit no coefficient
-  // formulation can lift, and a seed of order 1 would hit it first.
+  // The seed is `1.0`, deliberately: a state of order 1 is where an f32
+  // accumulator of magnitude `m` fails to record a step smaller than half an
+  // ulp of `m`, so seeding there makes this differential a statement about the
+  // *accumulator* as well as the coefficient. A seed of `0.0` would keep the
+  // running state near zero, where ulps are minute, and could not distinguish
+  // the two.
   let mut state: u64 = 0x5DEE_CE66_D1B5_4A32;
   for _ in 0..4 {
     // tau in [3.5e7, 4e7) at a unit cadence: `delta / tau` is about 2.6e-8,
@@ -752,7 +869,7 @@ fn cadence_ema_matches_f64_zoh_reference_at_sub_epsilon_cadence() {
     let tau = 3.5e7 + next_unit(&mut state) * 5e6;
     let n = 50_000 + (xorshift(&mut state) % 20_000) as usize;
     let mut samples: Vec<(usize, f32)> = Vec::with_capacity(n);
-    let mut level = 0.0f32;
+    let mut level = 1.0f32;
     for p in 0..n {
       if p != 0 && p.is_multiple_of(10_000) {
         level = next_unit(&mut state);
