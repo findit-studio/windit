@@ -37,8 +37,8 @@ use windit::{
   decode::{Decoder, Step},
   plan::Span,
   segment::{
-    Dwell, DwellState, GatePolicy, Hangover, HangoverState, Range, SegmentOptions, ThresholdState,
-    Vote, VoteState,
+    Dwell, DwellState, GatePolicy, Hangover, HangoverState, Range, SegmentOptions, Segmenter,
+    ThresholdState, Vote, VoteState,
   },
   smooth::{CadenceEma, CadenceEmaState, SmoothPolicy},
   windowed::Windowed,
@@ -156,6 +156,12 @@ fn decoder_drive_does_not_allocate_and_state_sizes_are_pinned() {
     assert_eq!(size_of::<HangoverState<ThresholdState>>(), 48);
     assert_eq!(size_of::<Step>(), 32);
     assert_eq!(align_of::<Step>(), 8);
+    // The `Segmenter`'s own O(1) bound, which its type doc states as a number:
+    // `opts` plus the open run, the pending accumulator, and the last start.
+    // Unaffected by `merge_gap` — an unbounded one widens `pending`, never the
+    // state — which is the point of pinning it here.
+    assert_eq!(size_of::<Segmenter>(), 80);
+    assert_eq!(align_of::<Segmenter>(), 8);
     // The whole pipeline the drive below runs: CadenceEma smoother, the canonical
     // gate nesting, and the segmenter, all held inline.
     assert_eq!(
