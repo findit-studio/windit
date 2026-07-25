@@ -86,7 +86,9 @@ own by implementing the trait.
   in `(0, CadenceEma::MAX_TAU]` (`2^26 - 4` elements, over a week of audio at a
   10 ms hop): the ceiling is where the per-step coefficient stops clearing the
   bar its accuracy guarantees rest on, so the domain it accepts is exactly the
-  domain those guarantees hold over.
+  domain those guarantees hold over. That is an accuracy boundary, not a liveness
+  one — the first rejected `tau` still moves the state, it just lands on the bar
+  instead of above it.
 - **segment** — gate a windowed score sequence into a binary decision, then reduce
   it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff),
   [`Hysteresis`] (latching two-threshold), and [`Vote`] (N-of-M over recent

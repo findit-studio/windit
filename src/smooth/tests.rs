@@ -957,6 +957,126 @@ fn cadence_ema_max_tau_is_the_exact_coefficient_boundary() {
 }
 
 #[test]
+fn cadence_ema_rejected_tau_still_filters_and_the_freeze_is_28_orders_further_out() {
+  // The ceiling's rationale, made falsifiable rather than merely worded. It was
+  // published for a while as "a `tau` past the ceiling names a filter that
+  // cannot move at a unit cadence, which is a silent no-op" — and the very first
+  // rejected value refutes that: `tau = 2^26` applies exactly `2^-26` per unit
+  // step and the state moves by it. The ceiling is an ACCURACY boundary (the
+  // coefficient lands *on* the `4 * ulp(s)` bar instead of above it); the regime
+  // where a filter really stops moving is 28 binary orders further out and
+  // depends on the state as much as on `tau`. Both halves are pinned here so
+  // the two can never be conflated again.
+  let first_rejected = next_up32(CadenceEma::MAX_TAU);
+  assert_eq!(first_rejected, 67_108_864.0, "2^26");
+  assert_eq!(
+    CadenceEma::try_new(first_rejected),
+    Err(WinditError::TimeConstantOutOfRange),
+    "and it is rejected"
+  );
+
+  // Its unit coefficient is not zero and not below the floor: it is exactly on
+  // it, which is the whole of what the rejection is about. At a state of `1.0`
+  // the finest contrast the emitted `f32` can express is half an `f32` ulp, and
+  // the step that contrast produces is exactly the published `4 * ulp(s)` —
+  // level with the bar, where `MAX_TAU` clears it by the one `f32` ulp that
+  // separates the two configurations.
+  let alpha = cadence_alpha(first_rejected, 1);
+  assert_eq!(alpha.to_bits(), ALPHA_FLOOR.to_bits(), "exactly 2^-26");
+  let half_ulp32 = f64::from(ulp32(1.0)) / 2.0;
+  assert_eq!(
+    f64::from(alpha) * half_ulp32,
+    PUBLISHED_ABSORPTION_ULPS * ulp64(1.0),
+    "the first rejected tau lands exactly ON the absorption bar"
+  );
+  assert!(
+    f64::from(cadence_alpha(CadenceEma::MAX_TAU, 1)) * half_ulp32
+      > PUBLISHED_ABSORPTION_ULPS * ulp64(1.0),
+    "while the ceiling itself stays above it"
+  );
+
+  // Not a no-op, and not frozen. Driven through the state directly, since the
+  // configuration is — correctly — unconstructible.
+  let mut from_zero = CadenceEmaState {
+    tau: first_rejected,
+    prev: Some((0, 0.0)),
+  };
+  let out = from_zero
+    .push(Windowed::new(1.0, Span::new(1, 1, 1)))
+    .unwrap();
+  assert_eq!(
+    retained(&from_zero),
+    libm::ldexp(1.0, -26),
+    "one unit push must move a zero state to exactly 2^-26"
+  );
+  assert_eq!(out.value, libm::ldexpf(1.0, -26), "and the output shows it");
+  for k in 2..=100usize {
+    let _ = from_zero
+      .push(Windowed::new(1.0, Span::new(k, 1, 1)))
+      .unwrap();
+  }
+  assert!(
+    retained(&from_zero) > 99.0 * libm::ldexp(1.0, -26),
+    "and it keeps climbing: {:e}",
+    retained(&from_zero)
+  );
+
+  // It decays as well as rises: a state of `1.0` loses exactly `2^-26`.
+  let mut from_one = CadenceEmaState {
+    tau: first_rejected,
+    prev: Some((0, 1.0)),
+  };
+  let _ = from_one
+    .push(Windowed::new(0.0, Span::new(1, 1, 1)))
+    .unwrap();
+  assert_eq!(
+    retained(&from_one),
+    1.0 - libm::ldexp(1.0, -26),
+    "and a unit push must decay a state of 1.0 by exactly 2^-26"
+  );
+
+  // The real freeze, 28 binary orders out: at `tau = 2^54` the `f64` `1 - alpha`
+  // is exactly `1.0`, so the recurrence keeps no decay term at all.
+  let frozen_tau = libm::ldexpf(1.0, 54);
+  assert_eq!(
+    1.0 - f64::from(cadence_alpha(frozen_tau, 1)),
+    1.0,
+    "no decay term survives at 2^54"
+  );
+  assert_ne!(
+    1.0 - f64::from(cadence_alpha(libm::ldexpf(1.0, 53), 1)),
+    1.0,
+    "and 2^53 still decays, so 2^54 is the threshold"
+  );
+  let mut held = CadenceEmaState {
+    tau: frozen_tau,
+    prev: Some((0, 1.0)),
+  };
+  for k in 1..=64usize {
+    let _ = held.push(Windowed::new(0.0, Span::new(k, 1, 1))).unwrap();
+  }
+  assert_eq!(
+    retained(&held),
+    1.0,
+    "a state of order 1 is bit-identical forever at 2^54"
+  );
+  // But even there the freeze is a statement about STATES, not about `tau`: a
+  // state of `0.0` has no ulps to absorb the increment and still moves.
+  let mut still_moves = CadenceEmaState {
+    tau: frozen_tau,
+    prev: Some((0, 0.0)),
+  };
+  let _ = still_moves
+    .push(Windowed::new(1.0, Span::new(1, 1, 1)))
+    .unwrap();
+  assert_eq!(
+    retained(&still_moves),
+    libm::ldexp(1.0, -54),
+    "a zero state moves by exactly alpha * x even in the frozen regime"
+  );
+}
+
+#[test]
 fn cadence_ema_smallest_accepted_tau_saturates_to_a_pass_through() {
   // The low edge of the accepted domain. A subnormal `tau` drives `delta / tau`
   // past `expf`'s underflow at every `delta >= 1`, so `alpha` saturates to
@@ -1915,7 +2035,11 @@ fn cadence_ema_coefficient_never_rounds_delta_through_f32() {
 
   // Below the cast boundary the two spellings agree bit for bit at every
   // enumerated `tau`, which is why nothing else on the type moved: the change
-  // is confined to the counts an `f32` cannot hold.
+  // is confined to the counts an `f32` cannot hold. The agreement is a theorem
+  // rather than a lucky sample — `delta` is exactly representable there, so both
+  // round the same quotient of two `f32`s, and `f64` carries more than twice
+  // `f32`'s significand — and this checks the corner of it the rest of the suite
+  // depends on.
   let below: Vec<usize> = (1..=512)
     .chain((1 << 24) - 512..=(1 << 24))
     .chain([1 << 20, 1 << 23, 12_345_678])

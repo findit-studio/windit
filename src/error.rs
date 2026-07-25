@@ -153,9 +153,12 @@ pub enum WinditError {
   /// Neither end has a sane clamp target, so rejection is the only honest total
   /// answer: a NaN, infinite, zero, or negative `tau` has no meaning at all —
   /// `tau = 0` would make an equal-start step compute `0/0` — and a `tau` above
-  /// `CadenceEma::MAX_TAU` derives a per-step coefficient too small to move the
-  /// state at a unit cadence, so it names a silent no-op that no substitute
-  /// value could be said to approximate. Carries no payload: an `f32` field
+  /// `CadenceEma::MAX_TAU` derives a per-step coefficient that no longer clears
+  /// the `2^-26` floor the type's accuracy figures rest on. That puts it outside
+  /// the domain those figures are quantified over rather than making it inert:
+  /// the first rejected `tau` still moves the state, by exactly `2^-26` per unit
+  /// step. No substitute value could be said to approximate the `tau` the caller
+  /// asked for. Carries no payload: an `f32` field
   /// would cost this enum its `Eq` derive, and the caller already holds the
   /// `tau` it passed.
   TimeConstantOutOfRange,

@@ -328,12 +328,23 @@ accepted domain to its edges and fails if the claim is false.
   This is a contract restriction, not a bug fix, and it is what makes the
   accuracy figures on the type true of *everything it admits* rather than of the
   range they were measured over. Unbounded acceptance falsified them at the
-  edges: at `tau = 2^55` the `f64` `1 - alpha` rounds to exactly `1.0`, so a
-  unit cadence cannot move the state at all — a configuration that asks for a
-  filter and silently gets a no-op, while the "within four ulps of `exp(-1)`
-  over one `tau`" figure says otherwise by millions of ulps. Nothing usable is
-  excluded: `2^26` elements is over a week of audio at a 10 ms hop. `CadenceEma`
-  is new in this release, so no published configuration can be affected.
+  edges: at `tau = 2^55` the `f64` `1 - alpha` rounds to exactly `1.0`, so a unit
+  cadence cannot move a state of order `1` at all, while the "within four ulps of
+  `exp(-1)` over one `tau`" figure says otherwise by millions of ulps.
+
+  The ceiling is drawn at the accuracy boundary rather than at that degenerate
+  one, and the two lie 28 binary orders apart. A rejected `tau` is not an inert
+  filter: the first one, `2^26`, applies exactly `2^-26` per unit step, moving a
+  state seeded at `0.0` to exactly `2^-26` and decaying a state of `1.0` by the
+  same amount. It is rejected because that coefficient lands *on* the
+  `4 * ulp(s)` absorption bar instead of above it, so the unconditional
+  statements stop being provable of it — not because it stops moving. Freezing
+  needs both a far larger `tau` (from `2^54`, where the `f64` `1 - alpha` is
+  exactly `1.0` and the recurrence keeps no decay term) and a state large enough
+  to absorb `alpha * x`; a state of `0.0` still moves even there. Nothing usable
+  is excluded: `2^26` elements is over a week of audio at a 10 ms hop.
+  `CadenceEma` is new in this release, so no published configuration can be
+  affected.
 - **Three more `CadenceEma` figures were re-derived against the bounded domain,
   and one `Ema` figure was wrong.** The coefficient floor at `delta = 1` was
   published as `2^-128` (read at `f32::MAX`, which no longer constructs) and is
