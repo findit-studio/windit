@@ -343,7 +343,10 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 /// Because the coefficient tracks the cadence, one `tau` yields the same
 /// smoothing at any hop — regular or irregular — where a bare per-step [`Ema`]
 /// `alpha` does not: the configuration carries no cadence, the data does.
-/// (Lineage: the LiveKit EMA, made cadence-portable.)
+/// That portability is a floating-point property with a floating-point limit,
+/// and it is conditional on the signal, not only on `tau`: the *Fine cadences*
+/// bullet below states the condition. (Lineage: the LiveKit EMA, made
+/// cadence-portable.)
 ///
 /// `tau` is a positive, finite element count; [`new`](CadenceEma::new) and
 /// [`try_new`](CadenceEma::try_new) reject anything else, because there is no
@@ -359,25 +362,54 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 ///   recurrence and not a branch. A non-finite value pushed at `delta = 0` still
 ///   poisons the state, though, since `0.0 * NaN` and `0.0 * inf` are both `NaN`
 ///   — mirroring [`Ema`] at `alpha = 0`.
-/// - **Fine cadences keep their coefficient, and its effect:** the coefficient
-///   is derived in a form that stays exact as `delta / tau` shrinks, so it never
-///   rounds to zero, and the running state is carried in `f64` so a coefficient
-///   below the *state's* own resolution still accumulates instead of being
-///   absorbed. Both are needed: an `f32` accumulator rounds `1 - alpha` to
-///   exactly `1.0` at any `alpha` of `2^-25` or below, which would leave a state
-///   near 1.0 a fixed point and pin a fine cadence to its seed while a coarse
-///   sampling of the same signal decayed normally. The smoothed result is
-///   therefore invariant to how finely the same signal is sampled for as long as
-///   `delta / tau` stays above `2^-54` (~5.6e-17) — about nine orders of
-///   magnitude below f32's epsilon, and reached only by a `tau` past `2^54`
-///   (~1.8e16) elements at a unit cadence. Past that the `f64` accumulator
-///   absorbs the step in its turn and a fine cadence stops moving. Invariance is
-///   to within the resolution of the emitted `f32`, not bit for bit: each output
-///   is the `f64` state rounded to `f32`, and the coefficient itself is an `f32`
-///   whose relative error enters the decay exponent scaled by the elapsed
-///   distance in units of `tau`. Both terms are of order `2^-24`, so cadences
-///   that share a position agree to about an ulp — a unit cadence and a single
-///   `tau`-sized step both land on `exp(-1)` within one.
+/// - **Fine cadences keep their coefficient; whether they keep its *effect*
+///   depends on the signal.** The coefficient is derived in a form that stays
+///   exact as `delta / tau` shrinks, so it never rounds to zero — with a
+///   validated `tau` it cannot fall below about `2^-128` at `delta = 1` — and
+///   the state is carried in `f64` rather than `f32`, which moves the point
+///   where a step is lost 29 binary orders further out. Neither makes cadence
+///   invariance unconditional, and in finite precision nothing can: the step a
+///   push contributes is `alpha * (x - s)` and it is added to a state of
+///   magnitude `|s|`, so it survives only while
+///
+///   ```text
+///   alpha * |x - s|  >  ulp(s) / 2
+///   ```
+///
+///   Below that the push leaves the state bit-identical and that cadence stops
+///   moving for good, however far `alpha` sits above any flat threshold on
+///   `delta / tau` alone. Dividing by `|s|` and writing
+///   the *contrast* `rho = |x - s| / |s|`, an `f64` state makes the condition
+///   `alpha * rho > 2^-53` (`2^-54` at the top of a binade) — a bound on the
+///   product, not on `alpha` alone. Unit contrast recovers `alpha > 2^-53`; a
+///   contrast of one `f32` ulp (`rho = 2^-23`) is already absorbed at
+///   `alpha = 2^-30`, `2^23` times sooner. The guarantee worth relying on is
+///   therefore the one stated over *representable* differences: an `f32`
+///   half-ulp is exactly `2^29` `f64` half-ulps at the same magnitude, so every
+///   difference the emitted `f32` can express still moves the state while
+///   `alpha` stays above `2^-29` (~1.9e-9) — a factor of 64 below `f32`'s
+///   epsilon, reached by a `tau` past about `2^29` (~5.4e8) elements at a unit
+///   cadence. Differences finer than that never reach the output anyway. Two
+///   edges bound the picture: a state of exactly `0.0` has no relative
+///   resolution to lose, so `s = alpha * x` survives whatever `alpha` is; and
+///   `|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input,
+///   so the state cannot be pushed into `f64`'s subnormals in one step and the
+///   relative reading of `ulp(s)` is the operative one until a long decay run
+///   drives the state to a value the emitted `f32` already reports as zero.
+/// - **Cadences agree to about an ulp of the *swing*, not of the result:** each
+///   output is the `f64` state rounded to `f32`, and the coefficient is an
+///   `f32`, so the retained fraction `1 - alpha` is resolved only to an absolute
+///   `2^-25`. That error multiplies the distance between the state and the
+///   input, so two cadences covering the same elapsed distance differ by a small
+///   multiple of `2^-25 * |x - s_0|` — measured at no more than four times that,
+///   over `tau` from 3 to 10007 and distances from `tau/4` to `12 tau`. Where the
+///   result is a healthy fraction of that swing this is about an ulp of the
+///   result: a unit cadence and a single `tau`-sized step both land on `exp(-1)`
+///   within one. Where the state has instead decayed by many `tau`, the residual
+///   is exponentially smaller than the error, and the same absolute agreement is
+///   many ulps of that residual — about `2^-25 * exp(delta / tau)` in relative
+///   terms, which measures at ~10^4 ulps by `delta / tau = 12`. Invariance is to
+///   within the resolution of the emitted `f32`, never bit for bit.
 /// - **Large gaps forget:** once `delta / tau` passes `ln(2^25)` (about 17.33),
 ///   `exp(-delta / tau)` is below half an ulp of 1 and `alpha` is exactly
 ///   `1.0`, so the state tracks the input exactly. Then `1 - alpha` is exactly
@@ -456,9 +488,10 @@ impl CadenceEma {
 /// `(span start, smoothed value)`, unseeded until the first push.
 ///
 /// The retained value is an `f64` while the emitted one is an `f32`, so that a
-/// per-step coefficient below the state's own resolution still accumulates; see
-/// the *Fine cadences* bullet on [`CadenceEma`]. The widening is confined to
-/// this accumulator — `tau` and the coefficient stay `f32`, so
+/// step below the resolution an `f32` state would have had is still recorded —
+/// 29 binary orders further out, not unconditionally; the *Fine cadences* bullet
+/// on [`CadenceEma`] states the condition that survives. The widening is
+/// confined to this accumulator — `tau` and the coefficient stay `f32`, so
 /// [`CadenceEma::alpha_for`] remains the exact coefficient applied.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CadenceEmaState {
@@ -493,15 +526,21 @@ impl Smoother<f32> for CadenceEmaState {
         // streaming state cannot drift.
         //
         // The *state* must be the wider type, not merely the arithmetic — an
-        // f32 result would re-round to the same fixed point every step. Nor is
-        // this a summation error a compensated adder could recover: the loss is
-        // inside the coefficient, where `1.0 - alpha` rounds to exactly `1.0`
-        // at any `alpha` of `2^-25` or below, so both addends are already exact
-        // and there is nothing left for a carried compensation term to hold.
-        // Rearranging to `prev + alpha * (x - prev)` puts the loss back into an
-        // addend, but absorbs identically in f32 *and* forfeits exact tracking
-        // at `alpha == 1`, where `prev + (x - prev)` is not `x` for a large
-        // `prev`.
+        // f32 result would re-round to the same fixed point every step. In the
+        // deepest regime the loss is inside the coefficient, where `1.0 - alpha`
+        // rounds to exactly `1.0` (f32 at any `alpha` of `2^-25` or below, f64
+        // at `2^-53`), so both addends are already exact and a carried
+        // compensation term would have nothing to hold. Above that regime the
+        // loss is in the final addition, and a compensated or double-double
+        // accumulator *would* recover it — deliberately not carried: each such
+        // widening only relocates the boundary (coefficient -> f32 accumulator
+        // -> f64 accumulator was three rounds of exactly that), never removes
+        // it, since invariance is unachievable in finite precision. The contract
+        // is documented instead: see the *Fine cadences* bullet on `CadenceEma`
+        // for the contrast-dependent condition that actually holds. Rearranging
+        // to `prev + alpha * (x - prev)` puts the loss back into an addend, but
+        // is absorbed at the same threshold *and* forfeits exact tracking at
+        // `alpha == 1`, where `prev + (x - prev)` is not `x` for a large `prev`.
         //
         // Keeping the algebra means every coefficient edge still falls out of
         // the one expression: `alpha == 1` gives `1 * x + 0 * prev`, which

@@ -845,6 +845,169 @@ fn cadence_ema_is_cadence_invariant_on_a_falling_step() {
 }
 
 #[test]
+fn cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone() {
+  // The counterexample to any flat `delta / tau` invariance bound, in both
+  // directions. A push contributes `alpha * (x - s)` into a state of magnitude
+  // `|s|`, so it survives only while `alpha * |x - s|` exceeds half an ulp of
+  // `|s|` — a condition on the *product* of coefficient and contrast. At the
+  // finest contrast an `f32` caller can express, one ulp, the boundary therefore
+  // sits at `alpha = 2^-30` and not at the `2^-53`-ish figure unit contrast
+  // suggests: 2^24 times sooner than the `delta / tau > 2^-54` the docs used to
+  // claim unconditionally.
+  //
+  // The observation is `CadenceEmaState`'s `PartialEq`, which compares the
+  // retained `f64`. At this contrast every emitted `f32` is the seed on both
+  // cadences, so only the retained state separates "absorbed" from "recorded,
+  // below `f32` resolution" — and a state advanced solely by absorbed pushes is
+  // bit-identical to one merely seeded at the same position.
+  const SEED: f32 = 1.0;
+  const N: usize = 16;
+  const TAU_MOVES: f32 = 536_870_912.0; // 2^29
+  const TAU_FREEZES: f32 = 1_073_741_824.0; // 2^30
+  const RETIRED_BOUND: f64 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+
+  // `expm1f` is exact this far below its argument's square, so the coefficient
+  // at `delta = 1` is exactly `1 / tau` and the boundary reads off the exponent.
+  assert_eq!(CadenceEma::new(TAU_MOVES).alpha_for(1), 1.0 / TAU_MOVES);
+  assert_eq!(CadenceEma::new(TAU_FREEZES).alpha_for(1), 1.0 / TAU_FREEZES);
+  // Both sit far above the retired bound, so what follows is not its deep tail.
+  assert!(f64::from(CadenceEma::new(TAU_FREEZES).alpha_for(1)) > RETIRED_BOUND);
+
+  // A smoother seeded at `at` and never advanced — the "nothing happened" state.
+  let bare = |tau: f32, at: usize| {
+    let mut s = CadenceEma::new(tau).smoother();
+    let _ = s.push(Windowed::new(SEED, Span::new(at, 1, 1))).unwrap();
+    s
+  };
+  // Seed at 0, then the `N` elements at a unit cadence...
+  let fine = |tau: f32, x: f32| {
+    let mut s = CadenceEma::new(tau).smoother();
+    let _ = s.push(Windowed::new(SEED, Span::new(0, 1, 1))).unwrap();
+    let outs: Vec<f32> = (1..=N)
+      .map(|k| s.push(Windowed::new(x, Span::new(k, 1, 1))).unwrap().value)
+      .collect();
+    (s, outs)
+  };
+  // ...and the same `N` elements as one hop.
+  let coarse = |tau: f32, x: f32| {
+    let mut s = CadenceEma::new(tau).smoother();
+    let _ = s.push(Windowed::new(SEED, Span::new(0, 1, 1))).unwrap();
+    let out = s.push(Windowed::new(x, Span::new(N, 1, 1))).unwrap().value;
+    (s, out)
+  };
+
+  // The seed's two `f32` neighbours: the finest falling and rising steps any
+  // caller can express — `1 - 2^-24` and `1 + 2^-23`.
+  for (dir, x) in [
+    ("falling", f32::from_bits(SEED.to_bits() - 1)),
+    ("rising", f32::from_bits(SEED.to_bits() + 1)),
+  ] {
+    // Above the boundary the property holds, and holds exactly: the unit cadence
+    // and the single hop reach the same retained `f64`, bit for bit.
+    let (fine_state, fine_outs) = fine(TAU_MOVES, x);
+    let (coarse_state, _) = coarse(TAU_MOVES, x);
+    assert_ne!(
+      fine_state,
+      bare(TAU_MOVES, N),
+      "{dir}: alpha = 2^-29 must still record a one-ulp step"
+    );
+    assert_eq!(
+      fine_state, coarse_state,
+      "{dir}: cadences must agree above the boundary"
+    );
+    assert!(
+      fine_outs.iter().all(|&v| v == SEED),
+      "{dir}: that movement is below f32 resolution"
+    );
+
+    // One binary order further out the step is exactly half an ulp of the state
+    // and ties to even, so the fine cadence absorbs every push and is left
+    // bit-identical to a bare seed — frozen, and frozen for any number of
+    // further pushes, the state being a fixed point of the map. The same
+    // elements taken in one hop carry 16x the coefficient and are not absorbed.
+    // Same signal, same tau, same elapsed distance, two cadences, two answers.
+    let (fine_state, fine_outs) = fine(TAU_FREEZES, x);
+    let (coarse_state, coarse_out) = coarse(TAU_FREEZES, x);
+    assert_eq!(
+      fine_state,
+      bare(TAU_FREEZES, N),
+      "{dir}: alpha = 2^-30 must absorb a one-ulp step entirely"
+    );
+    assert_ne!(
+      coarse_state,
+      bare(TAU_FREEZES, N),
+      "{dir}: the single hop over the same elements must still move"
+    );
+    assert_ne!(
+      fine_state, coarse_state,
+      "{dir}: cadence invariance must be observably broken here"
+    );
+    // Both cadences still emit the seed: the divergence is in the retained
+    // state, and only a run long enough to accumulate half an `f32` ulp would
+    // surface it in the output. That is why the assertions above are on states.
+    assert!(fine_outs.iter().all(|&v| v == SEED));
+    assert_eq!(coarse_out, SEED);
+  }
+}
+
+#[test]
+fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
+  // The narrowed agreement claim. `alpha` is an `f32`, so the retained fraction
+  // `1 - alpha` carries an absolute error of about `2^-25`, and that error
+  // multiplies the distance between the seed and the input: two cadences over
+  // the same elapsed distance agree to a small multiple of `2^-25 * |x - s_0|`,
+  // which is an ABSOLUTE bound. Read as ulps of the result it is about one while
+  // the result is a healthy fraction of the swing, and thousands once the state
+  // has decayed by many `tau` — the residual shrinks exponentially while the
+  // error does not. Both ends are pinned so the docs cannot drift back to a flat
+  // "cadences agree to about an ulp".
+  const TAU: f32 = 1024.0;
+  // 8 * 2^-25. The worst ratio measured over `tau` 3..10007 and distances
+  // `tau/4`..`12 tau` was 4x; this leaves one binary order of headroom.
+  const SWING_ERR: f64 = 8.0 / 33_554_432.0;
+  let cfg = CadenceEma::new(TAU);
+  let n = TAU as usize;
+
+  // `x0` at position 0, then a constant `x1` over `d` elements at `hop` cadence.
+  let sampled = |hop: usize, d: usize, x0: f32, x1: f32| -> f32 {
+    let mut samples: Vec<(usize, f32)> = vec![(0, x0)];
+    let mut p = 0usize;
+    while p + hop <= d {
+      p += hop;
+      samples.push((p, x1));
+    }
+    drive(&cfg, &cadence_seq(&samples)).last().unwrap().value
+  };
+
+  for mult in [1usize, 2, 4, 8, 12] {
+    let d = n * mult;
+    for (x0, x1) in [(0.0f32, 1.0f32), (1.0, 0.0)] {
+      let fine = sampled(1, d, x0, x1);
+      let coarse = sampled(d, d, x0, x1);
+      let bound = SWING_ERR * f64::from(x1 - x0).abs();
+      assert!(
+        (f64::from(fine) - f64::from(coarse)).abs() <= bound,
+        "d/tau {mult}, {x0} -> {x1}: |{fine} - {coarse}| exceeds {bound}"
+      );
+    }
+  }
+
+  // The same absolute agreement in ulps of the result, at both ends.
+  let ulps = |a: f32, b: f32| (a.to_bits() as i64 - b.to_bits() as i64).abs();
+  let (fine, coarse) = (sampled(1, n, 0.0, 1.0), sampled(n, n, 0.0, 1.0));
+  assert!(
+    ulps(fine, coarse) <= 1,
+    "a result of order the swing must agree to an ulp: {fine} vs {coarse}"
+  );
+  let d = n * 12;
+  let (fine, coarse) = (sampled(1, d, 1.0, 0.0), sampled(d, d, 1.0, 0.0));
+  assert!(
+    ulps(fine, coarse) > 1_000,
+    "a residual decayed by 12 tau must NOT agree to an ulp: {fine} vs {coarse}"
+  );
+}
+
+#[test]
 fn cadence_ema_falling_step_decays_by_one_over_e_over_one_tau() {
   // The defining decay, over the full time constant, at the cadence where the
   // per-step coefficient is smaller than the state's own resolution: a unit
