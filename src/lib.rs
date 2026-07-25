@@ -42,8 +42,9 @@ pub mod scalar;
 // `Vec`-returning batch drivers gate on `alloc` inside the module.
 pub mod segment;
 // The smooth module spans both tiers likewise: the `Smoother`/`SmoothPolicy`
-// traits and the `Identity`/`Ema` configs and states are featureless core, while
-// the `Vec`-returning batch `smooth` driver gates on `alloc` inside the module.
+// traits and the `Identity`/`Ema`/`CadenceEma` configs and states are featureless
+// core, while the `Vec`-returning batch `smooth` driver gates on `alloc` inside
+// the module.
 pub mod smooth;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]

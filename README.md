@@ -36,7 +36,7 @@ crate's contract, enforced by an acceptance suite.
 
 ```toml
 [dependencies]
-windit = "0.1"
+windit = "0.2"
 ```
 
 ## The unifying idea: one geometry drives both ends
@@ -76,18 +76,22 @@ own by implementing the trait.
   Built-ins: [`CoverageWeightedMean`] (default), [`MeanRenormalized`],
   [`EmaRenormalized`], [`SaliencyWeighted`], plus `keep_separate` for the
   multi-vector path. Embeddings are reconstructed through the minimal [`Vector`]
-  trait, so any 384-, 512-, or 768-dimension type fits, at either shipped
-  [`Scalar`] (`f32` or `f64`).
+  trait, so any 384-, 512-, or 768-dimension type fits, at any shipped
+  [`Scalar`] (see below).
 - **smooth** — rewrite each window's value while preserving its span, one window
   in, one window out, through a `Smoother` state and its `SmoothPolicy` config.
-  Built-ins: [`Identity`] (pass-through baseline) and [`Ema`] (temporal low-pass).
+  Built-ins: [`Identity`] (pass-through baseline), [`Ema`] (temporal low-pass),
+  and [`CadenceEma`], whose time constant is denominated in input *elements*, so
+  one setting smooths the same way at any hop.
 - **segment** — gate a windowed score sequence into a binary decision, then reduce
-  it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff)
-  and [`Hysteresis`] (latching two-threshold) drive the incremental [`Segmenter`]
-  (a bounded, zero-allocation state machine, so batch equals streaming by
-  construction) through `GatePolicy::segment`, with `min_len` and `merge_gap`
-  post-passes; `runs`, `longest_run`, and `runs_sorted` are the predicate-driven
-  batch counterparts.
+  it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff),
+  [`Hysteresis`] (latching two-threshold), and [`Vote`] (N-of-M over recent
+  windows) drive the incremental [`Segmenter`] (a bounded, zero-allocation state
+  machine, so batch equals streaming by construction) through
+  `GatePolicy::segment`, with `min_len` and `merge_gap` post-passes; `runs`,
+  `longest_run`, and `runs_sorted` are the predicate-driven batch counterparts.
+  [`Dwell`] (on-delay confirmation) and [`Hangover`] (off-delay hold) wrap any
+  gate to debounce it, in elements rather than windows.
 - **split** — decide how an input is divided before windowing. [`FixedWindow`]
   delegates to the planner; [`ContentAware`] (feature `text`) chunks strings.
 
@@ -109,6 +113,44 @@ let frames: Vec<Windowed<f32>> = probs
 let opts = SegmentOptions::new().with_min_len(2);
 let speech = longest_run(&frames, |&p| p >= 0.5, &opts).unwrap();
 assert_eq!(speech, Some(Range::new(4, 7)));
+```
+
+## Streaming: the same decision, one window at a time
+
+Smoothing, gating, and segmentation are state machines, not whole-sequence
+passes. A [`Decoder`] threads them in order — smoother, then gate, then
+[`Segmenter`] — and reports both output planes per window: `active`, the gate's
+immediate causal decision, and `finalized`, a [`Range`] no later input can
+change. Concatenating the finalized ranges with the `finish` tail reproduces the
+batch composition exactly, so a live decode and an offline one agree by
+construction. The pipeline itself allocates nothing and needs no feature — only
+the `Vec` collecting its output below does.
+
+```rust
+use windit::prelude::*;
+
+// 2-of-3 voting on the smoothed score, confirmed only after two continuous
+// elements, then held for one element past release.
+let gate = Hangover::new(Dwell::new(Vote::new(2, 3, 0.5), 2), 1);
+let mut dec = Decoder::new(
+    CadenceEma::new(1.0).smoother(),
+    gate.gate(),
+    SegmentOptions::new(),
+);
+
+let probs = [0.1_f32, 0.9, 0.8, 0.2, 0.7, 0.9, 0.6, 0.1, 0.1, 0.1];
+let mut speech: Vec<Range> = Vec::new();
+for (i, &p) in probs.iter().enumerate() {
+    let step = dec.push(Windowed::new(p, Span::new(i, 1, 1)))?;
+    let _now: bool = step.active();  // usable this instant; never retracted
+    speech.extend(step.finalized()); // settled; equal to the batch answer
+}
+speech.extend(dec.finish());
+
+// The dwell trims the two unconfirmed frames off the head; the hangover adds
+// exactly one element back at the tail.
+assert_eq!(speech, [Range::new(3, 9)]);
+# Ok::<(), windit::WinditError>(())
 ```
 
 ## Content-aware text chunking: the `MeasureText` measurer
@@ -182,28 +224,39 @@ serves every compute scalar instead.
 ## Scalars
 
 Embeddings declare what they store through [`Vector`]'s associated `Scalar`
-type. `f32` and `f64` are implemented, neither behind a feature flag — both are
-`core` types, and monomorphization already makes an unused one free.
+type. `f32`, `f64`, and `i8` are implemented without a feature flag — all three
+are `core` types, and monomorphization already makes an unused one free — and
+`half::f16` / `half::bf16` join them behind the `half` feature. Aggregation
+always computes in `f64`, the sole [`Real`]: every other scalar widens into it.
+
+`i8` is a *code* scalar, not a value one: a quantization code means nothing
+without a scale this crate cannot know, so an `i8` embedding is refused with
+`WinditError::MissingDequantization` unless the [`Vector`] supplies its own
+dequantization by overriding `compute_components`. `f32`, `f16`, and `bf16`
+widen exactly and need no such override.
 
 [`Scalar`] and [`Real`] are **sealed**: name them, bound on them, but only this
 crate implements them. The aggregation math depends on invariants those
 implementations uphold, and sealing also means a scalar added later is not a
-breaking change. Bare integers are deliberately excluded — an `i8` has no value
-without a per-tensor quantization scale this crate cannot know — and `f16` is
-the intended next addition. See the [`scalar`] module docs.
+breaking change. See the [`scalar`] module docs.
 
 ## `no_std`
 
-`windit` is `no_std + alloc`. `default = ["alloc"]`, since every operation
-returns a `Vec`; the type and trait surface compiles even without it. The
-optional features are additive:
+`windit` is `no_std + alloc`. `default = ["alloc"]`, because every operation that
+returns a `Vec` needs it — but the whole streaming surface does not: the value,
+geometry, and scalar types, the smoothing / gating / segmentation traits with
+their configs and states, [`Segmenter`], and [`Decoder`] all compile with
+`--no-default-features` and allocate nothing. `WinditError` implements
+`core::error::Error` on every tier, `std` included. The optional features are
+additive:
 
 | Feature   | Adds                                                              |
 |-----------|------------------------------------------------------------------|
-| `alloc`   | (default) the `Vec`-returning planner and the strategy families  |
-| `std`     | the [`std::error::Error`] implementation for `WinditError`       |
+| `alloc`   | (default) the `Vec`-returning planner, batch drivers, and strategy families |
+| `std`     | links `std`; adds no API of its own                              |
 | `text`    | content-aware string chunking (`unicode-segmentation`)           |
 | `serde`   | `Serialize` / `Deserialize` for the configuration and policy enums |
+| `half`    | the `half::f16` and `half::bf16` storage scalars (no `alloc` implied) |
 
 ## License
 
@@ -239,11 +292,15 @@ dual licensed as above, without any additional terms or conditions.
 [`SaliencyWeighted`]: https://docs.rs/windit/latest/windit/aggregate/struct.SaliencyWeighted.html
 [`Identity`]: https://docs.rs/windit/latest/windit/smooth/struct.Identity.html
 [`Ema`]: https://docs.rs/windit/latest/windit/smooth/struct.Ema.html
+[`CadenceEma`]: https://docs.rs/windit/latest/windit/smooth/struct.CadenceEma.html
 [`Hysteresis`]: https://docs.rs/windit/latest/windit/segment/struct.Hysteresis.html
 [`Range`]: https://docs.rs/windit/latest/windit/segment/struct.Range.html
 [`Threshold`]: https://docs.rs/windit/latest/windit/segment/struct.Threshold.html
+[`Vote`]: https://docs.rs/windit/latest/windit/segment/struct.Vote.html
+[`Dwell`]: https://docs.rs/windit/latest/windit/segment/struct.Dwell.html
+[`Hangover`]: https://docs.rs/windit/latest/windit/segment/struct.Hangover.html
 [`Segmenter`]: https://docs.rs/windit/latest/windit/segment/struct.Segmenter.html
+[`Decoder`]: https://docs.rs/windit/latest/windit/decode/struct.Decoder.html
 [`FixedWindow`]: https://docs.rs/windit/latest/windit/split/struct.FixedWindow.html
 [`ContentAware`]: https://docs.rs/windit/latest/windit/split/struct.ContentAware.html
 [`MeasureText`]: https://docs.rs/windit/latest/windit/split/trait.MeasureText.html
-[`std::error::Error`]: https://doc.rust-lang.org/std/error/trait.Error.html
