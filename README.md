@@ -82,7 +82,11 @@ own by implementing the trait.
   in, one window out, through a `Smoother` state and its `SmoothPolicy` config.
   Built-ins: [`Identity`] (pass-through baseline), [`Ema`] (temporal low-pass),
   and [`CadenceEma`], whose time constant is denominated in input *elements*, so
-  one setting smooths the same way at any hop.
+  one setting smooths the same way at any hop. `CadenceEma`'s `tau` is accepted
+  in `(0, CadenceEma::MAX_TAU]` (`2^26 - 4` elements, over a week of audio at a
+  10 ms hop): the ceiling is where the per-step coefficient stops clearing the
+  bar its accuracy guarantees rest on, so the domain it accepts is exactly the
+  domain those guarantees hold over.
 - **segment** — gate a windowed score sequence into a binary decision, then reduce
   it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff),
   [`Hysteresis`] (latching two-threshold), and [`Vote`] (N-of-M over recent

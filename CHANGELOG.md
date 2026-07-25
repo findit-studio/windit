@@ -61,10 +61,13 @@ fallible.
   *elements* rather than in pushes. Each push derives its own coefficient from
   the actual span distance, `alpha = 1 - exp(-delta / tau)`, so one `tau` yields
   the same smoothing at any hop — regular or irregular — where a bare per-push
-  `Ema` `alpha` does not. `new` panics unless `tau` is finite and positive;
-  `try_new` reports the new `WinditError::TimeConstantOutOfRange` instead. The
-  invariance is a floating-point property with a documented, contrast-dependent
-  limit — see the *Fine cadences* bullet on the type.
+  `Ema` `alpha` does not. `tau` is accepted in `(0, CadenceEma::MAX_TAU]`, a
+  bounded domain chosen so the type's accuracy figures hold across all of it:
+  `new` panics outside that interval and `try_new` reports the new
+  `WinditError::TimeConstantOutOfRange` instead. Over differences the emitted
+  `f32` can express the invariance holds at every accepted configuration; below
+  that resolution it stays contrast-dependent — see the *Fine cadences* bullet
+  on the type.
 - **`segment::Vote`**: an N-of-M gate, active once at least `need` of the last
   `of` comparisons `value >= thr` were true, over a one-machine-word ring of up
   to 64 votes. `new` panics unless `1 <= need <= of <= 64`; `try_new` reports the
@@ -239,9 +242,10 @@ No 0.1.x program's *output* changes here: the numerics of everything 0.1.x
 shipped are untouched, and every behavioural correction below is to a type
 introduced in this release. They are recorded because each states a contract the
 crate is now held to, and the first describes a regime an existing `Ema` user can
-be in today without knowing it. The last two entries correct *published claims*
-rather than behaviour — the code they describe was already right — and each is
-now pinned by a test that fails if the claim is false.
+be in today without knowing it. The last four entries correct *published claims*
+and the domain they are quantified over rather than behaviour — the code they
+describe was already right — and each is now pinned by a test that sweeps the
+accepted domain to its edges and fails if the claim is false.
 
 - **`smooth::Ema`'s behaviour at a sub-epsilon `alpha` is now documented, and it
   is not a hold.** At an `alpha` at or below `2^-25` (~3e-8), `1 - alpha` rounds
@@ -254,8 +258,9 @@ now pinned by a test that fails if the claim is false.
   because `s_0 = x_0` seeds a steady signal there, a constant stream still looks
   like a clean hold — which is what made "it holds" a plausible reading. The
   numerics are identical to 0.1.x; 0.1.x simply left the regime unstated. Reach
-  for `CadenceEma`, whose `f64` accumulator pushes the same degeneracy 28 binary
-  orders further out, if you need to work down there.
+  for `CadenceEma`, whose `f64` accumulator pushes the same degeneracy 29 binary
+  orders further out — its `1 - alpha` collapses at `2^-54`, not at `2^-25`
+  — if you need to work down there.
 - **`segment::Dwell` folds its confirmation horizon by maximum.** Confirming
   against the *current* span's end let an on-delay gate deactivate
   mid-activation: with `confirm = 10`, the spans `[0, 10)` then `[1, 2)` and the
@@ -268,23 +273,27 @@ now pinned by a test that fails if the claim is false.
   independent losses were closed. The coefficient is derived as
   `-expm1f(-delta / tau)` rather than the literal `1 - expf(-delta / tau)`, which
   loses every bit of the ratio once `expf` rounds to `1.0` — below `2^-25` for
-  `f32` — so a valid `tau = 1e8` at `delta = 1` used to derive `alpha == 0.0` and
-  freeze the filter entirely, while the same signal sampled at `delta = 100`
-  moved normally. And the recurrence is accumulated in `f64` with only the emitted
-  value rounded to `f32`, because applying an exact small coefficient to an `f32`
+  `f32` — so a then-accepted `tau = 1e8` at `delta = 1` used to derive
+  `alpha == 0.0` and freeze the filter entirely, while the same signal sampled
+  at `delta = 100` moved normally. (`1e8` is above the ceiling this release
+  ships and no longer constructs; the loss it exposed was real at every `tau`.)
+  And the recurrence is accumulated in `f64` with only the emitted value
+  rounded to `f32`, because applying an exact small coefficient to an `f32`
   state made a state near `1.0` a fixed point: at `tau = 4e7` a unit cadence
   decayed not at all where one `tau`-sized step over the same distance reached
   ~0.9990005. Both were the type's defining property — that the result does not
   depend on how finely the signal is sampled — failing in a reachable regime.
-  Invariance remains conditional and is now documented as a bound on
-  `alpha * rho` (`rho` the contrast `|x - s| / |s|`), not on `alpha` alone —
-  specifically `alpha * rho > 2^-50`, equivalently `alpha * |x - s| >
-  4 * ulp(s)`, with `alpha > 2^-26` the corollary over differences the emitted
-  `f32` can express. The constant accounts for all three roundings the
-  recurrence performs — `1 - alpha`, the product `(1 - alpha) * s`, and the
-  final sum — rather than the single fused step earlier drafts assumed, and it
-  is deliberately looser than both the derivation (`(1.5 + alpha) * ulp(s)`) and
-  an adversarial search of ~1.4e9 probes (worst absorption `1.48 * ulp(s)`).
+  Invariance is documented as a bound on `alpha * rho` (`rho` the contrast
+  `|x - s| / |s|`), not on `alpha` alone — specifically `alpha * rho > 2^-50`,
+  equivalently `alpha * |x - s| > 4 * ulp(s)`. Its `alpha > 2^-26` corollary,
+  over differences the emitted `f32` can express, is *unconditional* on the
+  accepted domain, because that is exactly what `MAX_TAU` guarantees. The
+  constant accounts for all three roundings the recurrence performs —
+  `1 - alpha`, the product `(1 - alpha) * s`, and the final sum — rather than
+  the single fused step earlier drafts assumed, and it is deliberately looser
+  than both the derivation (`(1.5 + alpha) * ulp(s)`) and an adversarial search
+  over the accepted domain (~1.4e8 probes above the bar; worst absorption under
+  one `ulp(s)`).
 - **`segment::Dwell` with `confirm == usize::MAX` no longer activates.** The
   configuration is documented as never confirming, but the test was
   `horizon - origin >= confirm`, and the widest run a `Span` pair can describe —
@@ -304,6 +313,39 @@ now pinned by a test that fails if the claim is false.
   `1e-6` tolerance that accompanied the claim (over 33 ulps at that magnitude,
   far too slack to enforce it) is replaced by exact ULP-distance assertions
   swept across the `tau` range.
+- **`smooth::CadenceEma` now accepts a bounded `tau` domain,
+  `(0, CadenceEma::MAX_TAU]`.** `MAX_TAU` is `2^26 - 4` elements — the largest
+  `f32` strictly below `2^26` — and `try_new` reports
+  `TimeConstantOutOfRange` above it, where it used to accept every positive
+  finite `f32`. The ceiling is derived from the guarantees rather than picked
+  for roundness: half an `f32` ulp is `2^28` `f64` ulps at the same magnitude,
+  so `alpha > 2^-26` is precisely the condition that lifts every difference the
+  emitted `f32` can express above the `4 * ulp(s)` absorption bar, and `MAX_TAU`
+  is the largest `f32` whose `delta = 1` coefficient still clears it (one `f32`
+  step further out, at `tau = 2^26`, the coefficient is exactly `2^-26` and the
+  product lands *on* the bar instead of above it).
+
+  This is a contract restriction, not a bug fix, and it is what makes the
+  accuracy figures on the type true of *everything it admits* rather than of the
+  range they were measured over. Unbounded acceptance falsified them at the
+  edges: at `tau = 2^55` the `f64` `1 - alpha` rounds to exactly `1.0`, so a
+  unit cadence cannot move the state at all — a configuration that asks for a
+  filter and silently gets a no-op, while the "within four ulps of `exp(-1)`
+  over one `tau`" figure says otherwise by millions of ulps. Nothing usable is
+  excluded: `2^26` elements is over a week of audio at a 10 ms hop. `CadenceEma`
+  is new in this release, so no published configuration can be affected.
+- **Three more `CadenceEma` figures were re-derived against the bounded domain,
+  and one `Ema` figure was wrong.** The coefficient floor at `delta = 1` was
+  published as `2^-128` (read at `f32::MAX`, which no longer constructs) and is
+  now `2^-26`; the `|alpha * x|` floor was `2^-277` and is now `2^-175`; and the
+  `cadence_alpha` note claimed the derived coefficient lands "within an ulp" of
+  the exact one, which two composed roundings make false — it is within two
+  (measured 1.51). Separately, `Ema` and `CadenceEma` both said the `f64`
+  `1 - alpha` collapses to exactly `1.0` at `2^-53`. It does not: `1 - 2^-53` is
+  exactly representable. The threshold is `2^-54`, the tie that rounds to even,
+  which also makes the `f32`-to-`f64` gap 29 binary orders rather than 28. Every
+  figure above is now pinned by a test that sweeps the accepted domain to its
+  edges, `MAX_TAU` included.
 
 ## 0.1.2 - 2026-07-25
 
