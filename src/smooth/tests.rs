@@ -1,7 +1,22 @@
 use std::{boxed::Box, vec, vec::Vec};
 
-use super::{CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother};
+use super::{cadence_alpha, CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother};
 use crate::{error::WinditError, plan::Span, windowed::Windowed};
+
+/// The coefficient floor the accepted `tau` domain is built around: every
+/// accepted `tau` derives an `alpha` strictly above this at every `delta >= 1`.
+const ALPHA_FLOOR: f32 = 1.0 / 67_108_864.0; // 2^-26
+
+/// The published absorption bound: a step above this many `ulp(s)` must be
+/// recorded. Shared by the randomized sweep and the exact witness below, so the
+/// two cannot enforce different figures — and so one edit falsifies both.
+const PUBLISHED_ABSORPTION_ULPS: f64 = 4.0;
+
+/// The next representable `f32` above `v`, for probing the domain edge from its
+/// rejected side.
+fn next_up32(v: f32) -> f32 {
+  f32::from_bits(v.to_bits() + 1)
+}
 
 /// Signed distance between two `f32`s in representable steps. Quantitative
 /// accuracy claims are stated in ulps, so they are checked in ulps: an absolute
@@ -715,7 +730,7 @@ fn cadence_ema_backward_start_errs_and_leaves_state_unchanged() {
 
 #[test]
 fn cadence_ema_construction_validates_tau() {
-  // `try_new` rejects non-finite and non-positive tau.
+  // `try_new` rejects non-finite and non-positive tau...
   for bad in [
     f32::NAN,
     f32::INFINITY,
@@ -731,16 +746,120 @@ fn cadence_ema_construction_validates_tau() {
       "tau {bad} must be rejected"
     );
   }
-  // Accepts a positive subnormal and a fractional tau, reported verbatim.
+  // ...and every `tau` past the ceiling, which is the domain restriction this
+  // type's accuracy figures are quantified over. `2^55` is the witness that
+  // falsified the one-`tau` claim while it still constructed; `2^54` is where
+  // the f64 `1 - alpha` first collapses to exactly `1.0`; the two neighbours of
+  // `MAX_TAU` pin the boundary itself.
+  for bad in [
+    next_up32(CadenceEma::MAX_TAU),
+    67_108_864.0, // 2^26, the first power of two above the ceiling
+    libm::ldexpf(1.0, 54),
+    libm::ldexpf(1.0, 55),
+    1e8,
+    f32::MAX,
+  ] {
+    assert_eq!(
+      CadenceEma::try_new(bad),
+      Err(WinditError::TimeConstantOutOfRange),
+      "tau {bad} is above MAX_TAU and must be rejected"
+    );
+  }
+
+  // Both ends of the accepted domain construct, reported verbatim: the smallest
+  // positive subnormal and the ceiling itself.
+  let subnormal = f32::from_bits(1); // smallest positive subnormal, 2^-149
+  assert_eq!(CadenceEma::try_new(subnormal).unwrap().tau(), subnormal);
   assert_eq!(
     CadenceEma::try_new(f32::MIN_POSITIVE).unwrap().tau(),
     f32::MIN_POSITIVE
   );
-  let subnormal = f32::from_bits(1); // smallest positive subnormal
-  assert_eq!(CadenceEma::try_new(subnormal).unwrap().tau(), subnormal);
   assert_eq!(CadenceEma::try_new(0.25).unwrap().tau(), 0.25);
-  // `new` agrees with `try_new` on a valid tau.
+  assert_eq!(
+    CadenceEma::try_new(CadenceEma::MAX_TAU).unwrap().tau(),
+    CadenceEma::MAX_TAU
+  );
+  // `new` agrees with `try_new` on a valid tau, at an ordinary value and at the
+  // ceiling.
   assert_eq!(CadenceEma::new(14.0).tau(), 14.0);
+  assert_eq!(
+    CadenceEma::new(CadenceEma::MAX_TAU).tau(),
+    CadenceEma::MAX_TAU
+  );
+}
+
+#[test]
+fn cadence_ema_max_tau_is_the_exact_coefficient_boundary() {
+  // `MAX_TAU` is not a round number picked for looks: it is the largest `f32`
+  // whose `delta = 1` coefficient still clears `2^-26`, the floor every
+  // unconditional figure on this type rests on. Both halves are asserted, so a
+  // ceiling moved in EITHER direction fails: one f32 step further out the
+  // coefficient is exactly `2^-26` — on the `4 * ulp(s)` bar rather than above
+  // it — and one step back in, the value below would leave an accepted `tau`
+  // wrongly rejected.
+  assert_eq!(CadenceEma::MAX_TAU, 67_108_860.0);
+  assert_eq!(CadenceEma::MAX_TAU.to_bits(), 0x4C7F_FFFF);
+  assert_eq!(next_up32(CadenceEma::MAX_TAU), 67_108_864.0, "2^26");
+
+  let at = cadence_alpha(CadenceEma::MAX_TAU, 1);
+  let past = cadence_alpha(next_up32(CadenceEma::MAX_TAU), 1);
+  assert!(at > ALPHA_FLOOR, "the ceiling must clear 2^-26: {at:e}");
+  assert_eq!(at.to_bits(), 0x3280_0001, "2^-26 + 2^-49, one ulp above");
+  assert!(
+    past <= ALPHA_FLOOR,
+    "one f32 past the ceiling must NOT clear 2^-26: {past:e}"
+  );
+  assert_eq!(past.to_bits(), ALPHA_FLOOR.to_bits(), "exactly 2^-26");
+
+  // The floor is a property of the whole accepted domain, not just its top: the
+  // coefficient falls monotonically with `tau`, so checking it exhaustively over
+  // the last 2^20 representable `tau` values below the ceiling — where it is
+  // tightest — plus a ladder down to the smallest accepted `tau` covers it.
+  let mut prev = 0.0f32;
+  for k in 0..(1u32 << 20) {
+    let tau = f32::from_bits(CadenceEma::MAX_TAU.to_bits() - k);
+    let a = cadence_alpha(tau, 1);
+    assert!(a > ALPHA_FLOOR, "tau {tau} yields alpha {a:e} at the floor");
+    assert!(a >= prev, "alpha must not rise with tau: {a:e} < {prev:e}");
+    prev = a;
+  }
+  for k in -149i32..=26 {
+    let tau = libm::ldexpf(1.0, k);
+    if tau > CadenceEma::MAX_TAU {
+      continue;
+    }
+    let cfg = CadenceEma::new(tau);
+    assert!(
+      cfg.alpha_for(1) > ALPHA_FLOOR,
+      "tau 2^{k} yields alpha {:e} at the floor",
+      cfg.alpha_for(1)
+    );
+    // And `alpha` only grows with `delta`, so `delta = 1` is the floor for the
+    // whole configuration.
+    assert!(cfg.alpha_for(2) >= cfg.alpha_for(1));
+    assert!(cfg.alpha_for(1_000_000) >= cfg.alpha_for(1));
+  }
+}
+
+#[test]
+fn cadence_ema_smallest_accepted_tau_saturates_to_a_pass_through() {
+  // The low edge of the accepted domain. A subnormal `tau` drives `delta / tau`
+  // past `expf`'s underflow at every `delta >= 1`, so `alpha` saturates to
+  // exactly `1.0` and the filter tracks its input exactly — degenerate, but a
+  // total and meaningful configuration (no smoothing at all), which is why the
+  // domain is bounded above and not below.
+  let subnormal = f32::from_bits(1);
+  for tau in [subnormal, f32::MIN_POSITIVE, 1e-30] {
+    let cfg = CadenceEma::new(tau);
+    assert_eq!(cfg.alpha_for(1), 1.0, "tau {tau:e} must saturate alpha");
+    assert!(cfg.alpha_for(1) > ALPHA_FLOOR);
+    let out = drive(&cfg, &cadence_seq(&[(0, 0.5), (1, 0.25), (2, -3.0)]));
+    assert_eq!(
+      values(&out),
+      vec![0.5, 0.25, -3.0],
+      "tau {tau:e} must track the input exactly"
+    );
+  }
 }
 
 #[test]
@@ -753,6 +872,12 @@ fn cadence_ema_new_panics_on_zero_tau() {
 #[should_panic = "cadence time constant"]
 fn cadence_ema_new_panics_on_nan_tau() {
   let _ = CadenceEma::new(f32::NAN);
+}
+
+#[test]
+#[should_panic = "cadence time constant"]
+fn cadence_ema_new_panics_above_max_tau() {
+  let _ = CadenceEma::new(next_up32(CadenceEma::MAX_TAU));
 }
 
 #[test]
@@ -782,10 +907,14 @@ fn cadence_ema_tiny_cadence_ratio_yields_a_nonzero_coefficient() {
   // returns exactly `0.0` and the filter stops responding to the data
   // altogether — on finite, valid input. The coefficient is therefore derived
   // with `expm1f`, which is exact to full precision in that regime.
-  let tau = 1e8;
+  //
+  // Read at `MAX_TAU`, the extreme of the accepted domain and so the smallest
+  // coefficient any configuration can produce; the `1e8` this used to use is
+  // above the ceiling and no longer constructs.
+  let tau = CadenceEma::MAX_TAU;
   let cfg = CadenceEma::new(tau);
   assert!(
-    cfg.alpha_for(1) > 0.0,
+    cfg.alpha_for(1) > ALPHA_FLOOR,
     "a unit cadence under tau {tau} must still move the filter: {}",
     cfg.alpha_for(1)
   );
@@ -812,23 +941,31 @@ fn cadence_ema_tiny_cadence_ratio_yields_a_nonzero_coefficient() {
 #[test]
 fn cadence_ema_coefficient_and_step_floors_are_the_documented_powers_of_two() {
   // The three edge figures the *Fine cadences* bullet quotes but nothing
-  // enforced: the smallest coefficient a validated `tau` can produce, the floor
-  // under `|alpha * x|`, and the zero-state escape.
+  // enforced: the smallest coefficient an accepted `tau` can produce, the floor
+  // under `|alpha * x|`, and the zero-state escape. All three moved when the
+  // domain was bounded — they are properties OF the domain, so they must be read
+  // at its edge, `MAX_TAU`, and not at `f32::MAX`, which no longer constructs.
 
-  // "with a validated `tau` it cannot fall below about `2^-128` at `delta = 1`":
-  // the largest `tau` is `f32::MAX`, and the coefficient there is exactly
-  // `2^-128` — nonzero, so the filter still responds.
-  let widest = CadenceEma::new(f32::MAX);
+  // "the accepted domain floors it at `2^-26` for `delta = 1`": the largest
+  // accepted `tau` is `MAX_TAU`, and the coefficient there is one f32 ulp above
+  // `2^-26` — strictly above the bar, which is what the ceiling is chosen for.
+  let widest = CadenceEma::new(CadenceEma::MAX_TAU);
   let floor = widest.alpha_for(1);
-  assert!(floor > 0.0, "the coefficient must not round away: {floor}");
-  assert_eq!(floor, libm::ldexpf(1.0, -128), "the documented 2^-128");
+  assert!(
+    floor > ALPHA_FLOOR,
+    "the coefficient must clear 2^-26: {floor}"
+  );
+  assert_eq!(floor, ALPHA_FLOOR + libm::ldexpf(1.0, -49), "2^-26 + 2^-49");
 
-  // "`|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input":
+  // "`|alpha * x|` cannot fall below about `2^-175` for a nonzero `f32` input":
   // that floor keeps a single step clear of `f64`'s subnormals (2^-1074), so
   // the relative reading of `ulp(s)` stays the operative one.
   let tiniest = f32::from_bits(1); // f32's smallest positive subnormal, 2^-149
   let product = f64::from(floor) * f64::from(tiniest);
-  assert_eq!(product, libm::ldexp(1.0, -277), "the documented 2^-277");
+  assert!(
+    product > libm::ldexp(1.0, -175) && product < libm::ldexp(1.0, -174),
+    "the documented 2^-175: {product:e}"
+  );
   assert!(product > f64::MIN_POSITIVE * f64::EPSILON);
 
   // "a state of exactly `0.0` has no relative resolution to lose, so
@@ -948,181 +1085,165 @@ fn cadence_ema_is_cadence_invariant_on_a_falling_step() {
 
 #[test]
 fn cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone() {
-  // The counterexample to any flat `delta / tau` invariance bound, in both
-  // directions. A push contributes `alpha * (x - s)` into a state of magnitude
-  // `|s|`, so it survives only while `alpha * |x - s|` clears a small multiple
-  // of `ulp(s)` — a condition on the *product* of coefficient and contrast, not
-  // on `alpha` alone, which is what this test exists to show.
+  // The counterexample to any flat `delta / tau` invariance bound, rebuilt
+  // INSIDE the accepted domain. A push contributes `alpha * (x - s)` into a
+  // state of magnitude `|s|`, so it survives only while `alpha * |x - s|` clears
+  // a small multiple of `ulp(s)` — a condition on the *product* of coefficient
+  // and contrast, not on `alpha` alone, which is what this test exists to show.
   //
-  // The `2^-29` / `2^-30` boundary below is this geometry's, NOT the general
-  // one. The seed is `1.0`: a dyadic state at the bottom of a binade, where
-  // `1 - alpha`, `(1 - alpha) * s` and the final sum are all exact, so the
-  // recurrence behaves as one fused correctly-rounded step and absorption sits
-  // at exactly half an ulp. A non-dyadic state pays up to three roundings and
-  // absorbs a step almost three times larger — which is why the published bound
-  // is `4 * ulp(s)` and `alpha > 2^-26`, and why
-  // `cadence_ema_two_rounded_products_absorb_a_step_the_retired_bound_admitted`
-  // has to carry a non-dyadic state to exhibit it. Keep both: this one pins the
-  // product-versus-coefficient shape, that one pins the constant.
-  //
-  // The observation is `CadenceEmaState`'s `PartialEq`, which compares the
-  // retained `f64`. At this contrast every emitted `f32` is the seed on both
-  // cadences, so only the retained state separates "absorbed" from "recorded,
-  // below `f32` resolution" — and a state advanced solely by absorbed pushes is
-  // bit-identical to one merely seeded at the same position.
-  const SEED: f32 = 1.0;
-  const N: usize = 16;
-  const TAU_MOVES: f32 = 536_870_912.0; // 2^29
-  const TAU_FREEZES: f32 = 1_073_741_824.0; // 2^30
-  const RETIRED_BOUND: f64 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+  // Both witnesses run at `MAX_TAU`, the smallest coefficient the domain admits
+  // (`alpha_for(1)` one ulp above `2^-26`), so the same `alpha` is held fixed
+  // and only the contrast varies. That is the sharpest form of the claim: same
+  // tau, same alpha, two contrasts, two outcomes. The pair this replaces used
+  // `tau = 2^29` and `2^30` — both now rejected at construction, and that is the
+  // point of the ceiling: it removes the configurations at which a contrast the
+  // emitted `f32` CAN express was absorbed, and leaves only the sub-resolution
+  // ones below.
+  const N: usize = 64;
+  let cfg = CadenceEma::new(CadenceEma::MAX_TAU);
+  assert_eq!(cfg.alpha_for(1).to_bits(), 0x3280_0001, "2^-26 + 2^-49");
 
-  // `expm1f` is exact this far below its argument's square, so the coefficient
-  // at `delta = 1` is exactly `1 / tau` and the boundary reads off the exponent.
-  assert_eq!(CadenceEma::new(TAU_MOVES).alpha_for(1), 1.0 / TAU_MOVES);
-  assert_eq!(CadenceEma::new(TAU_FREEZES).alpha_for(1), 1.0 / TAU_FREEZES);
-  // Both sit far above the retired bound, so what follows is not its deep tail.
-  assert!(f64::from(CadenceEma::new(TAU_FREEZES).alpha_for(1)) > RETIRED_BOUND);
-
-  // A smoother seeded at `at` and never advanced — the "nothing happened" state.
-  let bare = |tau: f32, at: usize| {
-    let mut s = CadenceEma::new(tau).smoother();
-    let _ = s.push(Windowed::new(SEED, Span::new(at, 1, 1))).unwrap();
+  // A reachable non-`f32` state: seed 1.0, then one push of 0.0 across 1836
+  // elements leaves the retained `f64` between two `f32` values.
+  let seeded = || {
+    let mut s = cfg.smoother();
+    for (start, x) in [(0usize, 1.0f32), (1836, 0.0)] {
+      let _ = s.push(Windowed::new(x, Span::new(start, 1, 1))).unwrap();
+    }
     s
   };
-  // Seed at 0, then the `N` elements at a unit cadence...
-  let fine = |tau: f32, x: f32| {
-    let mut s = CadenceEma::new(tau).smoother();
-    let _ = s.push(Windowed::new(SEED, Span::new(0, 1, 1))).unwrap();
-    let outs: Vec<f32> = (1..=N)
-      .map(|k| s.push(Windowed::new(x, Span::new(k, 1, 1))).unwrap().value)
-      .collect();
-    (s, outs)
-  };
-  // ...and the same `N` elements as one hop.
-  let coarse = |tau: f32, x: f32| {
-    let mut s = CadenceEma::new(tau).smoother();
-    let _ = s.push(Windowed::new(SEED, Span::new(0, 1, 1))).unwrap();
-    let out = s.push(Windowed::new(x, Span::new(N, 1, 1))).unwrap().value;
-    (s, out)
-  };
+  let p = retained(&seeded());
+  assert_eq!(p.to_bits(), 0x3FEF_FFC6_A033_4000);
 
-  // The seed's two `f32` neighbours: the finest falling and rising steps any
-  // caller can express — `1 - 2^-24` and `1 + 2^-23`.
-  for (dir, x) in [
-    ("falling", f32::from_bits(SEED.to_bits() - 1)),
-    ("rising", f32::from_bits(SEED.to_bits() + 1)),
-  ] {
-    // Above the boundary the property holds, and holds exactly: the unit cadence
-    // and the single hop reach the same retained `f64`, bit for bit.
-    let (fine_state, fine_outs) = fine(TAU_MOVES, x);
-    let (coarse_state, _) = coarse(TAU_MOVES, x);
-    assert_ne!(
-      fine_state,
-      bare(TAU_MOVES, N),
-      "{dir}: alpha = 2^-29 must still record a one-ulp step"
-    );
-    assert_eq!(
-      fine_state, coarse_state,
-      "{dir}: cadences must agree above the boundary"
-    );
+  // The finest contrast that exists at all: the gap between the retained `f64`
+  // and its own `f32` rounding, which here is two orders below what the emitted
+  // value could express. The corollary says nothing about it — and it is
+  // absorbed.
+  let sub = p as f32;
+  let contrast = (f64::from(sub) - p).abs();
+  let half_ulp32 = f64::from(ulp32(sub)) / 2.0;
+  assert!(
+    contrast < half_ulp32,
+    "the absorbed contrast must be below f32 resolution: {contrast:e} vs {half_ulp32:e}"
+  );
+  assert!(
+    f64::from(cfg.alpha_for(1)) * contrast < 0.5 * ulp64(p),
+    "and its step must be under half an ulp of the state"
+  );
+
+  // A unit cadence absorbs every one of the `N` pushes: the retained state is
+  // bit-identical to one that never saw them, and stays so — it is a fixed point
+  // of its own map.
+  let mut fine = seeded();
+  let outs: Vec<f32> = (1..=N)
+    .map(|k| {
+      fine
+        .push(Windowed::new(sub, Span::new(1836 + k, 1, 1)))
+        .unwrap()
+        .value
+    })
+    .collect();
+  assert_eq!(
+    retained(&fine).to_bits(),
+    p.to_bits(),
+    "a unit cadence must absorb a sub-resolution contrast entirely"
+  );
+
+  // The same `N` elements taken as one hop carry `N` times the coefficient and
+  // are not absorbed. Same signal, same tau, same elapsed distance, two
+  // cadences, two retained states — invariance observably broken, at a `tau` the
+  // constructor accepts.
+  let mut coarse = seeded();
+  let coarse_out = coarse
+    .push(Windowed::new(sub, Span::new(1836 + N, 1, 1)))
+    .unwrap()
+    .value;
+  assert_ne!(
+    retained(&coarse).to_bits(),
+    p.to_bits(),
+    "the single hop over the same elements must still move"
+  );
+  assert_ne!(retained(&fine).to_bits(), retained(&coarse).to_bits());
+  // Both cadences still emit the same `f32`: the divergence is in the retained
+  // state, which is why the assertions above are on states.
+  assert!(outs.iter().all(|&v| v == sub));
+  assert_eq!(coarse_out, sub);
+
+  // And the other half of the product: at the SAME tau and the same state, a
+  // contrast the emitted `f32` can express is not absorbed even at a unit
+  // cadence. That is the guarantee the ceiling makes unconditional.
+  for step in [1i64, -1] {
+    let x = f32::from_bits((sub.to_bits() as i64 + step) as u32);
+    let expressible = (f64::from(x) - p).abs();
     assert!(
-      fine_outs.iter().all(|&v| v == SEED),
-      "{dir}: that movement is below f32 resolution"
+      expressible >= half_ulp32,
+      "{x} must be an expressible contrast"
     );
-
-    // One binary order further out the step is exactly half an ulp of the state
-    // and ties to even, so the fine cadence absorbs every push and is left
-    // bit-identical to a bare seed — frozen, and frozen for any number of
-    // further pushes, the state being a fixed point of the map. The same
-    // elements taken in one hop carry 16x the coefficient and are not absorbed.
-    // Same signal, same tau, same elapsed distance, two cadences, two answers.
-    let (fine_state, fine_outs) = fine(TAU_FREEZES, x);
-    let (coarse_state, coarse_out) = coarse(TAU_FREEZES, x);
-    assert_eq!(
-      fine_state,
-      bare(TAU_FREEZES, N),
-      "{dir}: alpha = 2^-30 must absorb a one-ulp step entirely"
-    );
+    let mut s = seeded();
+    let _ = s.push(Windowed::new(x, Span::new(1837, 1, 1))).unwrap();
     assert_ne!(
-      coarse_state,
-      bare(TAU_FREEZES, N),
-      "{dir}: the single hop over the same elements must still move"
+      retained(&s).to_bits(),
+      p.to_bits(),
+      "an expressible contrast must move the state at every accepted tau"
     );
-    assert_ne!(
-      fine_state, coarse_state,
-      "{dir}: cadence invariance must be observably broken here"
-    );
-    // Both cadences still emit the seed: the divergence is in the retained
-    // state, and only a run long enough to accumulate half an `f32` ulp would
-    // surface it in the output. That is why the assertions above are on states.
-    assert!(fine_outs.iter().all(|&v| v == SEED));
-    assert_eq!(coarse_out, SEED);
   }
 }
 
 #[test]
 fn cadence_ema_two_rounded_products_absorb_a_step_the_retired_bound_admitted() {
-  // The counterexample that retired the `ulp(s) / 2` absorption bound and its
-  // `alpha > 2^-29` emitted-`f32` corollary. Every retired threshold is cleared
-  // here and the step is *still* absorbed, because the recurrence rounds two
-  // products and their sum rather than taking one fused step. Pinned on the
-  // exact IEEE bits: the emitted `f32` is unchanged whether the step lands or
-  // not, so nothing coarser can witness this.
+  // Why the absorption bound is `4 * ulp(s)` and not the `ulp(s) / 2` a single
+  // correctly-rounded step would give: the recurrence rounds two products and
+  // their sum, so a step of nearly a whole ulp can still vanish. Pinned on the
+  // exact IEEE bits, at `MAX_TAU` — inside the accepted domain, so this is not a
+  // statement about configurations the constructor refuses.
   //
-  // The retained state is deliberately non-dyadic. A dyadic one — the `1.0` in
-  // `cadence_invariance_is_bounded_by_contrast_not_by_the_coefficient_alone` —
-  // makes all three roundings exact and cannot exhibit the absorption at all.
-  const TAU: f32 = 536_870_880.0; // 0x4dffffff, the largest f32 below 2^29
-                                  // Spelled as bits: the counterexample is bit-exact, and a decimal literal for
-                                  // it (49_083.347_656_25) is one clippy's `excessive_precision` rewrites.
-  const X: f32 = f32::from_bits(0x473F_BB59);
-  const RETIRED_ALPHA: f64 = 1.0 / 536_870_912.0; // 2^-29
-  const RETIRED_PRODUCT: f64 = 1.0 / 9_007_199_254_740_992.0; // 2^-53
-
-  let cfg = CadenceEma::new(TAU);
-  let seed = |cfg: &CadenceEma| {
+  // The retained state is deliberately non-dyadic and reachable from two
+  // ordinary pushes; a dyadic one makes all three roundings exact and cannot
+  // exhibit the absorption at all.
+  const RETIRED_BOUND: f64 = 0.5;
+  let cfg = CadenceEma::new(CadenceEma::MAX_TAU);
+  let seed = || {
     let mut s = cfg.smoother();
-    for (start, x) in [(0usize, 100_000.0f32), (222_626_350, -50_000.0)] {
+    for (start, x) in [(0usize, 1000.0f32), (162_488, -1000.0)] {
       let _ = s.push(Windowed::new(x, Span::new(start, 1, 1))).unwrap();
     }
     s
   };
-  let mut s = seed(&cfg);
+  let mut s = seed();
   let before = retained(&s);
-  assert_eq!(before.to_bits(), 0x40E7_F76B_0747_0000);
+  assert_eq!(before.to_bits(), 0x408F_194E_83CD_0000);
 
-  // Every retired threshold is cleared by the push that follows.
+  let x = before as f32;
+  assert_eq!(x.to_bits(), 0x4478_CA74);
   let alpha = f64::from(cfg.alpha_for(1));
-  assert_eq!(cfg.alpha_for(1).to_bits(), 0x3100_0001);
-  assert!(alpha > RETIRED_ALPHA, "alpha must clear the retired 2^-29");
-  let contrast = (f64::from(X) - before).abs();
-  let rho = contrast / before.abs();
+  let contrast = (f64::from(x) - before).abs();
+  let step = alpha * contrast;
+  let ulp = ulp64(before);
+
+  // The step clears the retired half-ulp bound with room, and sits inside the
+  // published `4 * ulp(s)`.
   assert!(
-    alpha * rho > RETIRED_PRODUCT,
-    "alpha * rho must clear the retired 2^-53: {}",
-    alpha * rho
+    step > RETIRED_BOUND * ulp,
+    "step {step:e} must exceed the retired half-ulp bound"
   );
-  // Including the corollary's threshold: half an `f32` ulp at this magnitude is
-  // 0.001953125, so this is a contrast the emitted `f32` can express.
+  assert!(step > 0.9 * ulp, "step {} ulp", step / ulp);
   assert!(
-    contrast >= 0.001_953_125,
-    "contrast {contrast} is expressible"
+    step < PUBLISHED_ABSORPTION_ULPS * ulp,
+    "step {} ulp is inside the published bound",
+    step / ulp
   );
 
-  // And the state does not move — bit for bit, and permanently, the absorbed
-  // state being a fixed point of its own map.
-  let out = s
-    .push(Windowed::new(X, Span::new(222_626_351, 1, 1)))
-    .unwrap();
+  // And the state does not move — bit for bit, and permanently.
+  let out = s.push(Windowed::new(x, Span::new(162_489, 1, 1))).unwrap();
   assert_eq!(
     retained(&s).to_bits(),
     before.to_bits(),
     "the unit step must be absorbed exactly"
   );
-  assert_eq!(out.value.to_bits(), 0x473F_BB58);
+  assert_eq!(out.value, x);
   for k in 0..64 {
     let _ = s
-      .push(Windowed::new(X, Span::new(222_626_352 + k, 1, 1)))
+      .push(Windowed::new(x, Span::new(162_490 + k, 1, 1)))
       .unwrap();
   }
   assert_eq!(
@@ -1131,56 +1252,78 @@ fn cadence_ema_two_rounded_products_absorb_a_step_the_retired_bound_admitted() {
     "and stay absorbed for every further unit push"
   );
 
-  // The published bound excludes it, with room: the step is under one ulp of
-  // the state, well inside the `4 * ulp(s)` the docs now promise, and above the
-  // half-ulp the retired bound promised.
-  let step = alpha * contrast;
-  let ulp = ulp64(before);
-  assert!(
-    step < 4.0 * ulp,
-    "step {step} is inside the published bound"
+  // The witness that retired the `alpha > 2^-29` corollary is now out of domain
+  // rather than merely documented: its `tau` does not construct, and at the
+  // largest `tau` that does, its own contrast — one the emitted `f32` can
+  // express — moves the state instead of vanishing.
+  assert_eq!(
+    CadenceEma::try_new(f32::from_bits(0x4DFF_FFFF)),
+    Err(WinditError::TimeConstantOutOfRange),
+    "the retired witness tau (just under 2^29) is above MAX_TAU"
   );
-  assert!(step > 0.5 * ulp, "and outside the retired half-ulp one");
-
-  // The invariance break itself: the same 16 elements taken as one coarser hop
-  // carry 16x the coefficient and are not absorbed. Same signal, same tau, same
-  // elapsed distance, two cadences, two retained states.
-  let mut coarse = seed(&cfg);
-  let _ = coarse
-    .push(Windowed::new(X, Span::new(222_626_366, 1, 1)))
+  let retired_state = f64::from_bits(0x40E7_F76B_0747_0000);
+  let retired_x = f32::from_bits(0x473F_BB59);
+  let retired_contrast = (f64::from(retired_x) - retired_state).abs();
+  assert!(
+    retired_contrast >= f64::from(ulp32(retired_state as f32)) / 2.0,
+    "that contrast is expressible in the emitted f32"
+  );
+  let mut at_ceiling = CadenceEmaState {
+    tau: CadenceEma::MAX_TAU,
+    prev: Some((0, retired_state)),
+  };
+  let _ = at_ceiling
+    .push(Windowed::new(retired_x, Span::new(1, 1, 1)))
     .unwrap();
   assert_ne!(
-    retained(&coarse).to_bits(),
-    before.to_bits(),
-    "the coarse partition over the same elements must still move"
+    retained(&at_ceiling).to_bits(),
+    retired_state.to_bits(),
+    "at MAX_TAU the same expressible contrast moves the state"
   );
 }
 
 #[test]
 fn cadence_ema_published_absorption_bound_survives_a_randomized_sweep() {
   // The published bound, enforced rather than described: a step above
-  // `4 * ulp(s)` must leave the retained `f64` different, and a contrast the
-  // emitted `f32` can express must do so whenever `alpha` clears `2^-26`.
+  // `4 * ulp(s)` must leave the retained `f64` different, and — now
+  // unconditionally, at every accepted configuration — a contrast the emitted
+  // `f32` can express must do so too.
   //
-  // States are built with full 52-bit mantissas at exponents spanning the
-  // useful range, and `x` is engineered to straddle the bar — the geometry the
-  // three retired bounds were never searched against.
-  const PUBLISHED_ULPS: f64 = 4.0;
-  const COROLLARY_ALPHA: f64 = 1.0 / 67_108_864.0; // 2^-26
-
+  // The sweep runs over the ACCEPTED DOMAIN and nothing else: `tau` in every
+  // binade from the smallest subnormal to `MAX_TAU`, with the ceiling itself
+  // forced in, rather than the `2^0..2^41` convenience range this used to walk
+  // — a range that was partly outside what the constructor now admits and left
+  // the domain's own edge unprobed. States are built with full 52-bit mantissas
+  // at exponents spanning the useful range, and `x` is engineered to straddle
+  // the bar.
   let mut rng: u64 = 0x243F_6A88_85A3_08D3;
   let mut enforced = 0u32;
   let mut corollary = 0u32;
+  let mut at_ceiling = 0u32;
 
-  for _ in 0..3_000 {
-    // A `tau` spanning the whole validated range, and a cadence to match.
-    let exp = (xorshift(&mut rng) % 41) as i32;
-    let tau = libm::ldexpf(1.0 + next_unit(&mut rng), exp);
+  for probe in 0..3_000u32 {
+    // A `tau` spanning the accepted domain, and a cadence to match. Every
+    // eighth probe sits exactly at the ceiling, where `alpha` is smallest and
+    // the corollary is tightest.
+    let tau = if probe % 8 == 0 {
+      at_ceiling += 1;
+      CadenceEma::MAX_TAU
+    } else {
+      let exp = (xorshift(&mut rng) % 176) as i32 - 149; // 2^-149 ..= 2^26
+      libm::ldexpf(1.0 + next_unit(&mut rng), exp).min(CadenceEma::MAX_TAU)
+    };
     let delta = 1 + (xorshift(&mut rng) % 64) as usize;
     let cfg = CadenceEma::new(tau);
     let alpha = f64::from(cfg.alpha_for(delta));
-    // A saturated or vanished coefficient has no absorption boundary to probe.
-    if alpha.is_nan() || alpha <= 0.0 || alpha >= 1.0 {
+    // The domain invariant every unconditional figure rests on, asserted for
+    // every probe rather than used as a filter: no accepted `tau` may derive a
+    // coefficient at or below `2^-26` for `delta >= 1`.
+    assert!(
+      cfg.alpha_for(delta) > ALPHA_FLOOR,
+      "tau {tau:e} delta {delta} derived alpha {alpha:e}, at or below the 2^-26 floor"
+    );
+    // A saturated coefficient has no absorption boundary to probe.
+    if alpha >= 1.0 {
       continue;
     }
 
@@ -1214,7 +1357,7 @@ fn cadence_ema_published_absorption_bound_survives_a_randomized_sweep() {
         let _ = st.push(Windowed::new(x, Span::new(delta, 1, 1))).unwrap();
         let moved = retained(&st).to_bits() != p.to_bits();
 
-        if step > PUBLISHED_ULPS * ulp {
+        if step > PUBLISHED_ABSORPTION_ULPS * ulp {
           enforced += 1;
           assert!(
             moved,
@@ -1224,26 +1367,28 @@ fn cadence_ema_published_absorption_bound_survives_a_randomized_sweep() {
           );
         }
         // Half an `f32` ulp at this magnitude is the finest contrast the
-        // emitted value can express.
+        // emitted value can express. No `alpha` guard: the accepted domain
+        // supplies it, which is the whole point of bounding `tau`.
         let half_ulp32 = f64::from(ulp32(p as f32)) / 2.0;
-        if alpha > COROLLARY_ALPHA && contrast >= half_ulp32 {
+        if contrast >= half_ulp32 {
           corollary += 1;
           assert!(
             moved,
-            "corollary violated: alpha {alpha:?} > 2^-26 with an expressible \
-             contrast {contrast:?} on p {p:?} did not move the state"
+            "corollary violated: tau {tau} delta {delta} alpha {alpha:?} with an \
+             expressible contrast {contrast:?} on p {p:?} did not move the state"
           );
         }
       }
     }
   }
 
-  // Neither arm may pass vacuously.
+  // No arm may pass vacuously, and the ceiling must actually have been visited.
   assert!(
     enforced > 10_000,
     "too few probes above the bar: {enforced}"
   );
   assert!(corollary > 1_000, "too few corollary probes: {corollary}");
+  assert_eq!(at_ceiling, 375, "the domain edge must be swept");
 }
 
 #[test]
@@ -1258,8 +1403,9 @@ fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
   // error does not. Both ends are pinned so the docs cannot drift back to a flat
   // "cadences agree to about an ulp".
   const TAU: f32 = 1024.0;
-  // 8 * 2^-25. The worst ratio measured over `tau` 3..10007 and distances
-  // `tau/4`..`12 tau` was 2x; this leaves two binary orders of headroom.
+  // 8 * 2^-25. The worst ratio measured over the whole swept grid — `tau` 3 to
+  // 10007 at `tau/4`..`12 tau`, and the power-of-two ladder to 2^20 at
+  // `tau/4`..`4 tau` — was 2x; this leaves two binary orders of headroom.
   const SWING_ERR: f64 = 8.0 / 33_554_432.0;
 
   // `x0` at position 0, then a constant `x1` over `d` elements at `hop` cadence.
@@ -1306,6 +1452,28 @@ fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
       );
     }
   }
+  // Up the `tau` ladder, driven push by push rather than materialized: a fine
+  // cadence over `4 tau` at `tau = 2^20` is four million windows. The claim is
+  // about the whole accepted domain, and the top of it — one time constant at
+  // `MAX_TAU`, where the error peaks — is enforced by
+  // `cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one`, whose
+  // `4`-ulp bound at `exp(-1)` IS this bound at `d = tau` for a unit swing.
+  for k in 10..=20u32 {
+    let tau = libm::ldexpf(1.0, k as i32);
+    let n = tau as usize;
+    for (num, den) in [(1usize, 4usize), (1, 1), (2, 1), (4, 1)] {
+      let d = n * num / den;
+      for (x0, x1) in [(0.0f32, 1.0f32), (1.0, 0.0)] {
+        let fine = streamed(tau, 1, d, x0, x1);
+        let coarse = streamed(tau, d, d, x0, x1);
+        let bound = SWING_ERR * f64::from(x1 - x0).abs();
+        assert!(
+          (f64::from(fine) - f64::from(coarse)).abs() <= bound,
+          "tau 2^{k}, d = {num}/{den} tau, {x0} -> {x1}: |{fine} - {coarse}| exceeds {bound}"
+        );
+      }
+    }
+  }
 
   let n = TAU as usize;
   let sampled = |hop: usize, d: usize, x0: f32, x1: f32| sampled(TAU, hop, d, x0, x1);
@@ -1324,14 +1492,33 @@ fn cadence_agreement_is_absolute_in_the_swing_not_relative_to_the_result() {
   // At `d / tau = 12` the residual is exponentially smaller than the error, so
   // the same absolute agreement reads as ~10^4 ulps. Bounded on BOTH sides: a
   // bare `> 1_000` would also admit 10^6 and so could not enforce the figure
-  // the docs quote (measured 10833..10865 over `tau` 3..10007).
-  let d = n * 12;
-  let (fine, coarse) = (sampled(1, d, 1.0, 0.0), sampled(d, d, 1.0, 0.0));
-  let apart = ulps32(fine, coarse).abs();
-  assert!(
-    (5_000..=20_000).contains(&apart),
-    "a residual decayed by 12 tau must be ~10^4 ulps apart, got {apart}: {fine} vs {coarse}"
-  );
+  // the docs quote. Swept over the `tau` range rather than read at one `tau`,
+  // since the docs quote it for the range (measured 10832..15746, the top of
+  // that from a fractional `tau` whose `d / tau` lands at 11.66).
+  for tau in [3.0f32, 17.5, 251.0, 1024.0, 10007.0, 65_536.0] {
+    let d = (tau as usize) * 12;
+    let (fine, coarse) = (streamed(tau, 1, d, 1.0, 0.0), streamed(tau, d, d, 1.0, 0.0));
+    let apart = ulps32(fine, coarse).abs();
+    assert!(
+      (5_000..=20_000).contains(&apart),
+      "tau {tau}: a residual decayed by 12 tau must be ~10^4 ulps apart, \
+       got {apart}: {fine} vs {coarse}"
+    );
+  }
+}
+
+/// Seed `x0` at position 0, then a constant `x1` every `hop` elements out to
+/// `d`, driven push by push rather than materialized: the long cadences below
+/// run to millions of windows, which as a `Vec` would be gigabytes.
+fn streamed(tau: f32, hop: usize, d: usize, x0: f32, x1: f32) -> f32 {
+  let mut s = CadenceEma::new(tau).smoother();
+  let mut out = s.push(Windowed::new(x0, Span::new(0, 1, 1))).unwrap().value;
+  let mut p = 0usize;
+  while p + hop <= d {
+    p += hop;
+    out = s.push(Windowed::new(x1, Span::new(p, 1, 1))).unwrap().value;
+  }
+  out
 }
 
 /// Drive a falling unit cadence from a seed of `1.0` over `n` elements, push by
@@ -1369,10 +1556,20 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
   // "Much as", not "to an ulp". The claim this replaces said the two land on
   // `exp(-1)` *within one* ulp, and was enforced by a `1e-6` tolerance — over
   // 33 ulps at this magnitude, so slack enough to admit any of the answers
-  // below. The measured worst case over every integer `tau` from 2 to 40000
-  // plus sampled fractional `tau` to 4e7 is 2 ulps from `exp(-1)` and 3 ulps
-  // between the cadences; `4` is the conservative figure published, and is what
-  // this sweep enforces, in exact representable steps rather than a tolerance.
+  // below.
+  //
+  // The sweep is quantified over the ACCEPTED DOMAIN, not over a convenience
+  // range: every integer `tau` from 1 to 1024, sampled fractional `tau`, a
+  // power-of-two ladder, and `MAX_TAU` itself — the largest `tau` this type
+  // admits. That is the fix for how this claim was falsified: it was measured
+  // over `tau` to 4e7 and stated without a limit, while the constructor took
+  // every positive finite `f32`, so `tau = 2^55` — where a unit cadence cannot
+  // move the state at all and the two cadences end millions of ulps apart —
+  // satisfied the type and contradicted the figure. The domain now stops below
+  // that regime and this sweep runs to the new edge. Measured worst case over
+  // it: 2 ulps from the closed form and 2 between the cadences; `4` is the
+  // conservative figure published, enforced here in exact representable steps
+  // rather than through a tolerance.
   const BOUND: i64 = 4;
   let inv_e = (1.0f64 / core::f64::consts::E) as f32;
   assert_eq!(inv_e.to_bits(), 0x3EBC_5AB2, "nearest f32 to exp(-1)");
@@ -1391,7 +1588,7 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
 
   // Every integer tau across the swept range, plus fractional ones, in exact
   // ulps. `n = tau` keeps the elapsed distance at exactly one time constant.
-  for tau in 2..=1_024usize {
+  for tau in 1..=1_024usize {
     let cfg = CadenceEma::new(tau as f32);
     let fine = one_tau_fine(&cfg, tau);
     let coarse = one_tau_coarse(&cfg, tau);
@@ -1411,7 +1608,7 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
   // and the target is `exp(-n / tau)` rather than `exp(-1)`.
   let mut rng: u64 = 0xB5AD_4ECE_DA10_1010;
   for _ in 0..256 {
-    let tau = 2.0 + next_unit(&mut rng) * 1_022.0;
+    let tau = 1.0 + next_unit(&mut rng) * 1_023.0;
     let n = tau as usize;
     let cfg = CadenceEma::new(tau);
     let fine = one_tau_fine(&cfg, n);
@@ -1429,16 +1626,40 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
     );
   }
 
-  // The deep regime the type exists for, kept from the test this replaces: at
-  // `tau = 4e7` the per-step coefficient is smaller than the state's own `f32`
-  // resolution, so covering one `tau` at a unit cadence costs 4e7 pushes and an
-  // `f32` accumulator would not move at all.
-  let cfg = CadenceEma::new(4e7);
-  let n = 4e7f32 as usize;
+  // The deep regime the type exists for, walked up to the edge of the domain.
+  // Past `tau = 2^25` the per-step coefficient is smaller than the state's own
+  // `f32` resolution, so an `f32` accumulator would not move at all and one
+  // `tau` at a unit cadence costs tens of millions of pushes — which is exactly
+  // why this end went unswept before, and exactly where the claim died.
+  for k in 11..=25u32 {
+    let tau = libm::ldexpf(1.0, k as i32);
+    let cfg = CadenceEma::new(tau);
+    let n = tau as usize;
+    let fine = one_tau_fine(&cfg, n);
+    let coarse = one_tau_coarse(&cfg, n);
+    assert!(
+      ulps32(fine, inv_e).abs() <= BOUND,
+      "tau 2^{k}: fine {fine} is {} ulp from exp(-1)",
+      ulps32(fine, inv_e)
+    );
+    assert!(
+      ulps32(fine, coarse).abs() <= BOUND,
+      "tau 2^{k}: cadences {} ulp apart ({fine} vs {coarse})",
+      ulps32(fine, coarse)
+    );
+  }
+
+  // The edge itself: the largest `tau` the constructor accepts, where the
+  // coefficient is one ulp above the `2^-26` floor the whole domain is built
+  // around. Pinned on exact bits — one representable value below `exp(-1)`, and
+  // the two cadences one apart — so this cannot regress silently.
+  let cfg = CadenceEma::new(CadenceEma::MAX_TAU);
+  let n = CadenceEma::MAX_TAU as usize;
+  assert_eq!(n, 67_108_860);
   let fine = one_tau_fine(&cfg, n);
   let coarse = one_tau_coarse(&cfg, n);
-  assert_eq!(ulps32(fine, inv_e), -1, "tau 4e7 vs exp(-1)");
-  assert_eq!(ulps32(fine, coarse), -1, "tau 4e7 fine vs coarse");
+  assert_eq!(ulps32(fine, inv_e), -1, "MAX_TAU vs exp(-1)");
+  assert_eq!(ulps32(fine, coarse), -1, "MAX_TAU fine vs coarse");
 }
 
 #[test]

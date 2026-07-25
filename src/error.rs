@@ -146,13 +146,18 @@ pub enum WinditError {
     /// The number of elements the buffer would have held.
     elements: usize,
   },
-  /// A cadence-EMA time constant was not a positive, finite element count.
+  /// A cadence-EMA time constant fell outside `(0, CadenceEma::MAX_TAU]`
+  /// elements.
   ///
-  /// Returned by `CadenceEma::try_new` (`CadenceEma::new` panics instead): a
-  /// NaN, infinite, zero, or negative `tau` has no sane clamp target — `tau = 0`
-  /// would make an equal-start step compute `0/0` — so rejection is the only
-  /// honest total answer. Carries no payload: an `f32` field would cost this
-  /// enum its `Eq` derive, and the caller already holds the `tau` it passed.
+  /// Returned by `CadenceEma::try_new` (`CadenceEma::new` panics instead).
+  /// Neither end has a sane clamp target, so rejection is the only honest total
+  /// answer: a NaN, infinite, zero, or negative `tau` has no meaning at all —
+  /// `tau = 0` would make an equal-start step compute `0/0` — and a `tau` above
+  /// `CadenceEma::MAX_TAU` derives a per-step coefficient too small to move the
+  /// state at a unit cadence, so it names a silent no-op that no substitute
+  /// value could be said to approximate. Carries no payload: an `f32` field
+  /// would cost this enum its `Eq` derive, and the caller already holds the
+  /// `tau` it passed.
   TimeConstantOutOfRange,
   /// An N-of-M vote configuration was not satisfiable: the counts must obey
   /// `1 <= need <= of <= 64`.
@@ -224,7 +229,13 @@ impl core::fmt::Display for WinditError {
         write!(f, "could not allocate a buffer of {elements} elements")
       }
       Self::TimeConstantOutOfRange => {
-        f.write_str("cadence time constant tau must be finite and positive (in elements)")
+        // The ceiling is read from the constant rather than spelled again, so
+        // the message cannot drift from the domain it reports.
+        write!(
+          f,
+          "cadence time constant tau must be in (0, {}] elements",
+          crate::smooth::CadenceEma::MAX_TAU
+        )
       }
       Self::InvalidVote { need, of } => {
         write!(
