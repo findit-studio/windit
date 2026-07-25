@@ -1047,6 +1047,12 @@ impl GatePolicy<f32> for Vote {
 /// (`end 3 - origin 0 >= 3`). Consequently a `confirm` at or below the first
 /// window's length never suppresses anything.
 ///
+/// `confirm = usize::MAX` is the opposite pole and never confirms. It is
+/// suppressed explicitly rather than left to the comparison: the widest run a
+/// `Span` pair can describe — `[0, 1)` folded with
+/// `[usize::MAX - 1, usize::MAX)` — reaches `horizon - origin == usize::MAX`,
+/// which meets `>= confirm` exactly and would otherwise activate.
+///
 /// On a gapped plan (hop exceeding window), the distance is positional:
 /// elements no span covers still count toward confirmation as long as the
 /// inner flag run is continuous across the gap. That is the element-
@@ -1089,7 +1095,8 @@ impl<P> Dwell<P> {
   /// `confirm` continuous input elements.
   ///
   /// Infallible: every `usize` is a meaningful confirmation distance,
-  /// including `0` (exact pass-through) and [`usize::MAX`] (never confirms).
+  /// including `0` (exact pass-through) and [`usize::MAX`], which never
+  /// confirms — a suppressed sentinel, not merely an unreachable comparison.
   #[must_use]
   pub const fn new(inner: P, confirm: usize) -> Self {
     Self { inner, confirm }
@@ -1152,6 +1159,20 @@ impl<V, G: Gate<V>> Gate<V> for DwellState<G> {
         None => (start, span.end()),
       };
       self.run = Some((origin, horizon));
+      // `usize::MAX` is the documented never-confirming configuration, and it
+      // is the one value the `>=` test below cannot enforce on its own: the
+      // widest run a `Span` pair can describe — `[0, 1)` then
+      // `[usize::MAX - 1, usize::MAX)` — folds to `origin = 0` and
+      // `horizon = usize::MAX`, so `horizon - origin` meets `confirm` exactly
+      // and confirms. Suppressing the sentinel here keeps the promise total.
+      // The run above is still folded, so the state machine stays uniform and
+      // only the decision is withheld. `Hangover` needs no counterpart: its
+      // test has the opposite sense (`gap < hold`), and `Span`'s own invariants
+      // — `len >= 1`, and no `start + len` overflow — cap the gap at
+      // `usize::MAX - 2`, two elements short of the sentinel.
+      if self.confirm == usize::MAX {
+        return Ok(false);
+      }
       // `origin <= start <= horizon` under monotone starts, so this cannot
       // underflow; `saturating_sub` is the last line of defence, not
       // load-bearing.
@@ -1219,7 +1240,13 @@ impl<V, P: GatePolicy<V>> GatePolicy<V> for Dwell<P> {
 /// [`Segmenter`]'s merge fold uses.
 ///
 /// `hold = 0` is an exact pass-through: no gap is `< 0` (an adjacent window
-/// has gap `0`, which is not `< 0`). An inner `true` seen again during the
+/// has gap `0`, which is not `< 0`). `hold = usize::MAX` is the opposite pole
+/// and never releases once activated. That one falls out of the comparison
+/// rather than needing [`Dwell`]'s explicit guard, because the test has the
+/// opposite sense: [`Span`] requires `len >= 1` and rejects a `start + len`
+/// overflow, so a coverage horizon is at least `1` and a start at most
+/// `usize::MAX - 1`, capping the gap at `usize::MAX - 2` — strictly below the
+/// sentinel. An inner `true` seen again during the
 /// hold re-folds the horizon, so `Hangover` causally bridges inner-flag gaps
 /// shorter than `hold` into one flag run. `last_yes_end` is never cleared on
 /// release — under monotone starts a later gap can only grow, so a stale

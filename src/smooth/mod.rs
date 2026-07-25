@@ -204,9 +204,12 @@ impl<V> SmoothPolicy<V> for Identity {
 /// and `Ema` claims nothing more — its `alpha` is per-push and carries no
 /// cadence, so it has no sampling-invariance property to violate.
 /// [`CadenceEma`], which does claim one, carries its state in `f64` to push the
-/// same degeneracy 28 binary orders further out; that relocates the boundary
-/// rather than removing it, and its own *Fine cadences* bullet states the
-/// conditional guarantee that survives.
+/// same degeneracy 29 binary orders further out — there `1 - alpha` collapses to
+/// exactly `1.0` at `2^-54` rather than at `2^-25`, `2^-54` being the tie that
+/// rounds to even and `2^-53` still being exactly representable — and bounds its
+/// time constant so the collapse cannot be configured at all. That relocates the
+/// boundary rather than removing it, and its own *Fine cadences* bullet states
+/// what survives.
 ///
 /// This policy is infallible, so [`Ema::new`] clamps `alpha` into `[0, 1]`
 /// deterministically: a non-finite (NaN) `alpha` clamps to `0.0` (hold the
@@ -320,12 +323,45 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
   // there and saturates to exactly the same 1.0 at the large end, since both
   // forms reach it as soon as `exp(-x)` falls below half an ulp of 1.
   //
-  // `delta as f32` rounds above 2^24, but harmlessly: the cast is correct to a
-  // relative 2^-24, so the ratio — and with it the coefficient — lands within
-  // an ulp of the exact one at every `tau`. `expm1f` returns no NaN for the
-  // non-positive finite arguments produced here, so with a
-  // constructor-validated `tau` the coefficient stays in `[0, 1]`.
-  -libm::expm1f(-(delta as f32) / tau)
+  // The ratio is formed in `f64` and narrowed once. Spelling it
+  // `(delta as f32) / tau` instead rounded the *count* before the division ran
+  // — `delta as f32` cannot represent an integer above 2^24 exactly — and that
+  // avoidable rounding composed with the division's own to put the coefficient
+  // 2.25 ulps from the exact one at `tau = MAX_TAU, delta = 16_812_203`, with
+  // 29_711 further breaches of the two-ulp figure below among the `delta`s that
+  // one `tau` admits. `delta as f64` is exact to 2^53 and `f64::from` widens
+  // `tau` exactly, so the only rounding left on the ratio is the single
+  // narrowing to `f32`: worst case 1.49 coefficient ulps over the enumerated
+  // boundary sweep in
+  // `cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one`, and 1.51
+  // over a wider offline sweep of the same structure (~2e8 probes, none above
+  // two ulps, against 29_711 breaches for the cast). A `delta`
+  // past 2^53 rounds in the `f64` cast too, harmlessly this time: `delta / tau`
+  // is then past 2^27 for every accepted `tau`, deep inside the region where
+  // the coefficient is exactly 1.0.
+  //
+  // Narrowing the ratio rather than carrying `f64` through `expm1` is
+  // deliberate. The coefficient IS an `f32` — `alpha_for` returns it and the
+  // state applies exactly that value — and every published figure is quantified
+  // over it, the `2^-26` floor `MAX_TAU` is derived from included. Rounding
+  // only at the end would be about an ulp sharper and would retire that
+  // derivation with it: the correctly rounded coefficient at `MAX_TAU` is
+  // exactly `2^-26`, the same value the first rejected `tau` yields, so the
+  // accepted domain would no longer hold the applied coefficient strictly above
+  // the `4 * ulp(s)` absorption bar. Sharpening the ratio, which is where the
+  // defect was, costs nothing here: below 2^24 the two spellings agree bit for
+  // bit at every accepted `tau` — by construction, not by measurement. `delta`
+  // is exactly representable there, so both are rounding the same quotient of
+  // two `f32`s, and `f64` carries more than twice `f32`'s significand
+  // (53 >= 2 * 24 + 2), which is the condition under which routing a quotient
+  // through the wider format cannot land it on the wrong side of an `f32`
+  // midpoint.
+  //
+  // `expm1f` returns no NaN for the non-positive arguments produced here —
+  // including the `-inf` an overflowing ratio narrows to, which returns exactly
+  // `-1.0` — so with a constructor-validated `tau` the coefficient stays in
+  // `[0, 1]`.
+  -libm::expm1f((-(delta as f64) / f64::from(tau)) as f32)
 }
 
 /// Cadence-portable exponential moving average: an EMA whose time constant is
@@ -343,15 +379,29 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 /// Because the coefficient tracks the cadence, one `tau` yields the same
 /// smoothing at any hop — regular or irregular — where a bare per-step [`Ema`]
 /// `alpha` does not: the configuration carries no cadence, the data does.
-/// That portability is a floating-point property with a floating-point limit,
-/// and it is conditional on the signal, not only on `tau`: the *Fine cadences*
-/// bullet below states the condition. (Lineage: the LiveKit EMA, made
-/// cadence-portable.)
+/// That portability is a floating-point property with a floating-point limit.
+/// Over differences the emitted `f32` can express it holds at every accepted
+/// configuration; below that resolution it stays signal-dependent, and the
+/// *Fine cadences* bullet below states exactly where the line falls. (Lineage:
+/// the LiveKit EMA, made cadence-portable.)
 ///
-/// `tau` is a positive, finite element count; [`new`](CadenceEma::new) and
-/// [`try_new`](CadenceEma::try_new) reject anything else, because there is no
-/// sane clamp target — `tau = 0` would make an equal-start step compute `0/0`. A
-/// caller working in another unit converts at the boundary
+/// `tau` is an element count in `(0, MAX_TAU]` — positive, finite, and no
+/// greater than [`MAX_TAU`](CadenceEma::MAX_TAU) (`2^26 - 4` elements);
+/// [`new`](CadenceEma::new) and [`try_new`](CadenceEma::try_new) reject anything
+/// else, because there is no sane clamp target at either end. `tau = 0` would
+/// make an equal-start step compute `0/0`; the ceiling is where the accuracy
+/// contract stops holding rather than where the filter stops working. Past it
+/// the unit coefficient no longer clears `2^-26`, so the absorption and
+/// one-`tau` figures below stop being provable of it — but the filter still
+/// runs: the first rejected `tau`, `2^26`, applies exactly `2^-26` per unit
+/// step, which moves a state seeded at `0.0` to exactly `2^-26`. A `tau` that
+/// genuinely cannot move a state of its own magnitude is 28 binary orders
+/// further out, and even there the freeze is a property of the state as much as
+/// of `tau`; [`MAX_TAU`](CadenceEma::MAX_TAU) says where. Bounding the domain is
+/// what makes the figures below true of *everything this type admits* rather
+/// than of a measured subrange: see [`MAX_TAU`](CadenceEma::MAX_TAU) for the
+/// derivation. A caller
+/// working in another unit converts at the boundary
 /// (`tau_elements = tau_other * elements_per_unit`); the unit never enters this
 /// API.
 ///
@@ -364,48 +414,85 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 ///   — mirroring [`Ema`] at `alpha = 0`.
 /// - **Fine cadences keep their coefficient; whether they keep its *effect*
 ///   depends on the signal.** The coefficient is derived in a form that stays
-///   exact as `delta / tau` shrinks, so it never rounds to zero — with a
-///   validated `tau` it cannot fall below about `2^-128` at `delta = 1` — and
-///   the state is carried in `f64` rather than `f32`, which moves the point
-///   where a step is lost 29 binary orders further out. Neither makes cadence
-///   invariance unconditional, and in finite precision nothing can: the step a
-///   push contributes is `alpha * (x - s)` and it is added to a state of
-///   magnitude `|s|`, so it survives only while
+///   exact as `delta / tau` shrinks, so it never rounds to zero — and the
+///   accepted domain floors it at `2^-26` for `delta = 1`, the smallest
+///   coefficient any accepted `tau` can produce — while the state is carried in
+///   `f64` rather than `f32`, which moves the point where a step is lost 29
+///   binary orders further out. Neither makes cadence invariance unconditional,
+///   and in finite precision nothing can: the step a push contributes is
+///   `alpha * (x - s)` and it is added to a state of magnitude `|s|`, so it
+///   survives only while
 ///
 ///   ```text
-///   alpha * |x - s|  >  ulp(s) / 2
+///   alpha * |x - s|  >  4 * ulp(s)
 ///   ```
 ///
-///   Below that the push leaves the state bit-identical and that cadence stops
-///   moving for good, however far `alpha` sits above any flat threshold on
-///   `delta / tau` alone. Dividing by `|s|` and writing
-///   the *contrast* `rho = |x - s| / |s|`, an `f64` state makes the condition
-///   `alpha * rho > 2^-53` (`2^-54` at the top of a binade) — a bound on the
-///   product, not on `alpha` alone. Unit contrast recovers `alpha > 2^-53`; a
-///   contrast of one `f32` ulp (`rho = 2^-23`) is already absorbed at
-///   `alpha = 2^-30`, `2^23` times sooner. The guarantee worth relying on is
-///   therefore the one stated over *representable* differences: an `f32`
-///   half-ulp is exactly `2^29` `f64` half-ulps at the same magnitude, so every
-///   difference the emitted `f32` can express still moves the state while
-///   `alpha` stays above `2^-29` (~1.9e-9) — a factor of 64 below `f32`'s
-///   epsilon, reached by a `tau` past about `2^29` (~5.4e8) elements at a unit
-///   cadence. Differences finer than that never reach the output anyway. Two
-///   edges bound the picture: a state of exactly `0.0` has no relative
-///   resolution to lose, so `s = alpha * x` survives whatever `alpha` is; and
-///   `|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input,
-///   so the state cannot be pushed into `f64`'s subnormals in one step and the
-///   relative reading of `ulp(s)` is the operative one until a long decay run
-///   drives the state to a value the emitted `f32` already reports as zero.
+///   Below that the push may leave the state bit-identical, and a cadence
+///   absorbed once is absorbed for good — the state is then a fixed point of
+///   its own map — however far `alpha` sits above any flat threshold on
+///   `delta / tau` alone.
+///
+///   The `4` is not the half-ulp a single correctly-rounded step would give.
+///   The recurrence evaluates two *separately rounded* products and adds them,
+///   so a step is measured against three roundings rather than one: `1 - alpha`,
+///   the product `(1 - alpha) * s`, and the final sum each cost up to half an
+///   ulp of `|s|`, which bounds absorption at `(1.5 + alpha) * ulp(s)`. The
+///   published `4` is deliberately looser than that derivation *and* than
+///   measurement: an adversarial search over the accepted domain — ~1.4e8 probes
+///   above the bar, every accepted `tau` binade and
+///   [`MAX_TAU`](CadenceEma::MAX_TAU) itself, non-dyadic retained states, binade
+///   edges, both signs — found nothing absorbed above one `ulp(s)`, and
+///   `0.95 * ulp(s)` is reachable from two ordinary pushes. The three bounds
+///   this one replaces were each derived and published without such a search,
+///   and each was falsified by a case the derivation did not model.
+///
+///   Dividing by `|s|` and writing the *contrast* `rho = |x - s| / |s|`, an
+///   `f64` state makes the condition `alpha * rho > 2^-50` (`2^-51` at the top
+///   of a binade) — a bound on the product, not on `alpha` alone. That is what
+///   [`MAX_TAU`](CadenceEma::MAX_TAU) is for, and what it buys: it bounds
+///   `alpha` from *below*, at `2^-26` for `delta = 1` and higher for every
+///   larger `delta`, and an `f32` half-ulp is `2^28` `f64` ulps at the same
+///   magnitude, so on the accepted domain
+///
+///   ```text
+///   alpha * |x - s|  >  2^-26 * 2^28 * ulp(s)  =  4 * ulp(s)
+///   ```
+///
+///   for every difference the emitted `f32` can express. **Every representable
+///   difference therefore moves the state, at every accepted configuration** —
+///   unconditional over the domain, not conditional on the caller having picked
+///   a small enough `tau`. What stays absorbed is exactly what the output could
+///   never have shown: a contrast finer than `f32` resolution, which can be
+///   absorbed at any accepted `tau`. Two edges bound the picture: a state of
+///   exactly `0.0` has no relative resolution to lose, so `s = alpha * x`
+///   survives whatever `alpha` is; and `|alpha * x|` cannot fall below about
+///   `2^-175` for a nonzero `f32` input, so the state cannot be pushed into
+///   `f64`'s subnormals in one step and the relative reading of `ulp(s)` is the
+///   operative one until a long decay run drives the state to a value the
+///   emitted `f32` already reports as zero.
 /// - **Cadences agree to about an ulp of the *swing*, not of the result:** each
 ///   output is the `f64` state rounded to `f32`, and the coefficient is an
 ///   `f32`, so the retained fraction `1 - alpha` is resolved only to an absolute
 ///   `2^-25`. That error multiplies the distance between the state and the
 ///   input, so two cadences covering the same elapsed distance differ by a small
 ///   multiple of `2^-25 * |x - s_0|` — measured at no more than four times that,
-///   over `tau` from 3 to 10007 and distances from `tau/4` to `12 tau`. Where the
-///   result is a healthy fraction of that swing this is about an ulp of the
-///   result: a unit cadence and a single `tau`-sized step both land on `exp(-1)`
-///   within one. Where the state has instead decayed by many `tau`, the residual
+///   over `tau` from 3 to 10007 at distances from `tau/4` to `12 tau` and over
+///   the `tau` ladder to `2^20` at distances from `tau/4` to `4 tau`. Where the
+///   result is a healthy fraction of that swing this is a *few* ulps of the
+///   result, not one: over one `tau` of elapsed distance, for any accepted
+///   `tau >= 1`, a unit cadence lands within `4` ulps of the nearest `f32` to
+///   `exp(-1)`, and within `4` ulps of a single `tau`-sized step. Measurement
+///   puts both at `2` — the worst case over every integer `tau` from 1 to 1024,
+///   sampled fractional `tau`, and a ladder of powers of two through
+///   [`MAX_TAU`](CadenceEma::MAX_TAU) itself, which is the whole domain this
+///   type accepts — so `4` is again the conservative published figure. `tau = 14`
+///   and `tau = 238` both land exactly two ulps below `exp(-1)`, which is why
+///   the claim is no longer "within one". This one is quantified over the
+///   accepted domain rather than over a swept subrange of it: that distinction
+///   is why the ceiling exists, since the same statement is *false* at
+///   `tau = 2^55`, where a unit cadence cannot move a state of order `1` at all
+///   and the two cadences end millions of ulps apart. Where the state has
+///   instead decayed by many `tau`, the residual
 ///   is exponentially smaller than the error, and the same absolute agreement is
 ///   many ulps of that residual — about `2^-25 * exp(delta / tau)` in relative
 ///   terms, which measures at ~10^4 ulps by `delta / tau = 12`. Invariance is to
@@ -435,17 +522,55 @@ pub struct CadenceEma {
 }
 
 impl CadenceEma {
+  /// The largest accepted time constant: `2^26 - 4` elements — the largest `f32`
+  /// strictly below `2^26`, about 6.7e7.
+  ///
+  /// Derived from the guarantee rather than chosen for roundness. Every
+  /// unconditional statement this type makes rests on the per-step coefficient
+  /// staying above `2^-26`: half an `f32` ulp is `2^28` `f64` ulps at the same
+  /// magnitude, so `alpha > 2^-26` is exactly what lifts every difference the
+  /// emitted `f32` can express above the `4 * ulp(s)` absorption bar (the *Fine
+  /// cadences* bullet derives it). [`alpha_for(1)`](CadenceEma::alpha_for) falls
+  /// as `tau` grows, and this is the largest `f32` at which it is still strictly
+  /// above `2^-26`: it yields `2^-26 + 2^-49`, while one `f32` step further out,
+  /// at `tau = 2^26`, the coefficient is exactly `2^-26` and the product lands
+  /// *on* the bar instead of above it.
+  ///
+  /// No usable configuration is lost — `2^26` elements is over a week of audio
+  /// at a 10 ms hop.
+  ///
+  /// That makes this an accuracy boundary, not a liveness one. The first
+  /// rejected `tau` still filters: at `2^26` one unit push moves a state seeded
+  /// at `0.0` to exactly `2^-26`, and one unit push decays a state of `1.0` by
+  /// the same amount. Landing on the bar rather than above it is the whole of
+  /// what it loses, and what would turn the unconditional statements above into
+  /// claims this crate cannot prove of it.
+  ///
+  /// The regime where a filter really does stop filtering is far further out and
+  /// depends on the state, not on `tau` alone: from `tau = 2^54` the `f64`
+  /// `1 - alpha` rounds to exactly `1.0` at `delta = 1`, leaving the recurrence
+  /// no decay term at all — it degenerates to `s <- s + alpha * x`, which drifts
+  /// in `sign(x)` and cannot relax toward the input, exactly as [`Ema`]'s doc
+  /// walks it at `2^-25` for an `f32` state. Against a state of order `1` that
+  /// increment is under half an ulp, so the state is bit-identical forever while
+  /// a single `tau`-sized step still decays it to `exp(-1)`; against a state of
+  /// `0.0` it still moves, by exactly `alpha * x`. `2^54` is 28 binary orders
+  /// above this ceiling, which is the margin the accuracy bar buys and the
+  /// reason freeze language belongs there and not here.
+  pub const MAX_TAU: f32 = 67_108_860.0;
+
   /// A cadence-portable EMA with the given element-denominated time constant.
   ///
   /// # Panics
   ///
-  /// Panics, in every build, unless `tau` is finite and strictly positive. Use
+  /// Panics, in every build, unless `tau` is strictly positive and no greater
+  /// than [`MAX_TAU`](CadenceEma::MAX_TAU). Use
   /// [`try_new`](CadenceEma::try_new) to handle an untrusted `tau` instead.
   #[must_use]
   pub const fn new(tau: f32) -> Self {
     match Self::try_new(tau) {
       Ok(cfg) => cfg,
-      Err(_) => panic!("a cadence time constant tau must be finite and positive"),
+      Err(_) => panic!("a cadence time constant tau must be in (0, CadenceEma::MAX_TAU] elements"),
     }
   }
 
@@ -454,18 +579,27 @@ impl CadenceEma {
   ///
   /// # Errors
   ///
-  /// Returns [`WinditError::TimeConstantOutOfRange`] if `tau` is `NaN`, infinite,
-  /// zero, or negative. A non-positive or non-finite time constant has no sane
-  /// clamp target, so rejection is the only honest total answer.
+  /// Returns [`WinditError::TimeConstantOutOfRange`] unless `tau` lies in
+  /// `(0, MAX_TAU]` — so `NaN`, either infinity, zero, a negative `tau`, and any
+  /// `tau` above [`MAX_TAU`](CadenceEma::MAX_TAU) are all rejected. Neither end
+  /// has a sane clamp target, so rejection is the only honest total answer: a
+  /// non-positive `tau` has no meaning at all, and one past the ceiling names a
+  /// filter this crate can still run but can no longer make its accuracy
+  /// statements about — its unit coefficient stops clearing `2^-26` — while no
+  /// substitute value could be said to approximate the `tau` the caller asked
+  /// for.
   pub const fn try_new(tau: f32) -> Result<Self, WinditError> {
-    if tau.is_finite() && tau > 0.0 {
+    // No `is_finite` test: `NaN` fails both comparisons, `+inf` fails the upper
+    // bound, and `-inf` the lower, so the interval check is already total.
+    if tau > 0.0 && tau <= Self::MAX_TAU {
       Ok(Self { tau })
     } else {
       Err(WinditError::TimeConstantOutOfRange)
     }
   }
 
-  /// The element-denominated time constant, always finite and positive.
+  /// The element-denominated time constant, always in
+  /// `(0, `[`MAX_TAU`](CadenceEma::MAX_TAU)`]`.
   #[must_use]
   pub const fn tau(&self) -> f32 {
     self.tau
@@ -477,7 +611,9 @@ impl CadenceEma {
   /// The exact function the streaming state applies, exposed for tests and
   /// downstream calibration. It is `0.0` at `delta = 0`, monotonically
   /// non-decreasing in `delta`, and saturates to `1.0` once the gap dwarfs
-  /// `tau`.
+  /// `tau`. For every `delta >= 1` it is strictly above `2^-26`, whatever the
+  /// accepted `tau` — the floor [`MAX_TAU`](CadenceEma::MAX_TAU) is chosen to
+  /// hold, and the one the accuracy guarantees rest on.
   #[must_use]
   pub fn alpha_for(&self, delta: usize) -> f32 {
     cadence_alpha(self.tau, delta)
@@ -521,26 +657,36 @@ impl Smoother<f32> for CadenceEmaState {
         let delta = start - prev_start; // cannot underflow after the check
 
         // The `f32` coefficient `alpha_for` reports, applied in `f64`. The
-        // widening is the accumulator's, not the coefficient's: `alpha` is
-        // still derived once, in f32, so the inspectable coefficient and the
-        // streaming state cannot drift.
+        // widening is the accumulator's, not the coefficient's: both paths call
+        // the one `cadence_alpha` and both get the same `f32` back, so the
+        // inspectable coefficient and the streaming state cannot drift.
         //
         // The *state* must be the wider type, not merely the arithmetic — an
         // f32 result would re-round to the same fixed point every step. In the
         // deepest regime the loss is inside the coefficient, where `1.0 - alpha`
         // rounds to exactly `1.0` (f32 at any `alpha` of `2^-25` or below, f64
-        // at `2^-53`), so both addends are already exact and a carried
-        // compensation term would have nothing to hold. Above that regime the
+        // at `2^-54` or below — `2^-53` is still exactly representable there,
+        // and `2^-54` is the tie that rounds to even), so both addends are
+        // already exact and a carried compensation term would have nothing to
+        // hold. Above that regime the
         // loss is in the final addition, and a compensated or double-double
         // accumulator *would* recover it — deliberately not carried: each such
         // widening only relocates the boundary (coefficient -> f32 accumulator
         // -> f64 accumulator was three rounds of exactly that), never removes
         // it, since invariance is unachievable in finite precision. The contract
         // is documented instead: see the *Fine cadences* bullet on `CadenceEma`
-        // for the contrast-dependent condition that actually holds. Rearranging
-        // to `prev + alpha * (x - prev)` puts the loss back into an addend, but
-        // is absorbed at the same threshold *and* forfeits exact tracking at
-        // `alpha == 1`, where `prev + (x - prev)` is not `x` for a large `prev`.
+        // for the contrast-dependent condition that actually holds.
+        //
+        // Rearranging to `prev + alpha * (x - prev)` puts the loss back into a
+        // single addend and IS sharper — measured absorption ceilings of
+        // `0.50 * ulp(prev)` against this form's `1.48`, since one rounding
+        // replaces three. It is still declined, because it forfeits exact
+        // tracking at `alpha == 1`: `prev + (x - prev)` returns `0.0`, not `x`,
+        // once `prev` is large enough that `x - prev` rounds to `-prev`
+        // (`cadence_ema_large_gap_forgets_and_washes_infinity_to_nan` pins that
+        // at `prev = 1e30`). Trading a documented three-rounding bound for a
+        // silent loss of the exact-forget edge is the worse deal; the bound is
+        // published conservatively instead.
         //
         // Keeping the algebra means every coefficient edge still falls out of
         // the one expression: `alpha == 1` gives `1 * x + 0 * prev`, which
@@ -573,11 +719,14 @@ impl SmoothPolicy<f32> for CadenceEma {
   fn smoother(&self) -> CadenceEmaState {
     // Unlike `EmaState`, this performs no coefficient re-clamp. `EmaState` can
     // restore its `alpha` invariant because `[0, 1]` has a valid clamp target;
-    // `tau` has none — there is no in-range substitute for a non-positive or
-    // non-finite time constant — so a `tau` that bypassed `new`/`try_new` (a
-    // future serde derive, say) is carried as-is and degrades to `NaN` outputs
-    // at worst, never a panic and never UB, because `alpha` is derived per push
-    // and the recurrence is total for any stored `tau`.
+    // `tau` has none — there is no in-range substitute for a non-positive, a
+    // non-finite, or an over-ceiling time constant — so a `tau` that bypassed
+    // `new`/`try_new` (a future serde derive, say) is carried as-is and degrades
+    // to `NaN` outputs or to a frozen state at worst, never a panic and never
+    // UB, because `alpha` is derived per push and the recurrence is total for
+    // any stored `tau`. The accuracy guarantees on `CadenceEma` are stated over
+    // the *accepted* domain and so would not cover such a state; keeping the
+    // only construction paths validating is what makes that domain the real one.
     CadenceEmaState {
       tau: self.tau,
       prev: None,

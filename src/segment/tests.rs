@@ -1499,6 +1499,32 @@ fn dwell_usize_max_never_activates() {
 }
 
 #[test]
+fn dwell_usize_max_never_activates_at_the_maximum_reachable_horizon() {
+  // The boundary the 50-span sweep above cannot reach: it only ever gets to
+  // horizon 50, where `horizon - origin >= usize::MAX` is false for reasons
+  // that say nothing about the sentinel. `Span::try_new` admits a start of
+  // `usize::MAX - 1` with `len = 1`, so a run whose origin is `0` and whose
+  // folded horizon is `usize::MAX` is constructible — and there
+  // `horizon - origin` equals `confirm` exactly, so the `>=` test confirms
+  // unless `usize::MAX` is suppressed outright.
+  let spans = [Span::new(0, 1, 1), Span::new(usize::MAX - 1, 1, 1)];
+  assert_eq!(spans[1].end(), usize::MAX, "the horizon must be reachable");
+  assert_eq!(
+    drive_dwell(&[true, true], &spans, usize::MAX),
+    vec![false, false],
+    "confirm = usize::MAX must never confirm, at the maximum horizon too"
+  );
+
+  // The suppression is of `usize::MAX` alone, not of large confirms generally:
+  // one element below it, the same run confirms on the second push.
+  assert_eq!(
+    drive_dwell(&[true, true], &spans, usize::MAX - 1),
+    vec![false, true],
+    "confirm = usize::MAX - 1 must still confirm at that horizon"
+  );
+}
+
+#[test]
 fn dwell_head_trim_vs_min_len_worked_example() {
   // Inner-true run over unit spans [0, 6), confirm = 3: confirms at position 2
   // (end 3 - origin 0 >= 3), so the finalized range starts at 2, not 0 — the
@@ -1780,6 +1806,44 @@ fn hangover_usize_max_never_releases_after_activation() {
   assert!(
     got.iter().all(|&f| f),
     "usize::MAX hold must never release: {got:?}"
+  );
+}
+
+#[test]
+fn hangover_usize_max_never_releases_at_the_maximum_reachable_gap() {
+  // `Dwell`'s symmetric boundary probe. The two differ in the sense of the
+  // comparison — `Dwell` confirms on `>= confirm`, `Hangover` holds on
+  // `< hold` — so where `Dwell` needed `usize::MAX` suppressed outright,
+  // `Hangover`'s promise survives on `Span`'s own invariants: `try_new`
+  // demands `len >= 1` (so a coverage horizon is at least `1`) and rejects a
+  // `start + len` overflow (so a start is at most `usize::MAX - 1`). The gap
+  // therefore tops out at `usize::MAX - 2`, two short of `hold`. Pinned here so
+  // a future relaxation of either `Span` invariant fails a test rather than
+  // silently consuming that slack.
+  let spans = [Span::new(0, 1, 1), Span::new(usize::MAX - 1, 1, 1)];
+  assert_eq!(
+    spans[1].start() - spans[0].end(),
+    usize::MAX - 2,
+    "the widest gap a Span pair can produce"
+  );
+  assert_eq!(
+    drive_hangover(&[true, false], &spans, usize::MAX),
+    vec![true, true],
+    "hold = usize::MAX must never release, at the maximum gap too"
+  );
+
+  // The release boundary is real and sits exactly at the reached gap, which is
+  // what makes the two elements of slack above a measurement rather than a
+  // guess.
+  assert_eq!(
+    drive_hangover(&[true, false], &spans, usize::MAX - 2),
+    vec![true, false],
+    "a hold equal to the gap releases (the comparison is strict)"
+  );
+  assert_eq!(
+    drive_hangover(&[true, false], &spans, usize::MAX - 1),
+    vec![true, true],
+    "one element more holds"
   );
 }
 
