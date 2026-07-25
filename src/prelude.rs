@@ -5,10 +5,12 @@
 //! ```
 //!
 //! The value, geometry, and scalar types are always available, as are the
-//! featureless smoothing, gating, and segmentation cores: the `Smoother` /
-//! `SmoothPolicy` and `Gate` / `GatePolicy` traits, the `Identity`, `Ema`,
-//! `Threshold`, and `Hysteresis` configs, and `Segmenter`, `SegmentTail`,
-//! `Range`, `SegmentOptions`. The `Vec`-returning algorithms — the planner, the
+//! featureless smoothing, gating, segmentation, and decoding cores: the
+//! `Smoother` / `SmoothPolicy` and `Gate` / `GatePolicy` traits, the `Identity`,
+//! `Ema`, and `CadenceEma` smoother configs, the `Threshold`, `Hysteresis`, and
+//! `Vote` gate configs with the `Dwell` and `Hangover` gate combinators,
+//! `Segmenter`, `SegmentTail`, `Range`, `SegmentOptions`, and the `Decoder`
+//! pipeline with its `Step` output. The `Vec`-returning algorithms — the planner, the
 //! pre-processing helpers, the aggregation and split families, and the batch
 //! segmentation drivers (`runs`, `longest_run`, `runs_sorted`) — are re-exported
 //! under the `alloc` feature, matching where they are defined. The content-aware
@@ -17,15 +19,18 @@
 //! `AggregatePolicyKind` under `serde`.
 
 pub use crate::{
+  // Featureless and always available: the value, geometry, and scalar types, the
+  // smoothing, gating, segmentation, and decoding cores, and the value surface.
+  // The `alloc`-gated block below adds the `Vec`-returning algorithms.
+  decode::{Decoder, Step},
   error::WinditError,
   plan::{Span, TailPolicy, WindowOptions},
   scalar::{Real, Scalar},
-  // The smoothing, gating, and segmentation cores are featureless, so they are
-  // always available.
   segment::{
-    Gate, GatePolicy, Hysteresis, Range, SegmentOptions, SegmentTail, Segmenter, Threshold,
+    Dwell, Gate, GatePolicy, Hangover, Hysteresis, Range, SegmentOptions, SegmentTail, Segmenter,
+    Threshold, Vote,
   },
-  smooth::{Ema, Identity, SmoothPolicy, Smoother},
+  smooth::{CadenceEma, Ema, Identity, SmoothPolicy, Smoother},
   windowed::{ComputeOf, Vector, WindowEmbedding, Windowed},
 };
 

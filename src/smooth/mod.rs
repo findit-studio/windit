@@ -10,6 +10,10 @@
 //! - [`Identity`] passes values through unchanged — the no-rewrite baseline,
 //!   generic over any `V`.
 //! - [`Ema`] is an exponential moving average (temporal low-pass) over `f32`.
+//! - [`CadenceEma`] is an exponential moving average whose time constant is
+//!   denominated in input elements rather than in pushes, so one configuration
+//!   yields the same smoothing at any cadence — regular or irregular — over
+//!   `f32`.
 //!
 //! The state traits and states allocate nothing and live in the featureless core
 //! tier; only the `Vec`-returning batch driver gates on `alloc`.
@@ -46,6 +50,17 @@ mod tests;
 /// `finish`; [`discontinuity`](Smoother::discontinuity) defaults to
 /// [`reset`](Smoother::reset). `Box<dyn Smoother<f32>>` is a valid object, so a
 /// smoother can be selected at run time.
+///
+/// # Span contract
+///
+/// Spans arrive in ascending [`Span::start`](crate::plan::Span::start) order,
+/// equal starts admitted — and that is the only ordering guaranteed. **Ends are
+/// not monotone:** nested and overlapping spans are legal, so a later span may end
+/// *before* one already seen. A stage that keeps a temporal horizon must
+/// therefore fold it by maximum (`horizon = max(horizon, span.end())`) and
+/// measure against that fold; reading the current span's end alone would let
+/// the horizon move backward. A strictly backward start is a contract
+/// violation, reported as [`WinditError::NonMonotonicSpan`].
 pub trait Smoother<V> {
   /// Advance by one window. The returned value keeps the input [`Span`].
   ///
@@ -53,9 +68,12 @@ pub trait Smoother<V> {
   ///
   /// # Errors
   ///
-  /// Returns a [`WinditError`] for a stage that reads spans out of order; the
-  /// shipped smoothers ([`Identity`], [`Ema`]) are infallible and always return
-  /// `Ok`, returning `Result` only for uniformity with the composable stages.
+  /// Returns [`WinditError::NonMonotonicSpan`] from a span-reading stage fed a
+  /// start before the previous one: [`CadenceEma`] derives its coefficient from
+  /// the span distance, so it reads spans and reports out-of-order input here.
+  /// [`Identity`] and [`Ema`] read no spans and are infallible, always returning
+  /// `Ok` and carrying the `Result` only for uniformity with the composable
+  /// stages.
   fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -162,10 +180,38 @@ impl<V> SmoothPolicy<V> for Identity {
 /// Exponential moving average: `s_t = alpha * x_t + (1 - alpha) * s_{t-1}`.
 ///
 /// Seeded with `s_0 = x_0`. A larger `alpha` tracks the input more closely; a
-/// smaller one smooths harder. This policy is infallible, so [`Ema::new`] clamps
-/// `alpha` into `[0, 1]` deterministically: a non-finite (NaN) `alpha` clamps to
-/// `0.0` (hold the seed). With a clamped alpha and finite inputs, the recurrence
-/// introduces no NaN.
+/// smaller one smooths harder — down to the point where `f32` runs out. State
+/// and arithmetic are both `f32` here, so an `alpha` of `2^-25` (~3e-8) or below
+/// makes `1 - alpha` round to exactly `1.0`. What is left is not a hold: the
+/// decay term is gone but the `alpha * x` injection is not, so the recurrence
+/// degenerates from a weighted average into the biased accumulator
+/// `s <- s + alpha * x`. Concretely, at `alpha = 2^-25` the state
+///
+/// - never relaxes *toward* the input. It moves only in the direction of
+///   `sign(x)`, by `alpha * |x|` per push, whatever the input's distance from it
+///   — so an input below the state can never pull it down.
+/// - climbs from a seed of `0.0` under a constant `x` in exact steps of
+///   `alpha * x` — one push of `1.0` puts it at exactly `2^-25`, two at `2^-24`
+///   — and stalls at `alpha * x * 2^24`, which is `x / 2` here, reached after
+///   exactly `2^24` pushes. It never arrives at `x` at all.
+/// - does genuinely hold, but only from that stalling magnitude upward, where a
+///   step of `alpha * |x|` is no more than half an ulp of `|s|`. Seeding
+///   `s_0 = x_0` on a steady signal starts the state there, which is why a
+///   constant stream still looks like a clean hold: a state of `1.0` is a fixed
+///   point against `0.0`, `1.0` and `-1.0` alike.
+///
+/// That is the honest resolution of an `f32` filter at a coefficient that small,
+/// and `Ema` claims nothing more — its `alpha` is per-push and carries no
+/// cadence, so it has no sampling-invariance property to violate.
+/// [`CadenceEma`], which does claim one, carries its state in `f64` to push the
+/// same degeneracy 28 binary orders further out; that relocates the boundary
+/// rather than removing it, and its own *Fine cadences* bullet states the
+/// conditional guarantee that survives.
+///
+/// This policy is infallible, so [`Ema::new`] clamps `alpha` into `[0, 1]`
+/// deterministically: a non-finite (NaN) `alpha` clamps to `0.0` (hold the
+/// seed). With a clamped alpha and finite inputs, the recurrence introduces no
+/// NaN.
 ///
 /// `Ema` does not sanitize inputs: a non-finite input (`NaN` or `+inf`/`-inf`)
 /// enters the recurrence and poisons the state — every output from that index on
@@ -255,5 +301,312 @@ impl SmoothPolicy<f32> for Ema {
       self.alpha.clamp(0.0, 1.0)
     };
     EmaState { alpha, seed: None }
+  }
+}
+
+/// The per-step EMA coefficient for a span distance of `delta` elements under an
+/// element-denominated time constant `tau`: `1 - exp(-delta / tau)`.
+///
+/// The exact zero-order-hold discretization of a first-order low-pass, and the
+/// single definition shared by [`CadenceEma::alpha_for`] and
+/// [`CadenceEmaState`]'s push — so the inspectable coefficient and the streaming
+/// state can never drift.
+fn cadence_alpha(tau: f32, delta: usize) -> f32 {
+  // Spelled `-expm1(-x)` rather than the literal `1 - exp(-x)`: the literal
+  // form loses every bit of `x` once `exp(-x)` rounds to exactly 1.0 — for f32
+  // any `x` below 2^-25 — which would return a zero coefficient and freeze the
+  // filter whenever the cadence is fine relative to `tau`, destroying the
+  // cadence invariance this type exists for. `expm1` is exact to full precision
+  // there and saturates to exactly the same 1.0 at the large end, since both
+  // forms reach it as soon as `exp(-x)` falls below half an ulp of 1.
+  //
+  // `delta as f32` rounds above 2^24, but harmlessly: the cast is correct to a
+  // relative 2^-24, so the ratio — and with it the coefficient — lands within
+  // an ulp of the exact one at every `tau`. `expm1f` returns no NaN for the
+  // non-positive finite arguments produced here, so with a
+  // constructor-validated `tau` the coefficient stays in `[0, 1]`.
+  -libm::expm1f(-(delta as f32) / tau)
+}
+
+/// Cadence-portable exponential moving average: an EMA whose time constant is
+/// denominated in input elements, not in pushes.
+///
+/// Each push derives its own coefficient from the *actual* span distance,
+/// `alpha = 1 - exp(-delta / tau)` where `delta` is the gap between this span's
+/// start and the previous one — the exact zero-order-hold discretization of a
+/// first-order low-pass. The recurrence is then the ordinary EMA
+/// `s = alpha * x + (1 - alpha) * s_prev`, seeded `s_0 = x_0` on the first push.
+/// The state `s` is retained in `f64` and each output is that state rounded to
+/// `f32` — a fine cadence's coefficient is otherwise smaller than the state can
+/// record (see *Fine cadences* below) — so re-feeding outputs into a fresh
+/// smoother is not the same as carrying one across the stream.
+/// Because the coefficient tracks the cadence, one `tau` yields the same
+/// smoothing at any hop — regular or irregular — where a bare per-step [`Ema`]
+/// `alpha` does not: the configuration carries no cadence, the data does.
+/// That portability is a floating-point property with a floating-point limit,
+/// and it is conditional on the signal, not only on `tau`: the *Fine cadences*
+/// bullet below states the condition. (Lineage: the LiveKit EMA, made
+/// cadence-portable.)
+///
+/// `tau` is a positive, finite element count; [`new`](CadenceEma::new) and
+/// [`try_new`](CadenceEma::try_new) reject anything else, because there is no
+/// sane clamp target — `tau = 0` would make an equal-start step compute `0/0`. A
+/// caller working in another unit converts at the boundary
+/// (`tau_elements = tau_other * elements_per_unit`); the unit never enters this
+/// API.
+///
+/// # Cadence edges
+///
+/// - **Equal starts** (`delta = 0`, admitted): `alpha = 1 - exp(0) = 0` exactly,
+///   so the duplicate observation is ignored *arithmetically*, through the one
+///   recurrence and not a branch. A non-finite value pushed at `delta = 0` still
+///   poisons the state, though, since `0.0 * NaN` and `0.0 * inf` are both `NaN`
+///   — mirroring [`Ema`] at `alpha = 0`.
+/// - **Fine cadences keep their coefficient; whether they keep its *effect*
+///   depends on the signal.** The coefficient is derived in a form that stays
+///   exact as `delta / tau` shrinks, so it never rounds to zero — with a
+///   validated `tau` it cannot fall below about `2^-128` at `delta = 1` — and
+///   the state is carried in `f64` rather than `f32`, which moves the point
+///   where a step is lost 29 binary orders further out. Neither makes cadence
+///   invariance unconditional, and in finite precision nothing can: the step a
+///   push contributes is `alpha * (x - s)` and it is added to a state of
+///   magnitude `|s|`, so it survives only while
+///
+///   ```text
+///   alpha * |x - s|  >  ulp(s) / 2
+///   ```
+///
+///   Below that the push leaves the state bit-identical and that cadence stops
+///   moving for good, however far `alpha` sits above any flat threshold on
+///   `delta / tau` alone. Dividing by `|s|` and writing
+///   the *contrast* `rho = |x - s| / |s|`, an `f64` state makes the condition
+///   `alpha * rho > 2^-53` (`2^-54` at the top of a binade) — a bound on the
+///   product, not on `alpha` alone. Unit contrast recovers `alpha > 2^-53`; a
+///   contrast of one `f32` ulp (`rho = 2^-23`) is already absorbed at
+///   `alpha = 2^-30`, `2^23` times sooner. The guarantee worth relying on is
+///   therefore the one stated over *representable* differences: an `f32`
+///   half-ulp is exactly `2^29` `f64` half-ulps at the same magnitude, so every
+///   difference the emitted `f32` can express still moves the state while
+///   `alpha` stays above `2^-29` (~1.9e-9) — a factor of 64 below `f32`'s
+///   epsilon, reached by a `tau` past about `2^29` (~5.4e8) elements at a unit
+///   cadence. Differences finer than that never reach the output anyway. Two
+///   edges bound the picture: a state of exactly `0.0` has no relative
+///   resolution to lose, so `s = alpha * x` survives whatever `alpha` is; and
+///   `|alpha * x|` cannot fall below about `2^-277` for a nonzero `f32` input,
+///   so the state cannot be pushed into `f64`'s subnormals in one step and the
+///   relative reading of `ulp(s)` is the operative one until a long decay run
+///   drives the state to a value the emitted `f32` already reports as zero.
+/// - **Cadences agree to about an ulp of the *swing*, not of the result:** each
+///   output is the `f64` state rounded to `f32`, and the coefficient is an
+///   `f32`, so the retained fraction `1 - alpha` is resolved only to an absolute
+///   `2^-25`. That error multiplies the distance between the state and the
+///   input, so two cadences covering the same elapsed distance differ by a small
+///   multiple of `2^-25 * |x - s_0|` — measured at no more than four times that,
+///   over `tau` from 3 to 10007 and distances from `tau/4` to `12 tau`. Where the
+///   result is a healthy fraction of that swing this is about an ulp of the
+///   result: a unit cadence and a single `tau`-sized step both land on `exp(-1)`
+///   within one. Where the state has instead decayed by many `tau`, the residual
+///   is exponentially smaller than the error, and the same absolute agreement is
+///   many ulps of that residual — about `2^-25 * exp(delta / tau)` in relative
+///   terms, which measures at ~10^4 ulps by `delta / tau = 12`. Invariance is to
+///   within the resolution of the emitted `f32`, never bit for bit.
+/// - **Large gaps forget:** once `delta / tau` passes `ln(2^25)` (about 17.33),
+///   `exp(-delta / tau)` is below half an ulp of 1 and `alpha` is exactly
+///   `1.0`, so the state tracks the input exactly. Then `1 - alpha` is exactly
+///   `0.0`, and `0.0 * inf = NaN` washes an *infinite* prior state to `NaN` at
+///   that step; a `NaN` prior state stays `NaN` regardless. Non-finite state
+///   never washes out arithmetically — only
+///   [`discontinuity`](Smoother::discontinuity) or [`reset`](Smoother::reset)
+///   clears it.
+///
+/// # Non-finite inputs
+///
+/// `CadenceEma` does not sanitize inputs. A non-finite value (`NaN` or an
+/// infinity) enters the recurrence and poisons the state for the rest of the
+/// epoch: a `NaN` stays `NaN`, and an infinity propagates as that infinity while
+/// both coefficients are nonzero, degrading to `NaN` only when a zero
+/// coefficient multiplies it or opposite infinities meet. In a stream the
+/// poisoning persists across pushes until a
+/// [`discontinuity`](Smoother::discontinuity) or [`reset`](Smoother::reset)
+/// re-seeds the state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CadenceEma {
+  tau: f32,
+}
+
+impl CadenceEma {
+  /// A cadence-portable EMA with the given element-denominated time constant.
+  ///
+  /// # Panics
+  ///
+  /// Panics, in every build, unless `tau` is finite and strictly positive. Use
+  /// [`try_new`](CadenceEma::try_new) to handle an untrusted `tau` instead.
+  #[must_use]
+  pub const fn new(tau: f32) -> Self {
+    match Self::try_new(tau) {
+      Ok(cfg) => cfg,
+      Err(_) => panic!("a cadence time constant tau must be finite and positive"),
+    }
+  }
+
+  /// The checked counterpart of [`new`](CadenceEma::new): validate `tau` rather
+  /// than panic on it.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::TimeConstantOutOfRange`] if `tau` is `NaN`, infinite,
+  /// zero, or negative. A non-positive or non-finite time constant has no sane
+  /// clamp target, so rejection is the only honest total answer.
+  pub const fn try_new(tau: f32) -> Result<Self, WinditError> {
+    if tau.is_finite() && tau > 0.0 {
+      Ok(Self { tau })
+    } else {
+      Err(WinditError::TimeConstantOutOfRange)
+    }
+  }
+
+  /// The element-denominated time constant, always finite and positive.
+  #[must_use]
+  pub const fn tau(&self) -> f32 {
+    self.tau
+  }
+
+  /// The per-step coefficient this configuration derives for a span distance of
+  /// `delta` elements: `1 - exp(-delta / tau)`.
+  ///
+  /// The exact function the streaming state applies, exposed for tests and
+  /// downstream calibration. It is `0.0` at `delta = 0`, monotonically
+  /// non-decreasing in `delta`, and saturates to `1.0` once the gap dwarfs
+  /// `tau`.
+  #[must_use]
+  pub fn alpha_for(&self, delta: usize) -> f32 {
+    cadence_alpha(self.tau, delta)
+  }
+}
+
+/// The streaming state of a [`CadenceEma`]: the time constant and the previous
+/// `(span start, smoothed value)`, unseeded until the first push.
+///
+/// The retained value is an `f64` while the emitted one is an `f32`, so that a
+/// step below the resolution an `f32` state would have had is still recorded —
+/// 29 binary orders further out, not unconditionally; the *Fine cadences* bullet
+/// on [`CadenceEma`] states the condition that survives. The widening is
+/// confined to this accumulator — `tau` and the coefficient stay `f32`, so
+/// [`CadenceEma::alpha_for`] remains the exact coefficient applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CadenceEmaState {
+  tau: f32,
+  prev: Option<(usize, f64)>,
+}
+
+impl Smoother<f32> for CadenceEmaState {
+  fn push(&mut self, w: Windowed<f32>) -> Result<Windowed<f32>, WinditError> {
+    let (x, span) = w.into_parts();
+    let start = span.start();
+    match self.prev {
+      // First push (fresh, or after `reset`/`discontinuity`) seeds `s_0 = x_0`
+      // and arms the timeline. No monotonicity check on the seeding push — the
+      // timeline is (re-)armed here, matching `Segmenter`.
+      None => {
+        self.prev = Some((start, f64::from(x)));
+        Ok(Windowed::new(x, span))
+      }
+      Some((prev_start, prev_val)) => {
+        // Monotonicity, checked before any state mutation, so an out-of-order
+        // push is a no-op that reports the violation: a retry with an in-order
+        // span behaves as if the bad push never happened.
+        if start < prev_start {
+          return Err(WinditError::NonMonotonicSpan { prev_start, start });
+        }
+        let delta = start - prev_start; // cannot underflow after the check
+
+        // The `f32` coefficient `alpha_for` reports, applied in `f64`. The
+        // widening is the accumulator's, not the coefficient's: `alpha` is
+        // still derived once, in f32, so the inspectable coefficient and the
+        // streaming state cannot drift.
+        //
+        // The *state* must be the wider type, not merely the arithmetic — an
+        // f32 result would re-round to the same fixed point every step. In the
+        // deepest regime the loss is inside the coefficient, where `1.0 - alpha`
+        // rounds to exactly `1.0` (f32 at any `alpha` of `2^-25` or below, f64
+        // at `2^-53`), so both addends are already exact and a carried
+        // compensation term would have nothing to hold. Above that regime the
+        // loss is in the final addition, and a compensated or double-double
+        // accumulator *would* recover it — deliberately not carried: each such
+        // widening only relocates the boundary (coefficient -> f32 accumulator
+        // -> f64 accumulator was three rounds of exactly that), never removes
+        // it, since invariance is unachievable in finite precision. The contract
+        // is documented instead: see the *Fine cadences* bullet on `CadenceEma`
+        // for the contrast-dependent condition that actually holds. Rearranging
+        // to `prev + alpha * (x - prev)` puts the loss back into an addend, but
+        // is absorbed at the same threshold *and* forfeits exact tracking at
+        // `alpha == 1`, where `prev + (x - prev)` is not `x` for a large `prev`.
+        //
+        // Keeping the algebra means every coefficient edge still falls out of
+        // the one expression: `alpha == 1` gives `1 * x + 0 * prev`, which
+        // tracks `x` exactly and still yields `0 * inf = NaN` over an infinite
+        // prior state; `alpha == 0` gives `0 * x + 1 * prev`, the
+        // duplicate-ignoring `delta == 0` rule, which still poisons on a
+        // non-finite `x`. Each holds in `f64` exactly as it did in `f32`.
+        let alpha = f64::from(cadence_alpha(self.tau, delta));
+        let s = alpha * f64::from(x) + (1.0 - alpha) * prev_val;
+        self.prev = Some((start, s));
+        // The retained state keeps full precision; only the emitted value
+        // rounds. A convex combination of two f32-representable values cannot
+        // leave f32's range, so this narrowing cannot overflow.
+        Ok(Windowed::new(s as f32, span))
+      }
+    }
+  }
+
+  fn reset(&mut self) {
+    // One field re-seeds `s_0 = x_0` on the next push and re-arms the
+    // monotonicity check. `discontinuity` is the trait default (= `reset`): a
+    // 1-in/1-out filter holds no pending output, so the two coincide.
+    self.prev = None;
+  }
+}
+
+impl SmoothPolicy<f32> for CadenceEma {
+  type Smoother = CadenceEmaState;
+
+  fn smoother(&self) -> CadenceEmaState {
+    // Unlike `EmaState`, this performs no coefficient re-clamp. `EmaState` can
+    // restore its `alpha` invariant because `[0, 1]` has a valid clamp target;
+    // `tau` has none — there is no in-range substitute for a non-positive or
+    // non-finite time constant — so a `tau` that bypassed `new`/`try_new` (a
+    // future serde derive, say) is carried as-is and degrades to `NaN` outputs
+    // at worst, never a panic and never UB, because `alpha` is derived per push
+    // and the recurrence is total for any stored `tau`.
+    CadenceEmaState {
+      tau: self.tau,
+      prev: None,
+    }
+  }
+}
+
+/// Forwarding so a boxed smoother is itself a [`Smoother`], letting a
+/// run-time-selected `Box<dyn Smoother<V>>` be *held* as a stage — not merely
+/// called through auto-deref.
+///
+/// `?Sized` covers `Box<dyn Smoother<V>>` and `Box<Concrete>` alike; the
+/// coverage is conventional, mirroring std's `Box<impl Iterator>`. Policies stay
+/// non-boxed — configs are `Copy`.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+impl<V, T: Smoother<V> + ?Sized> Smoother<V> for std::boxed::Box<T> {
+  fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError> {
+    (**self).push(w)
+  }
+
+  fn reset(&mut self) {
+    (**self).reset();
+  }
+
+  // Forwarded explicitly, not left to the trait default: the default would route
+  // this box's `discontinuity` to the box's own `reset`, silently erasing any
+  // `discontinuity` override the concrete stage carries.
+  fn discontinuity(&mut self) {
+    (**self).discontinuity();
   }
 }

@@ -6,7 +6,7 @@
 #![cfg_attr(any(feature = "std", feature = "alloc"), doc = include_str!("../README.md"))]
 #![cfg_attr(
   not(any(feature = "std", feature = "alloc")),
-  doc = "Generic windowed-sequence processing — chunk, pad/mask, aggregate, smooth, segment, split — for embeddings, VAD, and ASR.\n\nThis is the featureless tier: the type and trait surface only (`Span`, `WindowOptions`, `TailPolicy`, `Vector`, `Windowed`, `WinditError`). Enable `alloc` — the default feature — for the planner, the pre-processing helpers, the four strategy families, and the worked examples on the crate's front page."
+  doc = "Generic windowed-sequence processing — chunk, pad/mask, aggregate, smooth, segment, split — for embeddings, VAD, and ASR.\n\nThis is the featureless tier, and it carries the whole streaming surface: the value, geometry, and scalar types (`Span`, `WindowOptions`, `TailPolicy`, `Vector`, `Windowed`, `WinditError`), the smoothing, gating, and segmentation traits with their configs and states (`Smoother`/`SmoothPolicy` with `Identity`, `Ema`, `CadenceEma`; `Gate`/`GatePolicy` with `Threshold`, `Hysteresis`, `Vote`, and the `Dwell`/`Hangover` combinators), the `Segmenter`, and the `Decoder` pipeline that composes a smoother, a gate, and a segmenter — all allocating nothing. Enable `alloc` — the default feature — for the planner, the pre-processing helpers, the four strategy families, the `Vec`-returning batch drivers, and the worked examples on the crate's front page."
 )]
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -22,6 +22,12 @@ extern crate std;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod aggregate;
+
+// The decode module is entirely featureless core: the `Decoder` composes a
+// smoother, a gate, and a `Segmenter` into one streaming pipeline and allocates
+// nothing, so — unlike `smooth`/`segment`, which also carry `Vec`-returning batch
+// drivers behind `alloc` — every item here lives in the core tier.
+pub mod decode;
 
 pub mod plan;
 

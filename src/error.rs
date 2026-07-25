@@ -146,6 +146,26 @@ pub enum WinditError {
     /// The number of elements the buffer would have held.
     elements: usize,
   },
+  /// A cadence-EMA time constant was not a positive, finite element count.
+  ///
+  /// Returned by `CadenceEma::try_new` (`CadenceEma::new` panics instead): a
+  /// NaN, infinite, zero, or negative `tau` has no sane clamp target — `tau = 0`
+  /// would make an equal-start step compute `0/0` — so rejection is the only
+  /// honest total answer. Carries no payload: an `f32` field would cost this
+  /// enum its `Eq` derive, and the caller already holds the `tau` it passed.
+  TimeConstantOutOfRange,
+  /// An N-of-M vote configuration was not satisfiable: the counts must obey
+  /// `1 <= need <= of <= 64`.
+  ///
+  /// Returned by `Vote::try_new` (`Vote::new` panics instead). `need = 0` would
+  /// always activate, `need > of` never, `of = 0` is vacuous, and `of > 64`
+  /// exceeds the documented one-word state bound.
+  InvalidVote {
+    /// The rejected required-true count.
+    need: usize,
+    /// The rejected window length, in votes.
+    of: usize,
+  },
 }
 
 impl core::fmt::Display for WinditError {
@@ -202,6 +222,15 @@ impl core::fmt::Display for WinditError {
       }
       Self::AllocFailed { elements } => {
         write!(f, "could not allocate a buffer of {elements} elements")
+      }
+      Self::TimeConstantOutOfRange => {
+        f.write_str("cadence time constant tau must be finite and positive (in elements)")
+      }
+      Self::InvalidVote { need, of } => {
+        write!(
+          f,
+          "vote counts must satisfy 1 <= need <= of <= 64, got need {need} of {of}"
+        )
       }
     }
   }

@@ -9,6 +9,8 @@
 //! build.
 #![cfg(any(feature = "std", feature = "alloc"))]
 
+use std::{cell::Cell, rc::Rc};
+
 use windit::prelude::*;
 
 /// A minimal embedding double that L2-normalizes on construction, standing in
@@ -336,5 +338,287 @@ fn serialized_options_replay_identical_spans() {
   assert_eq!(
     WindowPlan::spans(&opts, 1500).unwrap(),
     WindowPlan::spans(&restored, 1500).unwrap()
+  );
+}
+
+// ── P3: dyn manifest path, discontinuity forwarding, and non-f32 genericity ──
+
+/// Drive a decoder to exhaustion, returning its `(causal flags, finalized
+/// ranges)`. Takes the decoder by value because [`Decoder::finish`] consumes it.
+fn drive_decoder<S: Smoother<f32>, G: Gate<f32>>(
+  mut dec: Decoder<S, G, f32>,
+  seq: &[Windowed<f32>],
+) -> (Vec<bool>, Vec<Range>) {
+  let mut flags = Vec::new();
+  let mut ranges = Vec::new();
+  for w in seq {
+    let step = dec.push(*w).expect("push");
+    flags.push(step.active());
+    ranges.extend(step.finalized());
+  }
+  ranges.extend(dec.finish());
+  (flags, ranges)
+}
+
+/// Drive a value-free gate policy through a decoder over ANY value type, using
+/// the pass-through `Identity` smoother, and collect the causal flags. The
+/// `V`-generic signature is the point: the same body runs for `f32` and for a
+/// non-`f32`, non-`Clone` payload.
+fn decode_flags<V, CG: GatePolicy<V>>(
+  cg: &CG,
+  opts: SegmentOptions,
+  seq: Vec<Windowed<V>>,
+) -> Vec<bool> {
+  // `Identity` is a value-free smoother (`Smoother<V>` for every `V`), so the
+  // decoder threads `V` through without cloning or formatting it.
+  let mut dec = Decoder::new(
+    SmoothPolicy::<V>::smoother(&Identity::new()),
+    cg.gate(),
+    opts,
+  );
+  seq
+    .into_iter()
+    .map(|w| dec.push(w).expect("push").active())
+    .collect()
+}
+
+#[test]
+fn dyn_p3_smoothers_and_gates_are_object_safe() {
+  // The P3 stages behind boxed trait objects — the run-time-selected manifest
+  // path, extending the P2 dyn suite to CadenceEma, Vote, and the combinators.
+
+  // CadenceEma's element-time-constant smoother; the first push seeds `s_0 = x_0`.
+  let mut ce: Box<dyn Smoother<f32>> = Box::new(CadenceEma::new(8.0).smoother());
+  assert_eq!(
+    ce.push(Windowed::new(1.0, Span::new(0, 1, 1)))
+      .unwrap()
+      .value(),
+    &1.0
+  );
+
+  // Vote: 2-of-3 activates on the second consecutive true (earliest activation at
+  // push index `need - 1`).
+  let mut vote: Box<dyn Gate<f32>> = Box::new(Vote::new(2, 3, 0.5).gate());
+  assert!(!vote.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(vote.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap());
+
+  // Dwell of a threshold, confirm = 2 elements: with unit spans the second
+  // consecutive active window confirms (`end 2 - origin 0 >= 2`).
+  let mut dwell: Box<dyn Gate<f32>> = Box::new(Dwell::new(Threshold::new(0.5), 2).gate());
+  assert!(!dwell.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(dwell.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap());
+
+  // Hangover of a threshold, hold = 1 element: holds one element past the last
+  // active window, then releases (strict `<`).
+  let mut hang: Box<dyn Gate<f32>> = Box::new(Hangover::new(Threshold::new(0.5), 1).gate());
+  assert!(hang.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap()); // active
+  assert!(hang.push(&Windowed::new(0.1, Span::new(1, 1, 1))).unwrap()); // gap 0 < 1: held
+  assert!(!hang.push(&Windowed::new(0.1, Span::new(2, 1, 1))).unwrap()); // gap 1 not < 1: released
+}
+
+#[test]
+fn dyn_decoder_manifest_path_with_p3_policies_matches_concrete_and_batch() {
+  // The full manifest path with P3 stages held INSIDE a decoder: a boxed
+  // `CadenceEma` smoother and a boxed `Hangover(Dwell(Vote))` gate — the canonical
+  // nesting. Instantiable only because `Box<dyn Smoother<f32>>` and `Box<dyn
+  // Gate<f32>>` themselves implement the stage traits (the forwarding impls). Its
+  // output must match both the concrete decoder over the same policies and the
+  // batch composition, on both planes.
+  let scores = [
+    0.1f32, 0.8, 0.9, 0.9, 0.2, 0.7, 0.8, 0.1, 0.9, 0.9, 0.9, 0.2, 0.85,
+  ];
+  let seq: Vec<Windowed<f32>> = scores
+    .iter()
+    .enumerate()
+    .map(|(i, &s)| Windowed::new(s, Span::new(i, 1, 1)))
+    .collect();
+  let opts = SegmentOptions::new().with_min_len(2).with_merge_gap(1);
+
+  // Cheap `Copy` configs, reused across the three drives.
+  let smoother_cfg = CadenceEma::new(4.0);
+  let gate_cfg = Hangover::new(Dwell::new(Vote::new(2, 3, 0.5), 2), 3);
+
+  // The run-time-selected manifest decoder.
+  let sm: Box<dyn Smoother<f32>> = Box::new(smoother_cfg.smoother());
+  let ga: Box<dyn Gate<f32>> = Box::new(gate_cfg.gate());
+  let dyn_dec: Decoder<Box<dyn Smoother<f32>>, Box<dyn Gate<f32>>, f32> =
+    Decoder::new(sm, ga, opts);
+  let (dyn_flags, dyn_ranges) = drive_decoder(dyn_dec, &seq);
+
+  // The concrete decoder over the identical policies.
+  let concrete = Decoder::new(smoother_cfg.smoother(), gate_cfg.gate(), opts);
+  let (cc_flags, cc_ranges) = drive_decoder(concrete, &seq);
+  assert_eq!(
+    dyn_flags, cc_flags,
+    "causal plane: dyn manifest vs concrete decoder"
+  );
+  assert_eq!(
+    dyn_ranges, cc_ranges,
+    "finalized plane: dyn manifest vs concrete decoder"
+  );
+
+  // The batch composition of the same policies, both planes.
+  let smoothed = smoother_cfg.smooth(&seq).expect("batch smooth");
+  let batch_ranges = gate_cfg.segment(&opts, &smoothed).expect("batch segment");
+  assert_eq!(
+    dyn_ranges, batch_ranges,
+    "finalized plane: dyn manifest vs batch composition"
+  );
+  let mut batch_gate = gate_cfg.gate();
+  let batch_flags: Vec<bool> = smoothed
+    .iter()
+    .map(|w| batch_gate.push(w).expect("batch gate"))
+    .collect();
+  assert_eq!(
+    dyn_flags, batch_flags,
+    "causal plane: dyn manifest vs batch gate drive"
+  );
+}
+
+/// A public-API discontinuity probe gate: a [`Gate<f32>`] recording which
+/// lifecycle call fired. The crate has an internal twin; this one pins the
+/// forwarding through the PUBLIC `Box<dyn Gate<f32>>` impl an external caller
+/// hits.
+struct DiscProbeGate {
+  reset_calls: Rc<Cell<usize>>,
+  discontinuity_calls: Rc<Cell<usize>>,
+}
+
+impl Gate<f32> for DiscProbeGate {
+  fn push(&mut self, _w: &Windowed<f32>) -> Result<bool, WinditError> {
+    Ok(true)
+  }
+
+  fn reset(&mut self) {
+    self.reset_calls.set(self.reset_calls.get() + 1);
+  }
+
+  fn discontinuity(&mut self) {
+    self
+      .discontinuity_calls
+      .set(self.discontinuity_calls.get() + 1);
+  }
+}
+
+#[test]
+fn dyn_decoder_forwards_discontinuity_through_box() {
+  let reset_calls = Rc::new(Cell::new(0usize));
+  let discontinuity_calls = Rc::new(Cell::new(0usize));
+  let ga: Box<dyn Gate<f32>> = Box::new(DiscProbeGate {
+    reset_calls: reset_calls.clone(),
+    discontinuity_calls: discontinuity_calls.clone(),
+  });
+  let sm: Box<dyn Smoother<f32>> = Box::new(Ema::new(1.0).smoother());
+  let mut dec: Decoder<Box<dyn Smoother<f32>>, Box<dyn Gate<f32>>, f32> =
+    Decoder::new(sm, ga, SegmentOptions::new());
+
+  let _ = dec.push(Windowed::new(0.5, Span::new(0, 1, 1))).unwrap();
+  // `discontinuity` must reach the concrete gate through the box AS
+  // `discontinuity`, not be flattened to the box's default `reset`.
+  let _ = dec.discontinuity();
+  assert_eq!(
+    discontinuity_calls.get(),
+    1,
+    "discontinuity reached the boxed gate"
+  );
+  assert_eq!(reset_calls.get(), 0, "reset must not fire on discontinuity");
+
+  // `reset`, in contrast, forwards `reset`.
+  dec.reset();
+  assert_eq!(reset_calls.get(), 1, "reset reached the boxed gate");
+  assert_eq!(
+    discontinuity_calls.get(),
+    1,
+    "discontinuity count unchanged by reset"
+  );
+}
+
+/// A payload deliberately without `Clone`, `Copy`, or `Debug`. The value-free
+/// stages — `Identity`, `Dwell`, `Hangover`, and the `Decoder` threading them —
+/// must carry it with none of those bounds; any stage that required `V: Clone`
+/// (etc.) would fail to compile through this type.
+struct Marker(#[allow(dead_code)] u32);
+
+/// A gate policy replaying a fixed decision script, generic over EVERY value type
+/// — it reads neither spans nor values. It is the non-`f32` witness's inner gate,
+/// since the shipped leaf gates (`Threshold`, `Vote`, ...) are `Gate<f32>` only.
+#[derive(Clone)]
+struct ScriptPolicy {
+  flags: Vec<bool>,
+}
+
+/// The streaming state of [`ScriptPolicy`], replaying its script by push index.
+struct ScriptGate {
+  flags: Vec<bool>,
+  next: usize,
+}
+
+impl<V> GatePolicy<V> for ScriptPolicy {
+  type Gate = ScriptGate;
+
+  fn gate(&self) -> ScriptGate {
+    ScriptGate {
+      flags: self.flags.clone(),
+      next: 0,
+    }
+  }
+}
+
+impl<V> Gate<V> for ScriptGate {
+  fn push(&mut self, _w: &Windowed<V>) -> Result<bool, WinditError> {
+    // Replay the script; past its end hold the last decision (inactive if empty),
+    // so a sequence longer than the script stays defined.
+    let flag = self
+      .flags
+      .get(self.next)
+      .copied()
+      .unwrap_or_else(|| self.flags.last().copied().unwrap_or(false));
+    self.next += 1;
+    Ok(flag)
+  }
+
+  fn reset(&mut self) {
+    self.next = 0;
+  }
+}
+
+#[test]
+fn value_free_stages_carry_a_non_f32_payload() {
+  // The value-free stages carry a payload that is deliberately NOT
+  // Clone/Copy/Debug. A leading lone `true` the Dwell suppresses guarantees the
+  // shaped output differs from the raw script, so the pipeline demonstrably
+  // engaged.
+  let script = vec![
+    true, false, true, true, true, false, false, true, true, false,
+  ];
+  let gate_cfg = Hangover::new(Dwell::new(ScriptPolicy { flags: script }, 2), 2);
+  let opts = SegmentOptions::new();
+  let n = 10;
+
+  // Drive over the non-f32, non-Clone Marker payload.
+  let marker_seq: Vec<Windowed<Marker>> = (0..n)
+    .map(|i| Windowed::new(Marker(i as u32), Span::new(i, 1, 1)))
+    .collect();
+  let marker_flags = decode_flags(&gate_cfg, opts, marker_seq);
+
+  // Drive the IDENTICAL gate config and spans over f32: only the value type
+  // differs, so equal decisions prove the stages never read the value.
+  let f32_seq: Vec<Windowed<f32>> = (0..n)
+    .map(|i| Windowed::new(0.0f32, Span::new(i, 1, 1)))
+    .collect();
+  let f32_flags = decode_flags(&gate_cfg, opts, f32_seq);
+  assert_eq!(
+    marker_flags, f32_flags,
+    "value-free stages decided differently on a non-f32 payload"
+  );
+
+  // The exact shaped sequence: Dwell(2) suppresses onsets shorter than two
+  // elements, Hangover(2) holds two elements past each active run.
+  let expected = vec![
+    false, false, false, true, true, true, true, false, true, true,
+  ];
+  assert_eq!(
+    marker_flags, expected,
+    "the value-free pipeline shaped the script wrong"
   );
 }

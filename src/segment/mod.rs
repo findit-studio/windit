@@ -10,8 +10,16 @@
 //! [`SegmentOptions`] morphology passes — merge runs separated by at most
 //! `merge_gap` elements, then drop runs shorter than `min_len`.
 //!
-//! The shipped gates are [`Threshold`] (active at or above a fixed cutoff) and
-//! [`Hysteresis`] (a latching two-threshold gate). A [`GatePolicy`] is the
+//! The shipped gates are [`Threshold`] (active at or above a fixed cutoff),
+//! [`Hysteresis`] (a latching two-threshold gate), and [`Vote`] (active once
+//! at least `need` of the last `of` per-window comparisons were true).
+//! [`Dwell`] and [`Hangover`] are gate combinators that wrap an inner gate and
+//! reshape its flag sequence with an element-denominated on-delay or
+//! off-delay; they shape the *causal flag plane*, distinct from the
+//! *finalized-range plane* morphology
+//! ([`SegmentOptions::merge_gap`], [`SegmentOptions::min_len`]) the
+//! `Segmenter` applies afterward — the two are not interchangeable. A
+//! [`GatePolicy`] is the
 //! configuration that constructs a [`Gate`]; it also
 #![cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -619,15 +627,30 @@ where
 /// is a [`GatePolicy`].
 ///
 /// `Box<dyn Gate<f32>>` is a valid object, so a gate can be selected at run time.
+///
+/// # Span contract
+///
+/// Spans arrive in ascending [`Span::start`] order, equal starts admitted — and
+/// that is the only ordering guaranteed. **Ends are not monotone:** nested and
+/// overlapping spans are legal, so a later span may end *before* one already
+/// seen. A gate that keeps a temporal horizon must therefore fold it by maximum
+/// (`horizon = max(horizon, span.end())`) and measure against that fold, as
+/// [`Dwell`]'s confirmation and [`Hangover`]'s coverage horizon both do;
+/// reading the current span's end alone would let the horizon move backward and
+/// the decision retract. A strictly backward start is a contract violation,
+/// reported as [`WinditError::NonMonotonicSpan`].
 pub trait Gate<V> {
   /// Advance by one window; `Ok(true)` means active/accepted.
   ///
   /// # Errors
   ///
-  /// Returns a [`WinditError`] for a stage that reads spans out of order; the
-  /// shipped gates ([`Threshold`], [`Hysteresis`]) are infallible and always
-  /// return `Ok`, returning `Result` only for uniformity with the composable
-  /// stages.
+  /// Returns [`WinditError::NonMonotonicSpan`] from a span-reading stage fed a
+  /// start before the previous one: [`Dwell`] and [`Hangover`] read spans to
+  /// measure their confirm/hold distances and report out-of-order input here,
+  /// each checking independently of any inner or nested combinator.
+  /// [`Threshold`], [`Hysteresis`], and [`Vote`] read no spans and are
+  /// infallible, always returning `Ok` and carrying the `Result` only for
+  /// uniformity with the composable stages.
   fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -848,5 +871,505 @@ impl GatePolicy<f32> for Hysteresis {
       cfg: *self,
       active: false,
     }
+  }
+}
+
+/// N-of-M voting gate: active once at least `need` of the last `of`
+/// per-window comparisons `value >= thr` were true.
+///
+/// A window not yet pushed in the current epoch counts as an inactive vote —
+/// the pre-fill is all-`false` — so the gate starts inactive and its decision
+/// is causal and deterministic from the very first push. The comparison
+/// itself is raw IEEE, exactly [`Threshold`]'s table: a `NaN` value is never a
+/// true vote; a `NaN` `thr` accepts nothing; `thr = -inf` accepts every
+/// non-`NaN` value; `thr = +inf` accepts only `+inf`. Only the vote *counts*
+/// are checked at construction — `thr` is deliberately free to degrade the
+/// same way `Threshold`'s does. (Lineage: FunASR window-count voting, cited
+/// for lineage only — no recommendation.)
+///
+/// # Cadence coupling
+///
+/// `Vote` counts *windows*, not elements — like [`Ema`](crate::smooth::Ema)'s
+/// per-step alpha, its physical meaning changes with the hop. That is
+/// inherent to N-of-M voting, not a defect, and is stated plainly here: no
+/// portability claim is made. [`Dwell`] is the element-denominated
+/// confirmation alternative when portability across hops matters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vote {
+  need: usize,
+  of: usize,
+  thr: f32,
+}
+
+impl Vote {
+  /// A vote gate active once at least `need` of the last `of` comparisons
+  /// `value >= thr` are true.
+  ///
+  /// # Panics
+  ///
+  /// Panics, in every build, unless `1 <= need <= of <= 64`. Use
+  /// [`try_new`](Vote::try_new) to handle untrusted counts instead.
+  #[must_use]
+  pub const fn new(need: usize, of: usize, thr: f32) -> Self {
+    match Self::try_new(need, of, thr) {
+      Ok(v) => v,
+      Err(_) => panic!("vote counts must satisfy 1 <= need <= of <= 64"),
+    }
+  }
+
+  /// The checked counterpart of [`new`](Vote::new): validate the counts
+  /// rather than panic on them.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::InvalidVote`] unless `1 <= need <= of <= 64`:
+  /// `need = 0` would always activate, `need > of` would never activate,
+  /// `of = 0` is vacuous, and `of > 64` exceeds the one-machine-word state
+  /// bound documented on [`VoteState`].
+  pub const fn try_new(need: usize, of: usize, thr: f32) -> Result<Self, WinditError> {
+    if need >= 1 && need <= of && of <= 64 {
+      Ok(Self { need, of, thr })
+    } else {
+      Err(WinditError::InvalidVote { need, of })
+    }
+  }
+
+  /// The required-true count out of the last [`of`](Vote::of) votes.
+  #[must_use]
+  pub const fn need(&self) -> usize {
+    self.need
+  }
+
+  /// The vote window length: how many recent comparisons are considered.
+  #[must_use]
+  pub const fn of(&self) -> usize {
+    self.of
+  }
+
+  /// The cutoff each window's value is compared against: a vote is true when
+  /// `value >= thr`.
+  #[must_use]
+  pub const fn thr(&self) -> f32 {
+    self.thr
+  }
+}
+
+/// The streaming state of a [`Vote`] gate: the cutoff plus a one-machine-word
+/// ring buffer of the last up-to-64 votes and its popcount, all-`false` until
+/// the first push.
+///
+/// `need` and `of` narrow from [`Vote`]'s `usize` (the crate's count
+/// convention) down to `u8`, because a validated configuration's counts
+/// always fit `1..=64`; [`gate`](GatePolicy::gate) is the single place that
+/// defends the narrowing (see its doc). The ring holds the newest vote in bit
+/// 0. The type is a fixed 16 bytes on every platform, independent of target
+/// word size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoteState {
+  thr: f32,
+  need: u8,
+  of: u8,
+  ring: u64,
+}
+
+impl Gate<f32> for VoteState {
+  fn push(&mut self, w: &Windowed<f32>) -> Result<bool, WinditError> {
+    // Raw IEEE, Threshold's table: NaN is never a true vote.
+    let vote = *w.value() >= self.thr;
+    // The newest vote enters bit 0; bit 63 falls off the top, discarding any
+    // history older than 64 votes ago. Vote reads no spans, so this is total
+    // and branch-free.
+    self.ring = (self.ring << 1) | (vote as u64);
+    // `of` is defended into `1..=64` by `gate()`, so `64 - of` is always in
+    // `0..=63` — a shift amount that can never panic.
+    let window = self.ring & (u64::MAX >> (64 - self.of as u32));
+    Ok(window.count_ones() >= self.need as u32)
+  }
+
+  fn reset(&mut self) {
+    self.ring = 0;
+  }
+}
+
+impl GatePolicy<f32> for Vote {
+  type Gate = VoteState;
+
+  fn gate(&self) -> VoteState {
+    // `Vote::new`/`try_new` are the only public ways to set `need`/`of`, and
+    // both validate `1 <= need <= of <= 64` there, so this re-clamp is
+    // currently unreachable. It is kept as the last line of defence for the
+    // shift-amount invariant `VoteState::push` relies on: a future
+    // construction path that bypasses `new`/`try_new` — a serde derive being
+    // the obvious one — degrades to the nearest valid configuration instead
+    // of shifting a `u64` out of range, which would panic in debug and be
+    // silently masked in release.
+    let of = self.of.clamp(1, 64);
+    let need = self.need.clamp(1, of);
+    VoteState {
+      thr: self.thr,
+      need: need as u8,
+      of: of as u8,
+      ring: 0,
+    }
+  }
+}
+
+/// Onset-confirmation gate combinator: on-delay debounce.
+///
+/// Wraps an inner gate `P` and suppresses its `true` decisions until the inner
+/// gate has been continuously active for `confirm` input elements. Config-level:
+/// implements [`GatePolicy<V>`] for any inner `P: GatePolicy<V>`; the streaming
+/// state, [`DwellState`], implements [`Gate<V>`] for *every* `V` given only
+/// `G: Gate<V>` — the wrapper never reads the value, only the inner decision and
+/// the span. (Lineage: fast-vad/LiveKit dwell time, cited for lineage only — no
+/// recommendation.)
+///
+/// # Semantics
+///
+/// On an inner `true`, the wrapper records the *origin* — the `span.start()` of
+/// the first `true` after a `false` (or after fresh/[`reset`](Gate::reset)/
+/// [`discontinuity`](Gate::discontinuity)) — and folds the run's coverage
+/// horizon forward: `horizon = max(horizon, span.end())`, a monotone maximum
+/// rather than an overwrite, since ascending starts do not imply ascending
+/// ends. It outputs `true` once that horizon reaches `confirm` elements past
+/// the origin (`horizon - origin >= confirm`), otherwise `false` (a suppressed
+/// head). Because the horizon only grows, a confirmed run stays confirmed: a
+/// nested or overlapping span can never retract an activation. On an inner
+/// `false`, the run is cleared and the output is `false`: releases are never
+/// delayed, this is on-delay only.
+///
+/// `confirm = 0` is an exact pass-through: every span covers at least one
+/// element, so `horizon - origin >= 0` always holds on an inner `true`. The
+/// confirmation distance is measured to the run's coverage horizon — the
+/// largest span end seen since the origin — so a window's own coverage counts
+/// toward it: with unit spans and `confirm = 3`,
+/// inner-true windows at positions 0, 1, 2 confirm on the third push
+/// (`end 3 - origin 0 >= 3`). Consequently a `confirm` at or below the first
+/// window's length never suppresses anything.
+///
+/// On a gapped plan (hop exceeding window), the distance is positional:
+/// elements no span covers still count toward confirmation as long as the
+/// inner flag run is continuous across the gap. That is the element-
+/// denominated contract, not a coverage accounting — deliberate, not a bug.
+///
+/// A `true` is never retracted (emitted only once confirmation is real) and a
+/// `false` is never upgraded after the fact: output `true` at some step implies
+/// the inner gate was also `true` at that step (suppression only).
+///
+/// # The causal and finalized planes
+///
+/// `Dwell` reshapes the causal flag sequence that feeds the [`Segmenter`], so
+/// it trims a finalized range's head: the range starts at the `span.start()`
+/// of the first *confirmed* window, not at the origin. For example, with unit
+/// spans and `confirm = 3`, an inner-true run at positions `0..6` confirms
+/// starting at position 2 (the third true, `end 3 - origin 0 >= 3`), so the
+/// finalized range is `[2, 6)`, not `[0, 6)`. A caller wanting the full extent
+/// kept, with only whole short runs suppressed, uses
+/// [`SegmentOptions::min_len`] (finalized-plane morphology) instead — the two
+/// tools shape different planes and are not interchangeable.
+///
+/// # Errors
+///
+/// `Dwell` reads spans to measure `confirm`, so it checks
+/// [`WinditError::NonMonotonicSpan`] itself, independently of the inner gate:
+/// the check runs before the inner [`push`](Gate::push), and on the wrapper's
+/// own violation neither the wrapper's nor the inner gate's state has advanced.
+/// If the *inner* push errs instead (a nested span-reading combinator), the
+/// wrapper's own fields are still unchanged — `last_start` is written only
+/// after the inner call returns `Ok` — while the inner gate's state follows its
+/// own error contract.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Dwell<P> {
+  inner: P,
+  confirm: usize,
+}
+
+impl<P> Dwell<P> {
+  /// A dwell combinator over `inner`, confirming activation only after
+  /// `confirm` continuous input elements.
+  ///
+  /// Infallible: every `usize` is a meaningful confirmation distance,
+  /// including `0` (exact pass-through) and [`usize::MAX`] (never confirms).
+  #[must_use]
+  pub const fn new(inner: P, confirm: usize) -> Self {
+    Self { inner, confirm }
+  }
+
+  /// The wrapped gate configuration.
+  #[must_use]
+  pub const fn inner(&self) -> &P {
+    &self.inner
+  }
+
+  /// The confirmation distance, in input elements.
+  #[must_use]
+  pub const fn confirm(&self) -> usize {
+    self.confirm
+  }
+}
+
+/// The streaming state of a [`Dwell`] combinator: the inner gate, the
+/// confirmation distance, the current continuous run as
+/// `(origin, coverage horizon)` (`None` between runs), and the last pushed
+/// span's start (for the wrapper's own monotonicity check, independent of the
+/// inner gate's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DwellState<G> {
+  inner: G,
+  confirm: usize,
+  run: Option<(usize, usize)>,
+  last_start: Option<usize>,
+}
+
+impl<V, G: Gate<V>> Gate<V> for DwellState<G> {
+  fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError> {
+    let span = w.span();
+    let start = span.start();
+    // Checked before the inner push, so the wrapper's own violation leaves
+    // both this wrapper and the inner gate unchanged.
+    if let Some(prev) = self.last_start {
+      if start < prev {
+        return Err(WinditError::NonMonotonicSpan {
+          prev_start: prev,
+          start,
+        });
+      }
+    }
+    let inner_active = self.inner.push(w)?;
+    self.last_start = Some(start);
+    if inner_active {
+      // The origin is the start of the first `true` since the last `false`
+      // (or since fresh/reset/discontinuity); set here at most once per run.
+      // The horizon is folded by MAX, exactly as `HangoverState`'s is: the
+      // contract guarantees ascending starts, not ascending ends, so a nested
+      // or overlapping span can end before one already seen. Comparing the
+      // current span's end alone would let a confirmed gate deactivate while
+      // the inner gate never released — an on-delay gate must not do that. The
+      // max also makes confirmation permanent for the run: once the horizon
+      // clears `confirm` it can never fall back below it.
+      let (origin, horizon) = match self.run {
+        Some((origin, horizon)) => (origin, horizon.max(span.end())),
+        None => (start, span.end()),
+      };
+      self.run = Some((origin, horizon));
+      // `origin <= start <= horizon` under monotone starts, so this cannot
+      // underflow; `saturating_sub` is the last line of defence, not
+      // load-bearing.
+      Ok(horizon.saturating_sub(origin) >= self.confirm)
+    } else {
+      self.run = None;
+      Ok(false)
+    }
+  }
+
+  fn reset(&mut self) {
+    self.run = None;
+    self.last_start = None;
+    self.inner.reset();
+  }
+
+  // Forwarded explicitly, not left to the trait default: the default would
+  // call this wrapper's own `reset`, which would in turn call the inner
+  // gate's `reset` rather than its `discontinuity`, silently erasing an
+  // override the inner gate carries (mirrors the `Box` impl below).
+  fn discontinuity(&mut self) {
+    self.run = None;
+    self.last_start = None;
+    self.inner.discontinuity();
+  }
+}
+
+impl<V, P: GatePolicy<V>> GatePolicy<V> for Dwell<P> {
+  type Gate = DwellState<P::Gate>;
+
+  fn gate(&self) -> Self::Gate {
+    DwellState {
+      inner: self.inner.gate(),
+      confirm: self.confirm,
+      run: None,
+      last_start: None,
+    }
+  }
+}
+
+/// Release-hold gate combinator: off-delay debounce.
+///
+/// Wraps an inner gate `P` and, once active, holds `true` while the gap since
+/// the end of inner-active coverage stays below `hold` input elements — the
+/// mirror of [`Dwell`]'s on-delay. Config-level: implements [`GatePolicy<V>`]
+/// for any inner `P: GatePolicy<V>`; the streaming state, [`HangoverState`],
+/// implements [`Gate<V>`] for *every* `V` given only `G: Gate<V>`. (Lineage:
+/// WebRTC VAD hangover, cited for lineage only — no recommendation.)
+///
+/// # Semantics
+///
+/// On an inner `true`, the wrapper outputs `true` and folds the coverage
+/// horizon forward: `last_yes_end = max(last_yes_end, span.end())` — a
+/// monotone maximum, not an overwrite, so an overlapping or nested span can
+/// never move the horizon backward and shorten the hold. On an inner `false`:
+/// if no inner `true` has been seen this epoch, the output is `false`;
+/// otherwise the output is `true` iff
+/// `span.start().saturating_sub(last_yes_end) < hold`, else `false`. The
+/// comparison is strict: a window starting exactly `hold` elements after
+/// coverage ends is *not* held — with unit spans, `hold = N` extends the flag
+/// run by exactly `N` elements past the last inner-active window's end. The
+/// subtraction saturates, so an overlapping window
+/// (`span.start() < last_yes_end`) has gap `0`, which is always held for any
+/// positive `hold` — the same overlap-saturates-to-zero convention
+/// [`Segmenter`]'s merge fold uses.
+///
+/// `hold = 0` is an exact pass-through: no gap is `< 0` (an adjacent window
+/// has gap `0`, which is not `< 0`). An inner `true` seen again during the
+/// hold re-folds the horizon, so `Hangover` causally bridges inner-flag gaps
+/// shorter than `hold` into one flag run. `last_yes_end` is never cleared on
+/// release — under monotone starts a later gap can only grow, so a stale
+/// horizon can never re-activate anything — only [`reset`](Gate::reset) or
+/// [`discontinuity`](Gate::discontinuity) clears it. A held `true` is never
+/// retracted, and an inner `true` at some step always implies output `true`
+/// at that step (extension only — the dual of [`Dwell`]'s suppression only).
+///
+/// # The causal and finalized planes
+///
+/// Held flags do not bridge *uncovered* elements in the finalized plane:
+/// geometric continuity is span-based (the [`Segmenter`] only extends a run
+/// across windows whose start falls at or before its current end), so on a
+/// gapped plan (hop exceeding window) a held window separated from the last
+/// inner-active one by elements no span covers still opens a new run.
+/// [`SegmentOptions::merge_gap`] remains the only element-level bridge in that
+/// plane: `Hangover` holds the *flag* causally, while `merge_gap` bridges the
+/// finalized *ranges* acausally within its own horizon — the two tools shape
+/// different planes and are not interchangeable.
+///
+/// # Errors
+///
+/// `Hangover` reads spans to measure `hold`, so it checks
+/// [`WinditError::NonMonotonicSpan`] itself, independently of the inner gate:
+/// the check runs before the inner [`push`](Gate::push), and on the wrapper's
+/// own violation neither the wrapper's nor the inner gate's state has advanced.
+/// If the *inner* push errs instead, the wrapper's own fields are still
+/// unchanged — `last_start` is written only after the inner call returns `Ok`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hangover<P> {
+  inner: P,
+  hold: usize,
+}
+
+impl<P> Hangover<P> {
+  /// A hangover combinator over `inner`, holding an activation for `hold`
+  /// input elements after inner-active coverage ends.
+  ///
+  /// Infallible: every `usize` is a meaningful hold distance, including `0`
+  /// (exact pass-through) and [`usize::MAX`] (never releases once activated).
+  #[must_use]
+  pub const fn new(inner: P, hold: usize) -> Self {
+    Self { inner, hold }
+  }
+
+  /// The wrapped gate configuration.
+  #[must_use]
+  pub const fn inner(&self) -> &P {
+    &self.inner
+  }
+
+  /// The hold distance, in input elements.
+  #[must_use]
+  pub const fn hold(&self) -> usize {
+    self.hold
+  }
+}
+
+/// The streaming state of a [`Hangover`] combinator: the inner gate, the hold
+/// distance, the folded coverage horizon (`None` until the first inner `true`
+/// this epoch), and the last pushed span's start (for the wrapper's own
+/// monotonicity check, independent of the inner gate's).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HangoverState<G> {
+  inner: G,
+  hold: usize,
+  last_yes_end: Option<usize>,
+  last_start: Option<usize>,
+}
+
+impl<V, G: Gate<V>> Gate<V> for HangoverState<G> {
+  fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError> {
+    let span = w.span();
+    let start = span.start();
+    if let Some(prev) = self.last_start {
+      if start < prev {
+        return Err(WinditError::NonMonotonicSpan {
+          prev_start: prev,
+          start,
+        });
+      }
+    }
+    let inner_active = self.inner.push(w)?;
+    self.last_start = Some(start);
+    if inner_active {
+      // F2 (plan conformance flag): fold by MAX, not last-write. A later span
+      // can still end earlier than an already-covered one (an
+      // overlapping/nested span), and a last-write horizon would move the
+      // release boundary backward and shorten the hold.
+      let end = span.end();
+      self.last_yes_end = Some(self.last_yes_end.map_or(end, |prev| prev.max(end)));
+      Ok(true)
+    } else {
+      match self.last_yes_end {
+        Some(end) => Ok(start.saturating_sub(end) < self.hold),
+        None => Ok(false),
+      }
+    }
+  }
+
+  fn reset(&mut self) {
+    self.last_yes_end = None;
+    self.last_start = None;
+    self.inner.reset();
+  }
+
+  // Forwarded explicitly for the same reason as `DwellState`: the trait
+  // default would silently route through the inner gate's `reset`.
+  fn discontinuity(&mut self) {
+    self.last_yes_end = None;
+    self.last_start = None;
+    self.inner.discontinuity();
+  }
+}
+
+impl<V, P: GatePolicy<V>> GatePolicy<V> for Hangover<P> {
+  type Gate = HangoverState<P::Gate>;
+
+  fn gate(&self) -> Self::Gate {
+    HangoverState {
+      inner: self.inner.gate(),
+      hold: self.hold,
+      last_yes_end: None,
+      last_start: None,
+    }
+  }
+}
+
+/// Forwarding so a boxed gate is itself a [`Gate`], letting a run-time-selected
+/// `Box<dyn Gate<V>>` be *held* as a stage — not merely called through
+/// auto-deref.
+///
+/// `?Sized` covers `Box<dyn Gate<V>>` and `Box<Concrete>` alike; the coverage
+/// is conventional, mirroring std's `Box<impl Iterator>`. Policies stay
+/// non-boxed — configs are `Copy`.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+impl<V, T: Gate<V> + ?Sized> Gate<V> for std::boxed::Box<T> {
+  fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError> {
+    (**self).push(w)
+  }
+
+  fn reset(&mut self) {
+    (**self).reset();
+  }
+
+  // Forwarded explicitly, not left to the trait default: the default would
+  // route this box's `discontinuity` to the box's own `reset`, silently
+  // erasing any `discontinuity` override the concrete stage carries.
+  fn discontinuity(&mut self) {
+    (**self).discontinuity();
   }
 }
