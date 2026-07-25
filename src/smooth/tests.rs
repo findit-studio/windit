@@ -262,6 +262,52 @@ fn ema_new_clamps_alpha_into_range() {
 }
 
 #[test]
+fn ema_sub_epsilon_alpha_accumulates_rather_than_holding() {
+  // At `alpha = 2^-25` the f32 `1 - alpha` rounds to exactly 1.0, which deletes
+  // the decay term — but not the `alpha * x` injection. The recurrence therefore
+  // degenerates into the biased accumulator `s <- s + alpha * x`: the state
+  // ramps in the direction of the input rather than holding. These are the
+  // values the type docs describe; pinning them keeps the docs from drifting
+  // back to the (false) claim that the state simply stops responding.
+  const ALPHA: f32 = 1.0 / 33_554_432.0; // 2^-25
+  assert_eq!(1.0f32 - ALPHA, 1.0);
+
+  let ema = Ema::new(ALPHA);
+
+  // Seeded at zero, a constant 1.0 input ramps in exact steps of `alpha`. One
+  // push lands on exactly 2^-25 — not on 0.0, which a true hold would give.
+  let ramp = values(&drive(&ema, &seq(&[0.0, 1.0, 1.0, 1.0, 1.0])));
+  assert_eq!(
+    ramp,
+    vec![0.0, ALPHA, 2.0 * ALPHA, 3.0 * ALPHA, 4.0 * ALPHA]
+  );
+
+  // The ramp stalls at `alpha * x * 2^24` — 0.5 for a unit input — where a step
+  // of `alpha` is no longer more than half an ulp of the state. Seeding one step
+  // below reaches that in a single push, pinning the plateau without the 2^24
+  // pushes the climb from zero actually takes. The state never arrives at 1.0.
+  assert_eq!(0.5f32, ALPHA * 1.0 * 16_777_216.0);
+  let plateau = values(&drive(&ema, &seq(&[0.5 - ALPHA, 1.0, 1.0, 1.0])));
+  assert_eq!(plateau, vec![0.5 - ALPHA, 0.5, 0.5, 0.5]);
+
+  // From the stalling magnitude upward it does hold — in every direction, since
+  // what was lost is the decay and not the injection. A state of 1.0 is a fixed
+  // point against a smaller input, an equal one, and an opposing one alike.
+  for x in [0.0f32, 0.5, 1.0, -1.0] {
+    assert_eq!(
+      values(&drive(&ema, &seq(&[1.0, x, x, x]))),
+      vec![1.0, 1.0, 1.0, 1.0],
+      "a state of 1.0 must be a fixed point against {x}"
+    );
+  }
+
+  // The step scales with the input, not with the distance to it: the injection
+  // is `alpha * x`, so a large input ramps proportionally faster.
+  let scaled = values(&drive(&ema, &seq(&[0.0, 8.0, 8.0])));
+  assert_eq!(scaled, vec![0.0, ALPHA * 8.0, 2.0 * ALPHA * 8.0]);
+}
+
+#[test]
 fn ema_matches_oracle_on_randomized_finite_and_non_finite_inputs() {
   // The reshaped batch `smooth` and a fresh streaming drive must both equal the
   // retained 0.1.2 recurrence, over randomized alphas and sequences with the IEEE

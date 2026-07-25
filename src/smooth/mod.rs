@@ -182,12 +182,31 @@ impl<V> SmoothPolicy<V> for Identity {
 /// Seeded with `s_0 = x_0`. A larger `alpha` tracks the input more closely; a
 /// smaller one smooths harder — down to the point where `f32` runs out. State
 /// and arithmetic are both `f32` here, so an `alpha` of `2^-25` (~3e-8) or below
-/// makes `1 - alpha` round to exactly `1.0`: the state stops responding and
-/// holds whatever it holds. That is the honest resolution of an `f32` filter at
-/// a coefficient that small, and `Ema` claims nothing more — its `alpha` is
-/// per-push and carries no cadence, so it has no sampling-invariance property to
-/// violate. [`CadenceEma`], which does claim one, is the type that carries the
-/// extra state precision needed to keep it.
+/// makes `1 - alpha` round to exactly `1.0`. What is left is not a hold: the
+/// decay term is gone but the `alpha * x` injection is not, so the recurrence
+/// degenerates from a weighted average into the biased accumulator
+/// `s <- s + alpha * x`. Concretely, at `alpha = 2^-25` the state
+///
+/// - never relaxes *toward* the input. It moves only in the direction of
+///   `sign(x)`, by `alpha * |x|` per push, whatever the input's distance from it
+///   — so an input below the state can never pull it down.
+/// - climbs from a seed of `0.0` under a constant `x` in exact steps of
+///   `alpha * x` — one push of `1.0` puts it at exactly `2^-25`, two at `2^-24`
+///   — and stalls at `alpha * x * 2^24`, which is `x / 2` here, reached after
+///   exactly `2^24` pushes. It never arrives at `x` at all.
+/// - does genuinely hold, but only from that stalling magnitude upward, where a
+///   step of `alpha * |x|` is no more than half an ulp of `|s|`. Seeding
+///   `s_0 = x_0` on a steady signal starts the state there, which is why a
+///   constant stream still looks like a clean hold: a state of `1.0` is a fixed
+///   point against `0.0`, `1.0` and `-1.0` alike.
+///
+/// That is the honest resolution of an `f32` filter at a coefficient that small,
+/// and `Ema` claims nothing more — its `alpha` is per-push and carries no
+/// cadence, so it has no sampling-invariance property to violate.
+/// [`CadenceEma`], which does claim one, carries its state in `f64` to push the
+/// same degeneracy 28 binary orders further out; that relocates the boundary
+/// rather than removing it, and its own *Fine cadences* bullet states the
+/// conditional guarantee that survives.
 ///
 /// This policy is infallible, so [`Ema::new`] clamps `alpha` into `[0, 1]`
 /// deterministically: a non-finite (NaN) `alpha` clamps to `0.0` (hold the
