@@ -236,10 +236,12 @@ fallible.
 ### Fixed
 
 No 0.1.x program's *output* changes here: the numerics of everything 0.1.x
-shipped are untouched, and the two behavioural corrections below are to types
+shipped are untouched, and every behavioural correction below is to a type
 introduced in this release. They are recorded because each states a contract the
 crate is now held to, and the first describes a regime an existing `Ema` user can
-be in today without knowing it.
+be in today without knowing it. The last two entries correct *published claims*
+rather than behaviour — the code they describe was already right — and each is
+now pinned by a test that fails if the claim is false.
 
 - **`smooth::Ema`'s behaviour at a sub-epsilon `alpha` is now documented, and it
   is not a hold.** At an `alpha` at or below `2^-25` (~3e-8), `1 - alpha` rounds
@@ -275,7 +277,33 @@ be in today without knowing it.
   ~0.9990005. Both were the type's defining property — that the result does not
   depend on how finely the signal is sampled — failing in a reachable regime.
   Invariance remains conditional and is now documented as a bound on
-  `alpha * rho` (`rho` the contrast `|x - s| / |s|`), not on `alpha` alone.
+  `alpha * rho` (`rho` the contrast `|x - s| / |s|`), not on `alpha` alone —
+  specifically `alpha * rho > 2^-50`, equivalently `alpha * |x - s| >
+  4 * ulp(s)`, with `alpha > 2^-26` the corollary over differences the emitted
+  `f32` can express. The constant accounts for all three roundings the
+  recurrence performs — `1 - alpha`, the product `(1 - alpha) * s`, and the
+  final sum — rather than the single fused step earlier drafts assumed, and it
+  is deliberately looser than both the derivation (`(1.5 + alpha) * ulp(s)`) and
+  an adversarial search of ~1.4e9 probes (worst absorption `1.48 * ulp(s)`).
+- **`segment::Dwell` with `confirm == usize::MAX` no longer activates.** The
+  configuration is documented as never confirming, but the test was
+  `horizon - origin >= confirm`, and the widest run a `Span` pair can describe —
+  `[0, 1)` folded with `[usize::MAX - 1, usize::MAX)` — reaches
+  `horizon - origin == usize::MAX` and met it exactly. The sentinel is now
+  suppressed outright. `Hangover`'s mirror-image `hold == usize::MAX` needed no
+  change: its test has the opposite sense (`gap < hold`) and `Span`'s own
+  invariants cap the gap at `usize::MAX - 2`; that slack is now pinned by a test
+  rather than left implicit.
+- **Two published accuracy figures for `smooth::CadenceEma` were measured and
+  corrected.** The absorption bound above was `ulp(s) / 2` with an
+  `alpha > 2^-29` corollary, both falsified by a non-dyadic retained state where
+  the recurrence's two separately rounded products absorb a step of
+  `0.77 * ulp(s)`. And the one-`tau` decay was claimed accurate "within one" ulp
+  of `exp(-1)`; it is within two — `tau = 14` and `tau = 238` both land exactly
+  two representable values below — so the published figure is now four, and the
+  `1e-6` tolerance that accompanied the claim (over 33 ulps at that magnitude,
+  far too slack to enforce it) is replaced by exact ULP-distance assertions
+  swept across the `tau` range.
 
 ## 0.1.2 - 2026-07-25
 
