@@ -201,6 +201,17 @@ jobs:
       run: cargo install cargo-hack
     - name: Run build
       run: cargo hack build --feature-powerset
+    # `cargo hack build --feature-powerset` covers the library on every feature
+    # row but compiles no test or bench target, and the `test` job's `cargo hack
+    # test --feature-powerset` compiles the test targets but not the benches —
+    # so nothing above ever builds `benches/windit.rs`, and nothing builds every
+    # target at once on the crate's DEFAULT row. That row is the one where
+    # `alloc` is aliased as `std`, so an import of a module only real `std` has
+    # (`cell`, `sync`, `collections::HashMap`, ...) inside a test target fails
+    # there while passing under `--all-features`. `--no-run` because executing
+    # the tests is the `test` job's business; this row exists to compile.
+    - name: Compile every target under default features
+      run: cargo test --no-run --all-targets
 
   test:
     name: test

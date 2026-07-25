@@ -1,4 +1,10 @@
-use std::{boxed::Box, cell::Cell, rc::Rc, vec, vec::Vec};
+// `Cell` is imported from `core`, not through the `std` alias: under
+// `not(feature = "std")` the crate aliases `alloc as std`, and `alloc` has no
+// `cell` module — so `std::cell::Cell` breaks the default (alloc-only) test
+// build while still passing under `--all-features`. The heap types below are
+// the ones the alias does carry.
+use core::cell::Cell;
+use std::{boxed::Box, rc::Rc, vec, vec::Vec};
 
 use super::Decoder;
 use crate::{
