@@ -8,7 +8,7 @@
 //! over a whole slice as a batch convenience. The shipped built-ins:
 //!
 //! - [`Identity`] passes values through unchanged — the no-rewrite baseline,
-//!   generic over any `V: Clone`.
+//!   generic over any `V`.
 //! - [`Ema`] is an exponential moving average (temporal low-pass) over `f32`.
 //!
 //! The state traits and states allocate nothing and live in the featureless core
@@ -72,7 +72,7 @@ pub trait Smoother<V> {
 /// [`Smoother`], and drives it as a batch convenience.
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
-/// `V = f32` ([`Ema`]) or any `V: Clone` ([`Identity`]). Implement the factory
+/// `V = f32` ([`Ema`]) or any `V` ([`Identity`]). Implement the factory
 /// [`smoother`](SmoothPolicy::smoother) to add a strategy — the batch
 #[cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -126,7 +126,7 @@ pub trait SmoothPolicy<V> {
 /// intact.
 ///
 /// The semantic no-rewrite baseline — a deliberate absence of smoothing, not a
-/// quality claim. Generic over any `V: Clone`, so it is the identity stage for
+/// quality claim. Generic over any `V`, so it is the identity stage for
 /// embeddings, probabilities, or logits alike.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Identity;
@@ -143,7 +143,7 @@ impl Identity {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IdentityState;
 
-impl<V: Clone> Smoother<V> for IdentityState {
+impl<V> Smoother<V> for IdentityState {
   fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError> {
     Ok(w)
   }
@@ -151,7 +151,7 @@ impl<V: Clone> Smoother<V> for IdentityState {
   fn reset(&mut self) {}
 }
 
-impl<V: Clone> SmoothPolicy<V> for Identity {
+impl<V> SmoothPolicy<V> for Identity {
   type Smoother = IdentityState;
 
   fn smoother(&self) -> IdentityState {

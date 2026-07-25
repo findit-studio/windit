@@ -125,7 +125,7 @@ fn identity_passes_values_and_spans_through() {
 
 #[test]
 fn identity_is_generic_over_the_value_type() {
-  // `Identity` smooths any `V: Clone`, not just `f32` — a genericity contract the
+  // `Identity` smooths any `V`, not just `f32` — a genericity contract the
   // score-only smoothers do not carry.
   #[derive(Clone, Debug, PartialEq)]
   struct Payload(u32);
@@ -135,6 +135,19 @@ fn identity_is_generic_over_the_value_type() {
   let out = Identity.smooth(&input).unwrap();
   let got: Vec<Payload> = out.into_iter().map(Windowed::into_value).collect();
   assert_eq!(got, vec![Payload(0), Payload(10), Payload(20)]);
+}
+
+#[test]
+fn identity_streaming_path_admits_a_non_clone_payload() {
+  // Pins the loosened bound: `IdentityState::push` needs no `V: Clone`, unlike
+  // the batch `smooth` convenience, which clones at its own method bound.
+  #[derive(Debug, PartialEq)]
+  struct NotClone(u32);
+  let mut s = SmoothPolicy::<NotClone>::smoother(&Identity);
+  let out = s
+    .push(Windowed::new(NotClone(7), Span::new(0, 1, 1)))
+    .unwrap();
+  assert_eq!(out.into_value(), NotClone(7));
 }
 
 #[test]

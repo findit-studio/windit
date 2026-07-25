@@ -678,6 +678,8 @@ pub trait GatePolicy<V> {
   /// - [`WinditError::NonMonotonicSpan`] if a span's `start` is strictly before
   ///   its predecessor's.
   /// - [`WinditError::AllocFailed`] if the output ranges cannot be allocated.
+  /// - Any error the underlying [`Gate::push`] surfaces (none for the shipped
+  ///   built-ins).
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   fn segment(&self, opts: &SegmentOptions, seq: &[Windowed<V>]) -> Result<Vec<Range>, WinditError> {

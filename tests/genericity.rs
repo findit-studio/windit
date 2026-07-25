@@ -242,7 +242,7 @@ fn dyn_smoother_and_gate_are_object_safe() {
   // value), so a run-time-selected smoother or gate is a boxed trait object — the
   // manifest-driven selection path, mirroring `dyn AggregatePolicy`.
   let mut ema: Box<dyn Smoother<f32>> = Box::new(Ema::new(0.5).smoother());
-  // s_0 = x_0, then the recurrence: 0.5*1 + 0.5*1 = 1.0 here (both inputs 1.0).
+  // s_0 = x_0 = 1.0.
   assert_eq!(
     ema
       .push(Windowed::new(1.0, Span::new(0, 1, 1)))
@@ -259,7 +259,7 @@ fn dyn_smoother_and_gate_are_object_safe() {
     &0.4
   );
 
-  // `Identity` is generic over `V: Clone`, so name the value type when boxing its
+  // `Identity` is generic over `V`, so name the value type when boxing its
   // state — the same disambiguation any `dyn` selection over a generic config uses.
   let mut ident: Box<dyn Smoother<f32>> = Box::new(SmoothPolicy::<f32>::smoother(&Identity::new()));
   let passed = ident.push(Windowed::new(0.25, Span::new(0, 1, 1))).unwrap();
