@@ -23,6 +23,12 @@ extern crate std;
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub mod aggregate;
 
+// The decode module is entirely featureless core: the `Decoder` composes a
+// smoother, a gate, and a `Segmenter` into one streaming pipeline and allocates
+// nothing, so — unlike `smooth`/`segment`, which also carry `Vec`-returning batch
+// drivers behind `alloc` — every item here lives in the core tier.
+pub mod decode;
+
 pub mod plan;
 
 #[cfg(any(feature = "std", feature = "alloc"))]
