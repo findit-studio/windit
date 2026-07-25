@@ -30,13 +30,14 @@ pub mod plan;
 pub mod pre;
 pub mod prelude;
 pub mod scalar;
-// The segment module spans both tiers: the `Segmenter` state machine,
-// `SegmentTail`, `Range`, and `SegmentOptions` are featureless core (they
-// allocate nothing), while the `Vec`-returning batch drivers and policies gate
-// on `alloc` inside the module.
+// The segment module spans both tiers: the `Gate`/`GatePolicy` traits, the gate
+// configs, the `Segmenter` state machine, `SegmentTail`, `Range`, and
+// `SegmentOptions` are featureless core (they allocate nothing), while the
+// `Vec`-returning batch drivers gate on `alloc` inside the module.
 pub mod segment;
-#[cfg(any(feature = "std", feature = "alloc"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+// The smooth module spans both tiers likewise: the `Smoother`/`SmoothPolicy`
+// traits and the `Identity`/`Ema` configs and states are featureless core, while
+// the `Vec`-returning batch `smooth` driver gates on `alloc` inside the module.
 pub mod smooth;
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]

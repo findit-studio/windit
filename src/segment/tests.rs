@@ -1,13 +1,12 @@
 use std::{vec, vec::Vec};
 
 use super::{
-  longest_run, runs, runs_sorted, Range, SegmentOptions, SegmentPolicy, SegmentTail, Segmenter,
-  Threshold,
+  longest_run, runs, runs_sorted, Gate, GatePolicy, Hysteresis, Range, SegmentOptions, SegmentTail,
+  Segmenter, Threshold,
 };
 use crate::{
   error::WinditError,
   plan::{Span, WindowOptions, WindowPlan},
-  smooth::Hysteresis,
   windowed::Windowed,
 };
 
@@ -257,10 +256,9 @@ fn gapped_spans_feed_min_len_longest_and_sorted() {
 fn gapped_spans_split_under_the_threshold_policy() {
   let s = gapped_plan();
 
-  // The policy reaches the geometry only through `runs`, so it inherits the
-  // split.
+  // The policy drives the same `Segmenter`, so it inherits the split.
   assert_eq!(
-    Threshold::new(0.5).segment(&s),
+    Threshold::new(0.5).segment(&plain(), &s).unwrap(),
     vec![Range::new(0, 2), Range::new(5, 7)]
   );
 }
@@ -347,7 +345,10 @@ fn threshold_policy_includes_boundary() {
   // thr 0.5 admits values >= 0.5, so the boundary value 0.5 is in-segment.
   let s = seq(&[0.5, 0.9, 0.2, 0.6]);
   let policy = Threshold::new(0.5);
-  assert_eq!(policy.segment(&s), vec![Range::new(0, 2), Range::new(3, 4)]);
+  assert_eq!(
+    policy.segment(&plain(), &s).unwrap(),
+    vec![Range::new(0, 2), Range::new(3, 4)]
+  );
 }
 
 #[test]
@@ -489,19 +490,166 @@ fn threshold_non_finite_scores_and_thresholds() {
   // is still excluded because `NaN >= -inf` is false, so index 1 drops out.
   let s = seq(&[0.1, f32::NAN, 0.5]);
   assert_eq!(
-    Threshold::new(f32::NEG_INFINITY).segment(&s),
+    Threshold::new(f32::NEG_INFINITY)
+      .segment(&plain(), &s)
+      .unwrap(),
     vec![Range::new(0, 1), Range::new(2, 3)]
   );
 
   // `thr = NaN`: `value >= NaN` is never true, so nothing is in-segment.
-  assert!(Threshold::new(f32::NAN).segment(&s).is_empty());
+  assert!(Threshold::new(f32::NAN)
+    .segment(&plain(), &s)
+    .unwrap()
+    .is_empty());
 
   // `thr = +inf` admits only a `+inf` score.
   let s = seq(&[f32::INFINITY, 1.0]);
   assert_eq!(
-    Threshold::new(f32::INFINITY).segment(&s),
+    Threshold::new(f32::INFINITY).segment(&plain(), &s).unwrap(),
     vec![Range::new(0, 1)]
   );
+}
+
+// ── gate value semantics (moved from smooth, now a typed bool decision) ──────
+
+/// Drive a fresh gate over `values` (each a unit span), collecting the decision
+/// at every step.
+fn gate_bools<P: GatePolicy<f32>>(policy: &P, values: &[f32]) -> Vec<bool> {
+  let mut g = policy.gate();
+  values
+    .iter()
+    .enumerate()
+    .map(|(i, &v)| g.push(&Windowed::new(v, Span::new(i, 1, 1))).unwrap())
+    .collect()
+}
+
+#[test]
+fn hysteresis_gate_latches_and_holds() {
+  // on=0.6, off=0.3: 0.1 off, 0.7 on, 0.5 hold(on), 0.2 off, 0.6 on.
+  let out = gate_bools(&Hysteresis::new(0.6, 0.3), &[0.1, 0.7, 0.5, 0.2, 0.6]);
+  assert_eq!(out, vec![false, true, true, false, true]);
+}
+
+#[test]
+fn hysteresis_gate_holds_at_off_boundary_instead_of_turning_off() {
+  // 0.7 latches on; a value exactly at `off` (0.3) holds that on state rather than
+  // turning off, twice in a row; only the strictly-below 0.2 turns it off. The
+  // strict-below boundary real VAD consumers rely on.
+  let out = gate_bools(&Hysteresis::new(0.6, 0.3), &[0.7, 0.3, 0.3, 0.2]);
+  assert_eq!(out, vec![true, true, true, false]);
+}
+
+#[test]
+fn hysteresis_gate_exact_on_boundary_activates() {
+  // The turn-on test is `value >= on`, so a value exactly at `on` activates.
+  assert_eq!(gate_bools(&Hysteresis::new(0.6, 0.3), &[0.6]), vec![true]);
+}
+
+#[test]
+fn hysteresis_gate_on_below_off_degrades_to_single_threshold() {
+  // With `on < off` the turn-on test wins, so the gate degrades to the pointwise
+  // single threshold `value >= on` (here 0.3): 0.4 on, 0.5 on, 0.2 off, 0.35 on.
+  let out = gate_bools(&Hysteresis::new(0.3, 0.6), &[0.4, 0.5, 0.2, 0.35]);
+  assert_eq!(out, vec![true, true, false, true]);
+}
+
+#[test]
+fn hysteresis_gate_nan_score_holds_state() {
+  // Both gate comparisons are false for NaN, so a NaN score holds the current
+  // state — including the initial off state at index 0.
+  let out = gate_bools(
+    &Hysteresis::new(0.6, 0.3),
+    &[f32::NAN, 0.7, f32::NAN, 0.2, f32::NAN],
+  );
+  assert_eq!(out, vec![false, true, true, false, false]);
+}
+
+#[test]
+fn hysteresis_gate_infinite_scores_latch_and_release() {
+  // `+inf >= on` activates; `-inf < off` releases; the finite holds between.
+  let out = gate_bools(
+    &Hysteresis::new(0.6, 0.3),
+    &[f32::INFINITY, 0.5, f32::NEG_INFINITY, 0.5],
+  );
+  assert_eq!(out, vec![true, true, false, false]);
+}
+
+#[test]
+fn hysteresis_gate_nan_thresholds_fail_closed_or_never_release() {
+  // `on = NaN`: `value >= on` is never true, so the gate can never activate.
+  let out = gate_bools(&Hysteresis::new(f32::NAN, 0.3), &[0.7, f32::INFINITY, 0.1]);
+  assert_eq!(out, vec![false, false, false]);
+
+  // `off = NaN`: `value < off` is never true, so once on the gate never releases.
+  let out = gate_bools(
+    &Hysteresis::new(0.6, f32::NAN),
+    &[0.7, 0.1, f32::NEG_INFINITY],
+  );
+  assert_eq!(out, vec![true, true, true]);
+}
+
+#[test]
+fn hysteresis_gate_infinite_thresholds() {
+  // `on = -inf`: every non-NaN score activates (`-inf` via `-inf >= -inf`, and a
+  // NaN in between holds the on state).
+  let out = gate_bools(
+    &Hysteresis::new(f32::NEG_INFINITY, 0.3),
+    &[f32::NEG_INFINITY, f32::NAN, 0.1],
+  );
+  assert_eq!(out, vec![true, true, true]);
+
+  // `on = +inf`: only a `+inf` score activates; the finite below `off` releases.
+  let out = gate_bools(
+    &Hysteresis::new(f32::INFINITY, 0.3),
+    &[1.0, f32::INFINITY, 0.5, 0.2],
+  );
+  assert_eq!(out, vec![false, true, true, false]);
+
+  // `off = -inf`: `value < off` is never true, so once on the gate never releases
+  // — even a `-inf` score holds.
+  let out = gate_bools(
+    &Hysteresis::new(0.6, f32::NEG_INFINITY),
+    &[0.7, f32::NEG_INFINITY, 0.1, -1e30],
+  );
+  assert_eq!(out, vec![true, true, true, true]);
+}
+
+#[test]
+fn hysteresis_gate_new_exposes_thresholds() {
+  let gate = Hysteresis::new(0.6, 0.3);
+  assert_eq!((gate.on(), gate.off()), (0.6, 0.3));
+}
+
+#[test]
+fn hysteresis_gate_reset_clears_the_latch() {
+  let mut g = Hysteresis::new(0.6, 0.3).gate();
+  assert!(g.push(&Windowed::new(0.7, Span::new(0, 1, 1))).unwrap()); // latched on
+  g.reset();
+  // A held value (0.5) now sees the initial off state rather than the latch.
+  assert!(!g.push(&Windowed::new(0.5, Span::new(1, 1, 1))).unwrap());
+}
+
+#[test]
+fn threshold_gate_membership_is_raw_ieee() {
+  // `value >= thr`, raw IEEE: the boundary value is in; a NaN score never is.
+  assert_eq!(
+    gate_bools(&Threshold::new(0.5), &[0.5, 0.9, 0.2, 0.6]),
+    vec![true, true, false, true]
+  );
+  // `thr = -inf` admits every finite score and both infinities but not NaN.
+  assert_eq!(
+    gate_bools(
+      &Threshold::new(f32::NEG_INFINITY),
+      &[0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+    ),
+    vec![true, false, true, true]
+  );
+  // `thr = NaN` accepts nothing; a threshold state resets to nothing pending.
+  assert_eq!(
+    gate_bools(&Threshold::new(f32::NAN), &[0.9, f32::INFINITY]),
+    vec![false, false]
+  );
+  assert_eq!(Threshold::new(0.5).thr(), 0.5);
 }
 
 // ── monotonic-span contract ──────────────────────────────────────────────────
@@ -888,6 +1036,12 @@ fn segmenter_matches_oracle_hysteresis_on_the_fixed_grid() {
     let new = seg_hysteresis(on, off, &opts, &s);
     let reference = oracle::hysteresis_segment(on, off, &opts, &s);
     assert_eq!(new, reference, "on={on} off={off} opts={opts:?}");
+    // The reshaped provided method drives the same gate → Segmenter.
+    assert_eq!(
+      Hysteresis::new(on, off).segment(&opts, &s).unwrap(),
+      reference,
+      "Hysteresis::segment on={on} off={off} opts={opts:?}"
+    );
   }
 }
 
@@ -956,6 +1110,20 @@ fn segmenter_matches_oracle_on_randomized_finite_and_non_finite_inputs() {
     assert_eq!(
       new_hy, ref_hy,
       "hysteresis: n={n} window={window} hop={hop} on={on} off={off} opts={opts:?}"
+    );
+
+    // The reshaped `GatePolicy::segment` provided methods drive the same gate
+    // through the same `Segmenter`, so they must match the oracle too — the P2
+    // parity gate that batch `segment` still equals what 0.1.2 shipped.
+    assert_eq!(
+      Threshold::new(thr).segment(&opts, &s).unwrap(),
+      ref_thr,
+      "Threshold::segment: n={n} thr={thr} opts={opts:?}"
+    );
+    assert_eq!(
+      Hysteresis::new(on, off).segment(&opts, &s).unwrap(),
+      ref_hy,
+      "Hysteresis::segment: n={n} on={on} off={off} opts={opts:?}"
     );
   }
 }

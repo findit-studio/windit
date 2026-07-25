@@ -78,14 +78,16 @@ own by implementing the trait.
   multi-vector path. Embeddings are reconstructed through the minimal [`Vector`]
   trait, so any 384-, 512-, or 768-dimension type fits, at either shipped
   [`Scalar`] (`f32` or `f64`).
-- **smooth** — rewrite each window's value while preserving its span. Built-ins:
-  [`Ema`] (temporal low-pass) and [`Hysteresis`] (a latching two-threshold gate
-  for binary VAD).
-- **segment** — reduce a windowed score sequence to continuous element
-  [`Range`]s: `runs`, `longest_run`, and `runs_sorted`, with `min_len` and
-  `merge_gap` post-passes, all driving the incremental [`Segmenter`] (a bounded,
-  zero-allocation state machine, so batch equals streaming by construction).
-  Policy [`Threshold`] packages a predicate with its options.
+- **smooth** — rewrite each window's value while preserving its span, one window
+  in, one window out, through a `Smoother` state and its `SmoothPolicy` config.
+  Built-ins: [`Identity`] (pass-through baseline) and [`Ema`] (temporal low-pass).
+- **segment** — gate a windowed score sequence into a binary decision, then reduce
+  it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff)
+  and [`Hysteresis`] (latching two-threshold) drive the incremental [`Segmenter`]
+  (a bounded, zero-allocation state machine, so batch equals streaming by
+  construction) through `GatePolicy::segment`, with `min_len` and `merge_gap`
+  post-passes; `runs`, `longest_run`, and `runs_sorted` are the predicate-driven
+  batch counterparts.
 - **split** — decide how an input is divided before windowing. [`FixedWindow`]
   delegates to the planner; [`ContentAware`] (feature `text`) chunks strings.
 
@@ -235,8 +237,9 @@ dual licensed as above, without any additional terms or conditions.
 [`MeanRenormalized`]: https://docs.rs/windit/latest/windit/aggregate/struct.MeanRenormalized.html
 [`EmaRenormalized`]: https://docs.rs/windit/latest/windit/aggregate/struct.EmaRenormalized.html
 [`SaliencyWeighted`]: https://docs.rs/windit/latest/windit/aggregate/struct.SaliencyWeighted.html
+[`Identity`]: https://docs.rs/windit/latest/windit/smooth/struct.Identity.html
 [`Ema`]: https://docs.rs/windit/latest/windit/smooth/struct.Ema.html
-[`Hysteresis`]: https://docs.rs/windit/latest/windit/smooth/struct.Hysteresis.html
+[`Hysteresis`]: https://docs.rs/windit/latest/windit/segment/struct.Hysteresis.html
 [`Range`]: https://docs.rs/windit/latest/windit/segment/struct.Range.html
 [`Threshold`]: https://docs.rs/windit/latest/windit/segment/struct.Threshold.html
 [`Segmenter`]: https://docs.rs/windit/latest/windit/segment/struct.Segmenter.html

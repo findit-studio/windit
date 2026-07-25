@@ -1,6 +1,6 @@
 use std::{vec, vec::Vec};
 
-use super::{Ema, Hysteresis, SmoothPolicy};
+use super::{Ema, Identity, SmoothPolicy, Smoother};
 use crate::{plan::Span, windowed::Windowed};
 
 /// One `Windowed<f32>` per value, each covering a single element (window 1).
@@ -33,47 +33,135 @@ fn assert_f32_seq(got: &[f32], want: &[f32]) {
   }
 }
 
+/// xorshift64 — deterministic and dependency-free; the seed must be nonzero.
+fn xorshift(state: &mut u64) -> u64 {
+  let mut x = *state;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  *state = x;
+  x
+}
+
+/// A pseudo-random `f32` in `[0, 1)` from the generator's next 24 bits.
+fn next_unit(state: &mut u64) -> f32 {
+  (xorshift(state) >> 40) as f32 / (1u32 << 24) as f32
+}
+
+/// The retained 0.1.2 `Ema::smooth` recurrence, verbatim, as the independent
+/// differential oracle for the reshaped [`Smoother`]-driven batch method. Takes
+/// the already-clamped `alpha` (as [`Ema::alpha`] reports it) and re-clamps it
+/// exactly as the shipped batch loop did.
+fn ema_oracle(alpha: f32, seq: &[Windowed<f32>]) -> Vec<f32> {
+  let alpha = if alpha.is_nan() {
+    0.0
+  } else {
+    alpha.clamp(0.0, 1.0)
+  };
+  let mut out = Vec::with_capacity(seq.len());
+  let mut state = 0.0f32;
+  for (i, w) in seq.iter().enumerate() {
+    state = if i == 0 {
+      w.value
+    } else {
+      alpha * w.value + (1.0 - alpha) * state
+    };
+    out.push(state);
+  }
+  out
+}
+
+/// Drive a fresh smoother push-by-push over `seq`, the streaming counterpart of
+/// the batch `smooth` method.
+fn drive<P: SmoothPolicy<f32>>(policy: &P, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
+  let mut s = policy.smoother();
+  seq.iter().map(|w| s.push(*w).unwrap()).collect()
+}
+
 #[test]
 fn ema_pinned_and_preserves_spans() {
   // alpha 0.5, s_0 = x_0: 0, 0.5*1, 0.5*1 + 0.5*0.5, 0.5*0.75 -> exact dyadics.
   let input = seq(&[0.0, 1.0, 1.0, 0.0]);
-  let out = Ema::new(0.5).smooth(&input);
+  let out = Ema::new(0.5).smooth(&input).unwrap();
   assert_eq!(values(&out), vec![0.0, 0.5, 0.75, 0.375]);
   assert_eq!(spans(&out), spans(&input));
 }
 
 #[test]
-fn hysteresis_latches_and_holds() {
-  // on=0.6, off=0.3: 0.1 off, 0.7 on, 0.5 hold(on), 0.2 off, 0.6 on.
-  let input = seq(&[0.1, 0.7, 0.5, 0.2, 0.6]);
-  let out = Hysteresis::new(0.6, 0.3).smooth(&input);
-  assert_eq!(values(&out), vec![0.0, 1.0, 1.0, 0.0, 1.0]);
-  assert_eq!(spans(&out), spans(&input));
+fn ema_batch_equals_streaming_drive() {
+  // The batch `smooth` IS a fresh smoother driven over the slice, so the two must
+  // agree value for value and span for span.
+  let input = seq(&[0.2, 0.9, 0.4, 0.4, 0.1, 0.7]);
+  let batch = Ema::new(0.3).smooth(&input).unwrap();
+  let streamed = drive(&Ema::new(0.3), &input);
+  assert_eq!(values(&batch), values(&streamed));
+  assert_eq!(spans(&batch), spans(&streamed));
 }
 
 #[test]
-fn hysteresis_holds_at_off_boundary_instead_of_turning_off() {
-  // on=0.6, off=0.3: 0.7 latches on; a value exactly at `off` (0.3) must hold
-  // that on state rather than turn off, twice in a row to show it is stable
-  // and not a one-step fluke. Only the strictly-below value 0.2 turns it off.
-  // This is the strict-below boundary this type's real VAD consumers rely on.
-  let input = seq(&[0.7, 0.3, 0.3, 0.2]);
-  let out = Hysteresis::new(0.6, 0.3).smooth(&input);
-  assert_eq!(values(&out), vec![1.0, 1.0, 1.0, 0.0]);
+fn ema_reset_and_discontinuity_reseed_the_state() {
+  // Both return the smoother to `s_0 = x_0`: the value after re-seeding equals the
+  // first pushed value, not the recurrence against the pre-break state.
+  for reseed in [Smoother::reset, Smoother::discontinuity] {
+    let mut s = Ema::new(0.5).smoother();
+    let _ = s.push(Windowed::new(1.0, Span::new(0, 1, 1))).unwrap();
+    let _ = s.push(Windowed::new(1.0, Span::new(1, 1, 1))).unwrap();
+    reseed(&mut s);
+    let after = s.push(Windowed::new(0.25, Span::new(2, 1, 1))).unwrap();
+    assert_eq!(after.value, 0.25, "re-seed must restore s_0 = x_0");
+  }
+}
+
+#[test]
+fn identity_passes_values_and_spans_through() {
+  let input = seq(&[0.1, 0.9, 0.4]);
+  let out = Identity::new().smooth(&input).unwrap();
+  assert_eq!(values(&out), values(&input));
+  assert_eq!(spans(&out), spans(&input));
+
+  // The streaming drive agrees with the batch method.
+  assert_eq!(values(&drive(&Identity, &input)), values(&input));
+}
+
+#[test]
+fn identity_is_generic_over_the_value_type() {
+  // `Identity` smooths any `V`, not just `f32` — a genericity contract the
+  // score-only smoothers do not carry.
+  #[derive(Clone, Debug, PartialEq)]
+  struct Payload(u32);
+  let input: Vec<Windowed<Payload>> = (0..3)
+    .map(|i| Windowed::new(Payload(i * 10), Span::new(i as usize, 1, 1)))
+    .collect();
+  let out = Identity.smooth(&input).unwrap();
+  let got: Vec<Payload> = out.into_iter().map(Windowed::into_value).collect();
+  assert_eq!(got, vec![Payload(0), Payload(10), Payload(20)]);
+}
+
+#[test]
+fn identity_streaming_path_admits_a_non_clone_payload() {
+  // Pins the loosened bound: `IdentityState::push` needs no `V: Clone`, unlike
+  // the batch `smooth` convenience, which clones at its own method bound.
+  #[derive(Debug, PartialEq)]
+  struct NotClone(u32);
+  let mut s = SmoothPolicy::<NotClone>::smoother(&Identity);
+  let out = s
+    .push(Windowed::new(NotClone(7), Span::new(0, 1, 1)))
+    .unwrap();
+  assert_eq!(out.into_value(), NotClone(7));
 }
 
 #[test]
 fn ema_nan_alpha_clamps_to_hold_seed() {
   // alpha 2.0 clamps to 1.0 (track the input exactly): s_t = x_t.
   let input = seq(&[0.5, 0.8]);
-  let out = Ema::new(2.0).smooth(&input);
+  let out = Ema::new(2.0).smooth(&input).unwrap();
   assert_eq!(values(&out), vec![0.5, 0.8]);
 
   // A NaN alpha clamps to 0.0 (hold the seed). With finite inputs the recurrence
   // then holds the seed and every output is finite. This is a statement about the
   // clamped coefficient, not the inputs: a non-finite input still poisons the
   // state (see `ema_nan_input_poisons_the_rest_of_the_call`).
-  let out = Ema::new(f32::NAN).smooth(&input);
+  let out = Ema::new(f32::NAN).smooth(&input).unwrap();
   assert!(
     out.iter().all(|w| w.value.is_finite()),
     "outputs must be finite"
@@ -86,11 +174,11 @@ fn ema_nan_input_poisons_the_rest_of_the_call() {
   // A NaN score enters the recurrence and, because non-finite absorbs under
   // `+`/`*`, every later output is NaN — for every alpha. Here alpha 0.5 mixes
   // NaN into the state at index 1 and it never washes out.
-  let out = Ema::new(0.5).smooth(&seq(&[0.2, f32::NAN, 0.8]));
+  let out = Ema::new(0.5).smooth(&seq(&[0.2, f32::NAN, 0.8])).unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::NAN, f32::NAN]);
 
   // A NaN first value seeds the state directly, poisoning from index 0.
-  let out = Ema::new(0.5).smooth(&seq(&[f32::NAN, 0.5]));
+  let out = Ema::new(0.5).smooth(&seq(&[f32::NAN, 0.5])).unwrap();
   assert_f32_seq(&values(&out), &[f32::NAN, f32::NAN]);
 }
 
@@ -98,90 +186,67 @@ fn ema_nan_input_poisons_the_rest_of_the_call() {
 fn ema_infinite_input_saturates_and_zero_coefficients_degrade_to_nan() {
   // With both coefficients nonzero (alpha 0.5), an infinity propagates as that
   // infinity...
-  let out = Ema::new(0.5).smooth(&seq(&[0.2, f32::INFINITY, 0.8]));
+  let out = Ema::new(0.5)
+    .smooth(&seq(&[0.2, f32::INFINITY, 0.8]))
+    .unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::INFINITY, f32::INFINITY]);
-  let out = Ema::new(0.5).smooth(&seq(&[0.2, f32::NEG_INFINITY, 0.8]));
+  let out = Ema::new(0.5)
+    .smooth(&seq(&[0.2, f32::NEG_INFINITY, 0.8]))
+    .unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::NEG_INFINITY, f32::NEG_INFINITY]);
 
   // ...until opposite infinities meet: `+inf` state, then `0.5*(-inf)` gives
   // `-inf`, and `-inf + (+inf) = NaN`.
-  let out = Ema::new(0.5).smooth(&seq(&[0.2, f32::INFINITY, f32::NEG_INFINITY]));
+  let out = Ema::new(0.5)
+    .smooth(&seq(&[0.2, f32::INFINITY, f32::NEG_INFINITY]))
+    .unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::INFINITY, f32::NAN]);
 
   // alpha 1.0 zeroes `1 - alpha`, so the next step computes `1.0*0.8 + 0.0*inf`
   // and `0.0 * inf = NaN` degrades the infinity one step later.
-  let out = Ema::new(1.0).smooth(&seq(&[0.2, f32::INFINITY, 0.8]));
+  let out = Ema::new(1.0)
+    .smooth(&seq(&[0.2, f32::INFINITY, 0.8]))
+    .unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::INFINITY, f32::NAN]);
 
   // alpha 0.0 zeroes `alpha`, so `0.0 * x` degrades a non-finite input to NaN
   // immediately (both an infinity and a NaN), and it then absorbs the rest.
-  let out = Ema::new(0.0).smooth(&seq(&[0.2, f32::INFINITY, 0.8]));
+  let out = Ema::new(0.0)
+    .smooth(&seq(&[0.2, f32::INFINITY, 0.8]))
+    .unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::NAN, f32::NAN]);
-  let out = Ema::new(0.0).smooth(&seq(&[0.2, f32::NAN, 0.8]));
+  let out = Ema::new(0.0).smooth(&seq(&[0.2, f32::NAN, 0.8])).unwrap();
   assert_f32_seq(&values(&out), &[0.2, f32::NAN, f32::NAN]);
 }
 
 #[test]
-fn hysteresis_nan_score_holds_state() {
-  // Both gate comparisons are false for NaN, so a NaN score holds the current
-  // state — including the initial off state at index 0.
-  let out = Hysteresis::new(0.6, 0.3).smooth(&seq(&[f32::NAN, 0.7, f32::NAN, 0.2, f32::NAN]));
-  assert_eq!(values(&out), vec![0.0, 1.0, 1.0, 0.0, 0.0]);
-}
-
-#[test]
-fn hysteresis_infinite_scores_latch_and_release() {
-  // `+inf >= on` activates; `-inf < off` releases; the finite holds between.
-  let out = Hysteresis::new(0.6, 0.3).smooth(&seq(&[f32::INFINITY, 0.5, f32::NEG_INFINITY, 0.5]));
-  assert_eq!(values(&out), vec![1.0, 1.0, 0.0, 0.0]);
-}
-
-#[test]
-fn hysteresis_nan_thresholds_fail_closed_or_never_release() {
-  // `on = NaN`: `value >= on` is never true, so the gate can never activate.
-  let out = Hysteresis::new(f32::NAN, 0.3).smooth(&seq(&[0.7, f32::INFINITY, 0.1]));
-  assert_eq!(values(&out), vec![0.0, 0.0, 0.0]);
-
-  // `off = NaN`: `value < off` is never true, so once on the gate never releases.
-  let out = Hysteresis::new(0.6, f32::NAN).smooth(&seq(&[0.7, 0.1, f32::NEG_INFINITY]));
-  assert_eq!(values(&out), vec![1.0, 1.0, 1.0]);
-}
-
-#[test]
-fn hysteresis_infinite_thresholds() {
-  // `on = -inf`: every non-NaN score activates (`-inf` itself via `-inf >= -inf`,
-  // and a NaN in between holds the on state).
-  let out =
-    Hysteresis::new(f32::NEG_INFINITY, 0.3).smooth(&seq(&[f32::NEG_INFINITY, f32::NAN, 0.1]));
-  assert_eq!(values(&out), vec![1.0, 1.0, 1.0]);
-
-  // `on = +inf`: only a `+inf` score activates; the finite below `off` releases.
-  let out = Hysteresis::new(f32::INFINITY, 0.3).smooth(&seq(&[1.0, f32::INFINITY, 0.5, 0.2]));
-  assert_eq!(values(&out), vec![0.0, 1.0, 1.0, 0.0]);
-
-  // `off = -inf`: `value < off` is never true (`-inf < -inf` is false, and no
-  // value is less than `-inf`), so once on the gate can never release — even a
-  // `-inf` score holds, same as a NaN `off` in `hysteresis_nan_thresholds_...`.
-  let out =
-    Hysteresis::new(0.6, f32::NEG_INFINITY).smooth(&seq(&[0.7, f32::NEG_INFINITY, 0.1, -1e30]));
-  assert_eq!(values(&out), vec![1.0, 1.0, 1.0, 1.0]);
-}
-
-#[test]
-fn hysteresis_exact_on_boundary_activates() {
-  // The turn-on test is `value >= on`, so a value exactly at `on` activates.
-  // Complements `hysteresis_holds_at_off_boundary_instead_of_turning_off`.
-  let out = Hysteresis::new(0.6, 0.3).smooth(&seq(&[0.6]));
-  assert_eq!(values(&out), vec![1.0]);
-}
-
-#[test]
-fn hysteresis_on_below_off_degrades_to_single_threshold() {
-  // With `on < off` the turn-on test is evaluated first and wins, so the gate
-  // degrades to the pointwise single threshold `value >= on` (here 0.3): 0.4 on,
-  // 0.5 on, 0.2 off, 0.35 on — no memory of the previous state survives.
-  let out = Hysteresis::new(0.3, 0.6).smooth(&seq(&[0.4, 0.5, 0.2, 0.35]));
-  assert_eq!(values(&out), vec![1.0, 1.0, 0.0, 1.0]);
+fn ema_streaming_poisoning_persists_until_reset() {
+  // In a stream a NaN poisons every later push until the state is re-seeded.
+  let mut s = Ema::new(0.5).smoother();
+  assert_eq!(
+    s.push(Windowed::new(0.2, Span::new(0, 1, 1)))
+      .unwrap()
+      .value,
+    0.2
+  );
+  assert!(s
+    .push(Windowed::new(f32::NAN, Span::new(1, 1, 1)))
+    .unwrap()
+    .value
+    .is_nan());
+  assert!(s
+    .push(Windowed::new(0.8, Span::new(2, 1, 1)))
+    .unwrap()
+    .value
+    .is_nan());
+  // A discontinuity re-seeds, so the next push starts a clean epoch.
+  s.discontinuity();
+  assert_eq!(
+    s.push(Windowed::new(0.4, Span::new(0, 1, 1)))
+      .unwrap()
+      .value,
+    0.4
+  );
 }
 
 #[test]
@@ -197,14 +262,45 @@ fn ema_new_clamps_alpha_into_range() {
 }
 
 #[test]
-fn hysteresis_new_exposes_thresholds() {
-  let gate = Hysteresis::new(0.6, 0.3);
-  assert_eq!((gate.on(), gate.off()), (0.6, 0.3));
+fn ema_matches_oracle_on_randomized_finite_and_non_finite_inputs() {
+  // The reshaped batch `smooth` and a fresh streaming drive must both equal the
+  // retained 0.1.2 recurrence, over randomized alphas and sequences with the IEEE
+  // tables occasionally exercised.
+  let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+  for _ in 0..200 {
+    let n = (xorshift(&mut state) % 65) as usize;
+    let alpha = match xorshift(&mut state) % 8 {
+      0 => f32::NAN,
+      1 => 2.0,
+      2 => -1.0,
+      _ => next_unit(&mut state),
+    };
+    let s: Vec<Windowed<f32>> = (0..n)
+      .map(|i| {
+        let v = match xorshift(&mut state) % 16 {
+          0 => f32::NAN,
+          1 => f32::INFINITY,
+          2 => f32::NEG_INFINITY,
+          _ => next_unit(&mut state),
+        };
+        Windowed::new(v, Span::new(i, 1, 1))
+      })
+      .collect();
+
+    let ema = Ema::new(alpha);
+    let batch = ema.smooth(&s).unwrap();
+    let reference = ema_oracle(ema.alpha(), &s);
+    assert_f32_seq(&values(&batch), &reference);
+    // Batch equals the streaming drive by construction; pin it too.
+    assert_f32_seq(&values(&drive(&ema, &s)), &reference);
+    // Spans are preserved throughout.
+    assert_eq!(spans(&batch), spans(&s));
+  }
 }
 
 #[test]
 fn empty_input_yields_empty() {
   let input: Vec<Windowed<f32>> = Vec::new();
-  assert!(Ema::new(0.5).smooth(&input).is_empty());
-  assert!(Hysteresis::new(0.6, 0.3).smooth(&input).is_empty());
+  assert!(Ema::new(0.5).smooth(&input).unwrap().is_empty());
+  assert!(Identity::new().smooth(&input).unwrap().is_empty());
 }

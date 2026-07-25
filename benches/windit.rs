@@ -1,13 +1,13 @@
 //! Temporal smoothing and segmentation benchmarks.
 //!
-//! Covers the smoothing policies (`Identity` copy baseline, `Ema`, `Hysteresis`)
-//! and the segmentation paths (the batch `runs` composition, the incremental
-//! `Segmenter` streaming drive, and `Threshold` for context) over representative
-//! lengths and run patterns, reporting element throughput. The
-//! `segment/two_pass` versus `segment/streaming` pair contrasts the batch and
-//! incremental drivers of the one shared state machine.
+//! Covers the smoothing policies (`Identity` copy baseline, `Ema`) and the
+//! segmentation paths (the gate-driven batch `GatePolicy::segment` composition,
+//! the incremental `Segmenter` streaming drive, and `Threshold` for context) over
+//! representative lengths and run patterns, reporting element throughput. The
+//! `segment/hysteresis_batch` versus `segment/streaming` pair contrasts the batch
+//! and incremental drivers of the one shared state machine.
 //!
-//! Gated on the heap tier: the temporal modules do not exist without it, so the
+//! Gated on the heap tier: the batch drivers do not exist without it, so the
 //! featureless build compiles to an empty `main`.
 
 #[cfg(any(feature = "std", feature = "alloc"))]
@@ -17,22 +17,10 @@ mod temporal {
   use criterion::{BenchmarkId, Criterion, Throughput};
   use windit::{
     plan::Span,
-    segment::{runs, SegmentOptions, SegmentPolicy, Segmenter, Threshold},
-    smooth::{Ema, Hysteresis, SmoothPolicy},
+    segment::{GatePolicy, Hysteresis, SegmentOptions, Segmenter, Threshold},
+    smooth::{Ema, Identity, SmoothPolicy},
     windowed::Windowed,
   };
-
-  /// The semantic no-rewrite baseline: it copies scores through unchanged, so the
-  /// benchmark measures the cost of producing the output vector with no
-  /// smoothing. Not a crate type and not a quality claim — `Identity` is the
-  /// least-assumptive score filter, never universally the most accurate one.
-  struct Identity;
-
-  impl SmoothPolicy<f32> for Identity {
-    fn smooth(&self, seq: &[Windowed<f32>]) -> Vec<Windowed<f32>> {
-      seq.to_vec()
-    }
-  }
 
   /// Representative sequence lengths, in windows.
   const LENGTHS: [usize; 3] = [1_024, 16_384, 262_144];
@@ -105,26 +93,26 @@ mod temporal {
     g.finish();
   }
 
+  /// The shipped pass-through smoother: it copies scores through unchanged, so the
+  /// benchmark measures the cost of producing the output vector with no smoothing.
+  /// Not a quality claim — `Identity` is the least-assumptive score filter, never
+  /// universally the most accurate one.
   fn smooth_identity(c: &mut Criterion) {
-    each_input(c, "smooth/identity", |s| Identity.smooth(s));
+    each_input(c, "smooth/identity", |s| Identity::new().smooth(s).unwrap());
   }
 
   fn smooth_ema(c: &mut Criterion) {
-    each_input(c, "smooth/ema", |s| Ema::new(0.2).smooth(s));
+    each_input(c, "smooth/ema", |s| Ema::new(0.2).smooth(s).unwrap());
   }
 
-  fn smooth_hysteresis(c: &mut Criterion) {
-    each_input(c, "smooth/hysteresis", |s| {
-      Hysteresis::new(0.6, 0.3).smooth(s)
-    });
-  }
-
-  /// The batch driver over a hysteresis-smoothed sequence, contrasted against
-  /// the incremental drive of the same state machine below.
-  fn segment_two_pass(c: &mut Criterion) {
-    each_input(c, "segment/two_pass", |s| {
-      let gated = Hysteresis::new(0.6, 0.3).smooth(s);
-      runs(&gated, |&v| v >= 0.5, &SegmentOptions::new()).unwrap()
+  /// The gate-driven batch segmentation (`GatePolicy::segment` over a hysteresis
+  /// gate), contrasted against the incremental drive of the same state machine
+  /// below.
+  fn segment_hysteresis_batch(c: &mut Criterion) {
+    each_input(c, "segment/hysteresis_batch", |s| {
+      Hysteresis::new(0.6, 0.3)
+        .segment(&SegmentOptions::new(), s)
+        .unwrap()
     });
   }
 
@@ -145,18 +133,17 @@ mod temporal {
   }
 
   fn segment_threshold(c: &mut Criterion) {
-    each_input(c, "segment/threshold", |s| Threshold::new(0.5).segment(s));
+    each_input(c, "segment/threshold", |s| {
+      Threshold::new(0.5)
+        .segment(&SegmentOptions::new(), s)
+        .unwrap()
+    });
   }
 
-  criterion::criterion_group!(
-    smooth_benches,
-    smooth_identity,
-    smooth_ema,
-    smooth_hysteresis
-  );
+  criterion::criterion_group!(smooth_benches, smooth_identity, smooth_ema);
   criterion::criterion_group!(
     segment_benches,
-    segment_two_pass,
+    segment_hysteresis_batch,
     segment_streaming,
     segment_threshold
   );

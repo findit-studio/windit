@@ -237,6 +237,45 @@ fn dyn_policy_is_object_safe_at_both_scalars() {
 }
 
 #[test]
+fn dyn_smoother_and_gate_are_object_safe() {
+  // The streaming state traits are object-safe (no generic methods, no `Self` by
+  // value), so a run-time-selected smoother or gate is a boxed trait object — the
+  // manifest-driven selection path, mirroring `dyn AggregatePolicy`.
+  let mut ema: Box<dyn Smoother<f32>> = Box::new(Ema::new(0.5).smoother());
+  // s_0 = x_0 = 1.0.
+  assert_eq!(
+    ema
+      .push(Windowed::new(1.0, Span::new(0, 1, 1)))
+      .unwrap()
+      .value(),
+    &1.0
+  );
+  ema.reset();
+  assert_eq!(
+    ema
+      .push(Windowed::new(0.4, Span::new(0, 1, 1)))
+      .unwrap()
+      .value(),
+    &0.4
+  );
+
+  // `Identity` is generic over `V`, so name the value type when boxing its
+  // state — the same disambiguation any `dyn` selection over a generic config uses.
+  let mut ident: Box<dyn Smoother<f32>> = Box::new(SmoothPolicy::<f32>::smoother(&Identity::new()));
+  let passed = ident.push(Windowed::new(0.25, Span::new(0, 1, 1))).unwrap();
+  assert_eq!(passed.value(), &0.25);
+
+  let mut thr: Box<dyn Gate<f32>> = Box::new(Threshold::new(0.5).gate());
+  assert!(thr.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(!thr.push(&Windowed::new(0.1, Span::new(1, 1, 1))).unwrap());
+
+  let mut hy: Box<dyn Gate<f32>> = Box::new(Hysteresis::new(0.6, 0.3).gate());
+  assert!(!hy.push(&Windowed::new(0.4, Span::new(0, 1, 1))).unwrap()); // starts off
+  assert!(hy.push(&Windowed::new(0.7, Span::new(1, 1, 1))).unwrap()); // latches on
+  assert!(hy.push(&Windowed::new(0.5, Span::new(2, 1, 1))).unwrap()); // holds
+}
+
+#[test]
 fn vad_frame_segment_longest_run() {
   // Unit-agnosticism: the same segment functions that never touched an embedding
   // reduce a 100-frame f32 probability sequence to speech ranges. Frames are
