@@ -352,6 +352,18 @@ fn ema_sub_epsilon_alpha_accumulates_rather_than_holding() {
   // is `alpha * x`, so a large input ramps proportionally faster.
   let scaled = values(&drive(&ema, &seq(&[0.0, 8.0, 8.0])));
   assert_eq!(scaled, vec![0.0, ALPHA * 8.0, 2.0 * ALPHA * 8.0]);
+
+  // And the plateau is `alpha * x * 2^24 = x / 2` for any `x`, not only for the
+  // unit input the assertions above use — the doc states it in `x`.
+  for x in [0.5f32, 1.0, 8.0, -8.0, 1024.0] {
+    let plateau = ALPHA * x * 16_777_216.0;
+    assert_eq!(plateau, x / 2.0, "the plateau must be x / 2 for x = {x}");
+    assert_eq!(
+      values(&drive(&ema, &seq(&[plateau - ALPHA * x, x, x, x]))),
+      vec![plateau - ALPHA * x, plateau, plateau, plateau],
+      "the ramp must stall at x / 2 for x = {x}"
+    );
+  }
 }
 
 #[test]
@@ -1660,6 +1672,110 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
   let coarse = one_tau_coarse(&cfg, n);
   assert_eq!(ulps32(fine, inv_e), -1, "MAX_TAU vs exp(-1)");
   assert_eq!(ulps32(fine, coarse), -1, "MAX_TAU fine vs coarse");
+}
+
+#[test]
+fn cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one() {
+  // The `cadence_alpha` comment's accuracy figure, enforced. `delta as f32`
+  // rounds above 2^24 and the division rounds again, so the coefficient is not
+  // exact — the comment used to claim "within an ulp", which is false: two
+  // half-ulp roundings compose to a full ulp of relative error before `expm1f`
+  // adds its own. Measured worst case 1.46 ulps for the ratio and 1.51 for the
+  // coefficient, over `tau` across the accepted domain and `delta` to 2^40.
+  //
+  // The reference is the same expression evaluated in `f64`, an independent
+  // precision path: `delta` is exact there for every count below 2^53.
+  const BOUND: f64 = 2.0;
+  let mut rng: u64 = 0x0BAD_C0DE_DEAD_BEEF;
+  let mut probed = 0u32;
+  let mut past_cast = 0u32;
+
+  for i in 0..20_000u32 {
+    // Half the probes at the top of the domain, where a `delta` large enough to
+    // round in the cast still leaves the coefficient unsaturated — the regime
+    // the comment is actually about — and every sixteenth at the ceiling.
+    let tau = if i % 16 == 0 {
+      CadenceEma::MAX_TAU
+    } else {
+      let exp = if i % 2 == 0 {
+        21 + (xorshift(&mut rng) % 6) as i32
+      } else {
+        (xorshift(&mut rng) % 176) as i32 - 149
+      };
+      libm::ldexpf(1.0 + next_unit(&mut rng), exp).min(CadenceEma::MAX_TAU)
+    };
+    // `delta / tau` under 16 keeps `expm1f` off its large-end saturation, where
+    // both paths return exactly 1.0 and there is no ulp to measure.
+    let span = (16.0 * f64::from(tau)) as u64;
+    let delta = 1 + (xorshift(&mut rng) % span.max(1)) as usize;
+    if delta > (1 << 24) {
+      past_cast += 1;
+    }
+    let got = f64::from(CadenceEma::new(tau).alpha_for(delta));
+    let want = -libm::expm1(-(delta as f64) / f64::from(tau));
+    // A saturated coefficient is exactly 1.0 on both paths, with no ulp to
+    // measure against.
+    if !(0.0..1.0).contains(&want) || want == 0.0 {
+      continue;
+    }
+    probed += 1;
+    let apart = (got - want).abs() / f64::from(ulp32(got as f32));
+    assert!(
+      apart <= BOUND,
+      "tau {tau:e} delta {delta}: alpha {got:e} is {apart:.4} f32 ulps from {want:e}"
+    );
+  }
+  assert!(probed > 5_000, "too few unsaturated probes: {probed}");
+  assert!(
+    past_cast > 5_000,
+    "too few probes past the cast: {past_cast}"
+  );
+}
+
+#[test]
+fn one_minus_alpha_collapses_at_two_pow_minus_25_in_f32_and_two_pow_minus_54_in_f64() {
+  // The degeneracy thresholds both smoothers' docs quote. `Ema` says an `alpha`
+  // of `2^-25` "or below" makes the `f32` `1 - alpha` round to exactly 1.0, and
+  // that `CadenceEma`'s `f64` state pushes the same degeneracy 29 binary orders
+  // further out. Only the single `f32` value at `2^-25` was pinned, and the
+  // `f64` threshold was quoted as `2^-53`, which is wrong: `1 - 2^-53` is
+  // exactly representable, so it does not collapse. `2^-54` is the tie that
+  // rounds to even, and 25 to 54 is 29 orders, not 28.
+  assert_ne!(1.0f32 - libm::ldexpf(1.0, -24), 1.0, "2^-24 must survive");
+  assert_ne!(1.0f64 - libm::ldexp(1.0, -53), 1.0, "2^-53 must survive");
+  assert_eq!(
+    1.0f64 - libm::ldexp(1.0, -53),
+    f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)
+  );
+
+  // "or below", swept rather than sampled at one exponent: from each threshold
+  // down to the smallest subnormal of its type.
+  for k in 25..=149i32 {
+    assert_eq!(
+      1.0f32 - libm::ldexpf(1.0, -k),
+      1.0,
+      "f32: 1 - 2^-{k} must collapse"
+    );
+  }
+  for k in 54..=1074i32 {
+    assert_eq!(
+      1.0f64 - libm::ldexp(1.0, -k),
+      1.0,
+      "f64: 1 - 2^-{k} must collapse"
+    );
+  }
+  assert_eq!(54 - 25, 29, "29 binary orders, as the Ema doc states");
+
+  // And the collapse is unreachable through `CadenceEma`: the `tau` that first
+  // produces it does not construct, and the coefficient at the ceiling clears
+  // the `f64` threshold by the 2^28 the domain is built to keep.
+  assert_eq!(
+    CadenceEma::try_new(libm::ldexpf(1.0, 54)),
+    Err(WinditError::TimeConstantOutOfRange)
+  );
+  let at_ceiling = f64::from(CadenceEma::new(CadenceEma::MAX_TAU).alpha_for(1));
+  assert_ne!(1.0 - at_ceiling, 1.0, "the ceiling must still decay");
+  assert!(at_ceiling > libm::ldexp(1.0, -54) * f64::from(1u32 << 28));
 }
 
 #[test]

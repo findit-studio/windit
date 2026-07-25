@@ -204,9 +204,12 @@ impl<V> SmoothPolicy<V> for Identity {
 /// and `Ema` claims nothing more — its `alpha` is per-push and carries no
 /// cadence, so it has no sampling-invariance property to violate.
 /// [`CadenceEma`], which does claim one, carries its state in `f64` to push the
-/// same degeneracy 28 binary orders further out, and bounds its time constant so
-/// the collapse cannot be configured at all. That relocates the boundary rather
-/// than removing it, and its own *Fine cadences* bullet states what survives.
+/// same degeneracy 29 binary orders further out — there `1 - alpha` collapses to
+/// exactly `1.0` at `2^-54` rather than at `2^-25`, `2^-54` being the tie that
+/// rounds to even and `2^-53` still being exactly representable — and bounds its
+/// time constant so the collapse cannot be configured at all. That relocates the
+/// boundary rather than removing it, and its own *Fine cadences* bullet states
+/// what survives.
 ///
 /// This policy is infallible, so [`Ema::new`] clamps `alpha` into `[0, 1]`
 /// deterministically: a non-finite (NaN) `alpha` clamps to `0.0` (hold the
@@ -321,10 +324,13 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
   // forms reach it as soon as `exp(-x)` falls below half an ulp of 1.
   //
   // `delta as f32` rounds above 2^24, but harmlessly: the cast is correct to a
-  // relative 2^-24, so the ratio — and with it the coefficient — lands within
-  // an ulp of the exact one at every `tau`. `expm1f` returns no NaN for the
-  // non-positive finite arguments produced here, so with a
-  // constructor-validated `tau` the coefficient stays in `[0, 1]`.
+  // relative 2^-24 and the division adds another, so the ratio — and with it
+  // the coefficient — lands within two ulps of the exact one at every accepted
+  // `tau`: measured 1.46 for the ratio and 1.51 for the coefficient, over
+  // `delta` to 2^40, and enforced by
+  // `cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one`. `expm1f`
+  // returns no NaN for the non-positive finite arguments produced here, so with
+  // a constructor-validated `tau` the coefficient stays in `[0, 1]`.
   -libm::expm1f(-(delta as f32) / tau)
 }
 
@@ -606,8 +612,10 @@ impl Smoother<f32> for CadenceEmaState {
         // f32 result would re-round to the same fixed point every step. In the
         // deepest regime the loss is inside the coefficient, where `1.0 - alpha`
         // rounds to exactly `1.0` (f32 at any `alpha` of `2^-25` or below, f64
-        // at `2^-53`), so both addends are already exact and a carried
-        // compensation term would have nothing to hold. Above that regime the
+        // at `2^-54` or below — `2^-53` is still exactly representable there,
+        // and `2^-54` is the tie that rounds to even), so both addends are
+        // already exact and a carried compensation term would have nothing to
+        // hold. Above that regime the
         // loss is in the final addition, and a compensated or double-double
         // accumulator *would* recover it — deliberately not carried: each such
         // widening only relocates the boundary (coefficient -> f32 accumulator
