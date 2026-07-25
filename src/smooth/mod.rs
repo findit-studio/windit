@@ -273,12 +273,20 @@ impl SmoothPolicy<f32> for Ema {
 /// [`CadenceEmaState`]'s push — so the inspectable coefficient and the streaming
 /// state can never drift.
 fn cadence_alpha(tau: f32, delta: usize) -> f32 {
-  // `delta as f32` rounds above 2^24, but harmlessly: any `delta / tau` past
-  // roughly 88 underflows `expf` to 0.0, so `alpha` has already saturated to
-  // exactly 1.0 long before the cast could drop a bit that matters. `expf`
-  // returns no NaN for the non-positive finite arguments produced here, so with
-  // a constructor-validated `tau` the coefficient stays in `[0, 1]`.
-  1.0 - libm::expf(-(delta as f32) / tau)
+  // Spelled `-expm1(-x)` rather than the literal `1 - exp(-x)`: the literal
+  // form loses every bit of `x` once `exp(-x)` rounds to exactly 1.0 — for f32
+  // any `x` below 2^-25 — which would return a zero coefficient and freeze the
+  // filter whenever the cadence is fine relative to `tau`, destroying the
+  // cadence invariance this type exists for. `expm1` is exact to full precision
+  // there and saturates to exactly the same 1.0 at the large end, since both
+  // forms reach it as soon as `exp(-x)` falls below half an ulp of 1.
+  //
+  // `delta as f32` rounds above 2^24, but harmlessly: the cast is correct to a
+  // relative 2^-24, so the ratio — and with it the coefficient — lands within
+  // an ulp of the exact one at every `tau`. `expm1f` returns no NaN for the
+  // non-positive finite arguments produced here, so with a
+  // constructor-validated `tau` the coefficient stays in `[0, 1]`.
+  -libm::expm1f(-(delta as f32) / tau)
 }
 
 /// Cadence-portable exponential moving average: an EMA whose time constant is
@@ -308,11 +316,16 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
 ///   recurrence and not a branch. A non-finite value pushed at `delta = 0` still
 ///   poisons the state, though, since `0.0 * NaN` and `0.0 * inf` are both `NaN`
 ///   — mirroring [`Ema`] at `alpha = 0`.
-/// - **Large gaps forget:** once `delta / tau` passes roughly 88, `exp`
-///   underflows and `alpha` is exactly `1.0`, so the state tracks the input
-///   exactly. Then `1 - alpha` is exactly `0.0`, and `0.0 * inf = NaN` washes an
-///   *infinite* prior state to `NaN` at that step; a `NaN` prior state stays
-///   `NaN` regardless. Non-finite state never washes out arithmetically — only
+/// - **Fine cadences keep their coefficient:** the coefficient is derived in a
+///   form that stays exact as `delta / tau` shrinks, so it never rounds to zero
+///   and the smoothed result is invariant to how finely the same signal is
+///   sampled — down to ratios far below f32's epsilon.
+/// - **Large gaps forget:** once `delta / tau` passes `ln(2^25)` (about 17.33),
+///   `exp(-delta / tau)` is below half an ulp of 1 and `alpha` is exactly
+///   `1.0`, so the state tracks the input exactly. Then `1 - alpha` is exactly
+///   `0.0`, and `0.0 * inf = NaN` washes an *infinite* prior state to `NaN` at
+///   that step; a `NaN` prior state stays `NaN` regardless. Non-finite state
+///   never washes out arithmetically — only
 ///   [`discontinuity`](Smoother::discontinuity) or [`reset`](Smoother::reset)
 ///   clears it.
 ///

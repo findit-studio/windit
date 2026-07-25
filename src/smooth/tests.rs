@@ -658,6 +658,117 @@ fn cadence_ema_alpha_for_is_monotone_and_saturates() {
 }
 
 #[test]
+fn cadence_ema_tiny_cadence_ratio_yields_a_nonzero_coefficient() {
+  // The small end of the coefficient. `expf(-x)` rounds to exactly `1.0` once
+  // `x` drops below `2^-25` (~3e-8), so deriving alpha as `1 - expf(-x)` there
+  // returns exactly `0.0` and the filter stops responding to the data
+  // altogether — on finite, valid input. The coefficient is therefore derived
+  // with `expm1f`, which is exact to full precision in that regime.
+  let tau = 1e8;
+  let cfg = CadenceEma::new(tau);
+  assert!(
+    cfg.alpha_for(1) > 0.0,
+    "a unit cadence under tau {tau} must still move the filter: {}",
+    cfg.alpha_for(1)
+  );
+  // Below the epsilon the coefficient is `delta / tau` to within rounding.
+  for delta in [1usize, 2, 5, 17, 100, 1000] {
+    let want = (delta as f32) / tau;
+    let got = cfg.alpha_for(delta);
+    assert!(
+      (got - want).abs() <= want * 1e-3,
+      "alpha_for({delta}) = {got}, want ~{want}"
+    );
+  }
+
+  // The large end is unchanged: both formulations saturate to exactly `1.0` at
+  // the same ratio, where `exp(-x)` falls below half an ulp of 1 (`x` past
+  // `ln(2^25)` ~ 17.33), and `1 - alpha` is exactly `0.0` from there on.
+  let unit = CadenceEma::new(1.0);
+  assert!(unit.alpha_for(17) < 1.0);
+  assert_eq!(unit.alpha_for(18), 1.0);
+  assert_eq!(1.0 - unit.alpha_for(18), 0.0);
+  assert_eq!(cfg.alpha_for(1_800_000_000), 1.0);
+}
+
+#[test]
+fn cadence_ema_is_cadence_invariant_below_f32_epsilon() {
+  // The property the type exists for, asserted directly: one signal sampled at
+  // three cadences must smooth to the same value at a shared position. Here
+  // `delta / tau` is 2.5e-8 at the finest cadence — under f32's epsilon, the
+  // regime where a `1 - expf` coefficient collapses to zero and pins the fine
+  // sampling to its seed for the whole horizon while the coarse samplings of
+  // the same signal move normally.
+  const N: usize = 40_000;
+  let tau = 4e7f32;
+  let cfg = CadenceEma::new(tau);
+
+  // Seed 0.0 at position 0, then a constant 1.0 over the next `N` elements.
+  let sampled = |hop: usize| -> f32 {
+    let mut samples: Vec<(usize, f32)> = vec![(0, 0.0)];
+    let mut p = 0usize;
+    while p + hop <= N {
+      p += hop;
+      samples.push((p, 1.0));
+    }
+    drive(&cfg, &cadence_seq(&samples)).last().unwrap().value
+  };
+  let fine = sampled(1);
+  let mid = sampled(100);
+  let coarse = sampled(N);
+
+  // The step response at the shared endpoint, in f64 — an independent
+  // precision path, not the recurrence under test.
+  let want = 1.0 - libm::exp(-(N as f64) / f64::from(tau));
+  for (name, got) in [("fine", fine), ("mid", mid), ("coarse", coarse)] {
+    assert!(
+      (f64::from(got) - want).abs() <= 1e-6,
+      "{name} cadence: {got} vs closed form {want}"
+    );
+  }
+  assert!(
+    (fine - coarse).abs() <= 1e-6 && (fine - mid).abs() <= 1e-6,
+    "cadences must agree: fine {fine} mid {mid} coarse {coarse}"
+  );
+}
+
+#[test]
+fn cadence_ema_matches_f64_zoh_reference_at_sub_epsilon_cadence() {
+  // The differential below bounds `delta / tau` under 88 to keep `expf` off its
+  // large-end underflow; that bound also keeps it clear of the *small* end,
+  // where the coefficient rounds away. This is that end: a time constant far
+  // above the cadence, over a horizon long enough that the per-step coefficient
+  // accumulates into a visible response.
+  //
+  // The seed is `0.0` and the horizon covers only a few thousandths of `tau`,
+  // so the running state stays near zero. That keeps the comparison a statement
+  // about the *coefficient*: an f32 accumulator of magnitude `m` cannot record
+  // a step smaller than half an ulp of `m`, an absorption limit no coefficient
+  // formulation can lift, and a seed of order 1 would hit it first.
+  let mut state: u64 = 0x5DEE_CE66_D1B5_4A32;
+  for _ in 0..4 {
+    // tau in [3.5e7, 4e7) at a unit cadence: `delta / tau` is about 2.6e-8,
+    // just under the threshold below which `expf(-x)` rounds to exactly 1.0.
+    let tau = 3.5e7 + next_unit(&mut state) * 5e6;
+    let n = 50_000 + (xorshift(&mut state) % 20_000) as usize;
+    let mut samples: Vec<(usize, f32)> = Vec::with_capacity(n);
+    let mut level = 0.0f32;
+    for p in 0..n {
+      if p != 0 && p.is_multiple_of(10_000) {
+        level = next_unit(&mut state);
+      }
+      samples.push((p, level));
+    }
+
+    let cfg = CadenceEma::new(tau);
+    let input = cadence_seq(&samples);
+    let reference = cadence_zoh_reference(f64::from(tau), &samples);
+    assert_f32_seq_close(&values(&cfg.smooth(&input).unwrap()), &reference, 1e-5);
+    assert_f32_seq_close(&values(&drive(&cfg, &input)), &reference, 1e-5);
+  }
+}
+
+#[test]
 fn cadence_ema_matches_f64_zoh_reference() {
   // Differential over randomized monotone sequences: the batch `smooth`, a fresh
   // streaming drive, and an independent f64 ZOH reference must agree — within
