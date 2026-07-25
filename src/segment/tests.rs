@@ -2,7 +2,7 @@ use std::{boxed::Box, cell::Cell, rc::Rc, vec, vec::Vec};
 
 use super::{
   longest_run, runs, runs_sorted, Dwell, DwellState, Gate, GatePolicy, Hangover, HangoverState,
-  Hysteresis, Range, SegmentOptions, SegmentTail, Segmenter, Threshold,
+  Hysteresis, Range, SegmentOptions, SegmentTail, Segmenter, Threshold, Vote, VoteState,
 };
 use crate::{
   error::WinditError,
@@ -1320,6 +1320,28 @@ fn hangover_oracle(flags: &[(bool, Span)], hold: usize) -> Vec<bool> {
   out
 }
 
+/// Brute-force reference for [`Vote`]'s N-of-M semantics: keep the full
+/// per-window vote history and recompute the last `of` votes from scratch on
+/// every step, rather than the ring/popcount state machine — the independent
+/// oracle the exhaustive and randomized suites check the real state machine
+/// against. Equivalence with the all-`false`-prefill formulation is by
+/// construction (only `min(of, i + 1)` votes exist before index `of - 1`);
+/// this is what the tests actually prove: that the ring implements it.
+fn vote_oracle(scores: &[f32], thr: f32, need: usize, of: usize) -> Vec<bool> {
+  let mut history: Vec<bool> = Vec::with_capacity(scores.len());
+  let mut out = Vec::with_capacity(scores.len());
+  for &v in scores {
+    history.push(v >= thr);
+    let window = of.min(history.len());
+    let trues = history[history.len() - window..]
+      .iter()
+      .filter(|&&b| b)
+      .count();
+    out.push(trues >= need);
+  }
+  out
+}
+
 /// Drive a fresh `DwellState<ScriptGate>` over `spans`, scripting the inner
 /// gate's flags directly and pushing `Windowed<()>` — the streaming
 /// counterpart of [`dwell_oracle`], and the value-freeness witness at once.
@@ -1780,15 +1802,21 @@ fn hangover_batch_segment_equals_streaming_drive() {
 }
 
 #[test]
-fn composition_hangover_of_dwell_streams_and_batch_drives_and_matches_oracle() {
-  // The canonical nesting (placeholder inner: Threshold stands in for Vote,
-  // which T3 adds and upgrades this composition to). Compiles as a config
-  // value, streams via Gate::push, and batch-drives via GatePolicy::segment;
-  // both equal the composed scan oracles (Threshold -> dwell_oracle ->
-  // hangover_oracle).
+fn composition_hangover_of_dwell_of_vote_streams_and_batch_drives_and_matches_oracle() {
+  // The canonical nesting: Hangover(Dwell(Vote)) (T2 exercised this
+  // composition against a placeholder Threshold inner before Vote existed;
+  // T3 upgrades it to the real thing). Compiles as a config value, streams
+  // via Gate::push, and batch-drives via GatePolicy::segment; both equal the
+  // composed scan oracles (Vote -> dwell_oracle -> hangover_oracle).
+  let need = 3;
+  let of = 5;
+  let thr = 0.5;
   let confirm = 2;
   let hold = 3;
-  let policy = Hangover::new(Dwell::new(Threshold::new(0.5), confirm), hold);
+  let policy = Hangover::new(
+    Dwell::new(Vote::try_new(need, of, thr).unwrap(), confirm),
+    hold,
+  );
 
   let mut state: u64 = 0x2468_1357_9BDF_0246;
   for _ in 0..50 {
@@ -1806,12 +1834,13 @@ fn composition_hangover_of_dwell_streams_and_batch_drives_and_matches_oracle() {
     let streamed: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
     let batch_ranges = policy.segment(&plain(), &s).unwrap();
 
-    let thr_pairs: Vec<(bool, Span)> = scores
+    let vote_flags = vote_oracle(&scores, thr, need, of);
+    let vote_pairs: Vec<(bool, Span)> = vote_flags
       .iter()
       .zip(&spans)
-      .map(|(&v, &sp)| (v >= 0.5, sp))
+      .map(|(&f, &sp)| (f, sp))
       .collect();
-    let dwell_flags = dwell_oracle(&thr_pairs, confirm);
+    let dwell_flags = dwell_oracle(&vote_pairs, confirm);
     let dwell_pairs: Vec<(bool, Span)> = dwell_flags
       .iter()
       .zip(&spans)
@@ -1826,6 +1855,31 @@ fn composition_hangover_of_dwell_streams_and_batch_drives_and_matches_oracle() {
       "n={n} hop={hop}"
     );
   }
+}
+
+#[test]
+fn canonical_nesting_example_from_the_spec_compiles_and_streams() {
+  // The parent design's literal worked example
+  // (`Hangover::new(Dwell::new(Vote::try_new(3, 5, 0.5)?, 160), 480)`): pins
+  // that the exact expression type-checks as a config value and
+  // streams/batch-drives without panicking. `confirm = 160` dwarfs this short
+  // sequence, so every flag must be false and the batch empty — a concrete,
+  // checkable consequence rather than a no-op smoke test. The property test
+  // above uses smaller confirm/hold so its randomized sequences actually
+  // exercise Dwell/Hangover transitions; this test exists only to pin the
+  // spec's literal constants separately.
+  let policy = Hangover::new(Dwell::new(Vote::try_new(3, 5, 0.5).unwrap(), 160), 480);
+  let s = seq(&[0.9, 0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.9]);
+
+  let mut gate = policy.gate();
+  let flags: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+  assert!(
+    flags.iter().all(|&f| !f),
+    "confirm=160 must suppress every flag over an 8-element run: {flags:?}"
+  );
+
+  let batch = policy.segment(&plain(), &s).unwrap();
+  assert!(batch.is_empty());
 }
 
 #[test]
@@ -1953,4 +2007,304 @@ fn box_of_dwell_of_probe_forwards_discontinuity_through_both_layers() {
     "Box -> DwellState -> ProbeGate discontinuity chain broken"
   );
   assert_eq!(reset_calls.get(), 0);
+}
+
+// ── Vote gate ─────────────────────────────────────────────────────────────
+
+#[test]
+fn vote_new_exposes_need_of_thr() {
+  let v = Vote::new(3, 5, 0.5);
+  assert_eq!(v.need(), 3);
+  assert_eq!(v.of(), 5);
+  assert_eq!(v.thr(), 0.5);
+}
+
+#[test]
+fn vote_accessors_report_nan_thr_verbatim() {
+  // Only the counts are validated at construction; `thr` is carried through
+  // exactly as given, NaN included (mirrors `Threshold`/`Hysteresis`).
+  let v = Vote::new(2, 4, f32::NAN);
+  assert_eq!(v.need(), 2);
+  assert_eq!(v.of(), 4);
+  assert!(v.thr().is_nan());
+}
+
+#[test]
+fn vote_try_new_rejects_invalid_configurations() {
+  // (0, n): need = 0 would always activate.
+  assert_eq!(
+    Vote::try_new(0, 5, 0.5),
+    Err(WinditError::InvalidVote { need: 0, of: 5 })
+  );
+  // (n + 1, n): need > of would never activate.
+  assert_eq!(
+    Vote::try_new(6, 5, 0.5),
+    Err(WinditError::InvalidVote { need: 6, of: 5 })
+  );
+  // (n, 0): of = 0 is vacuous.
+  assert_eq!(
+    Vote::try_new(5, 0, 0.5),
+    Err(WinditError::InvalidVote { need: 5, of: 0 })
+  );
+  // (1, 65): of > 64 exceeds the one-word state bound.
+  assert_eq!(
+    Vote::try_new(1, 65, 0.5),
+    Err(WinditError::InvalidVote { need: 1, of: 65 })
+  );
+  // (65, 65): both violations at once.
+  assert_eq!(
+    Vote::try_new(65, 65, 0.5),
+    Err(WinditError::InvalidVote { need: 65, of: 65 })
+  );
+}
+
+#[test]
+fn vote_try_new_accepts_boundary_configurations() {
+  assert_eq!(Vote::try_new(1, 1, 0.5).unwrap(), Vote::new(1, 1, 0.5));
+  assert_eq!(Vote::try_new(64, 64, 0.5).unwrap(), Vote::new(64, 64, 0.5));
+}
+
+#[test]
+#[should_panic(expected = "1 <= need <= of <= 64")]
+fn vote_new_panics_on_invalid_pair() {
+  let _ = Vote::new(6, 5, 0.5);
+}
+
+#[test]
+fn vote_matches_brute_force_reference_on_exhaustive_patterns() {
+  // Every vote pattern up to length 10, against the (need, of) grid from the
+  // spec, checked at every step against the brute-force reference.
+  let configs = [(1usize, 1usize), (1, 2), (2, 2), (2, 3), (3, 5), (5, 5)];
+  let thr = 0.5;
+  for len in 0..=10usize {
+    for bits in 0u32..(1u32 << len) {
+      let scores: Vec<f32> = (0..len)
+        .map(|i| if (bits >> i) & 1 == 1 { 0.9 } else { 0.1 })
+        .collect();
+      for &(need, of) in &configs {
+        let expected = vote_oracle(&scores, thr, need, of);
+        let got = gate_bools(&Vote::new(need, of, thr), &scores);
+        assert_eq!(got, expected, "len={len} bits={bits:b} need={need} of={of}");
+      }
+    }
+  }
+}
+
+#[test]
+fn vote_word_boundary_of_64_activation_saturation_and_decay() {
+  // 64 true pushes then 64 false: of=64 means the vote window is exactly one
+  // machine word, so this exercises activation (the window filling),
+  // saturation (the window entirely true, popcount 64), and decay (the
+  // window sliding off the true run one vote at a time). For i in
+  // [63, 126], popcount(i) = 127 - i exactly: a clean linear decay across
+  // the one-word boundary.
+  let mut scores = vec![0.9f32; 64];
+  scores.extend(vec![0.1f32; 64]);
+  let thr = 0.5;
+
+  for &(need, of) in &[(1usize, 64usize), (32, 64), (64, 64)] {
+    let expected = vote_oracle(&scores, thr, need, of);
+    let got = gate_bools(&Vote::new(need, of, thr), &scores);
+    assert_eq!(got, expected, "need={need} of={of}");
+  }
+
+  // need=1: active as soon as any true vote is in the window (from index 0);
+  // deactivates only once the last true vote ages out at index 127.
+  let need1 = gate_bools(&Vote::new(1, 64, thr), &scores);
+  assert!(need1[63], "need=1 active with a full window of true votes");
+  assert!(
+    need1[126],
+    "need=1 still active: popcount(126) = 127-126 = 1"
+  );
+  assert!(
+    !need1[127],
+    "need=1 deactivates once the last true vote ages out"
+  );
+
+  // need=32: popcount(95) = 32 (active), popcount(96) = 31 (inactive) — the
+  // exact release boundary.
+  let need32 = gate_bools(&Vote::new(32, 64, thr), &scores);
+  assert!(need32[95], "need=32: popcount(95) = 127-95 = 32, active");
+  assert!(!need32[96], "need=32: popcount(96) = 127-96 = 31, inactive");
+
+  // need=64: only a single-index pulse, exactly at the window's first full
+  // saturation (index 63); cannot activate before, decays immediately after.
+  let need64 = gate_bools(&Vote::new(64, 64, thr), &scores);
+  assert!(
+    need64[63],
+    "need=64: window first fully saturates at index 63"
+  );
+  assert!(!need64[64], "need=64: decays the push after saturation");
+  assert!(
+    !need64[0],
+    "need=64: cannot activate before the window fills"
+  );
+}
+
+#[test]
+fn vote_1_1_equals_threshold_on_randomized_sequences() {
+  // Pins the comparison-table equivalence: with need = of = 1 there is no
+  // history besides the current push, so Vote degrades exactly to
+  // Threshold's raw-IEEE membership test.
+  let mut state: u64 = 0x7F4A_7C15_9E37_79B9;
+  for _ in 0..200 {
+    let n = (xorshift(&mut state) % 40) as usize;
+    let scores: Vec<f32> = (0..n)
+      .map(|_| match xorshift(&mut state) % 16 {
+        0 => f32::NAN,
+        1 => f32::INFINITY,
+        2 => f32::NEG_INFINITY,
+        _ => next_unit(&mut state),
+      })
+      .collect();
+    let thr = match xorshift(&mut state) % 8 {
+      0 => f32::NAN,
+      1 => f32::INFINITY,
+      2 => f32::NEG_INFINITY,
+      3 if !scores.is_empty() => scores[(xorshift(&mut state) % scores.len() as u64) as usize],
+      _ => next_unit(&mut state),
+    };
+
+    let vote_out = gate_bools(&Vote::new(1, 1, thr), &scores);
+    let threshold_out = gate_bools(&Threshold::new(thr), &scores);
+    assert_eq!(vote_out, threshold_out, "n={n} thr={thr}");
+  }
+}
+
+#[test]
+fn vote_matches_brute_force_reference_on_randomized_inputs() {
+  // ~200 cases: random (need, of) with of <= 64, a threshold sampled with
+  // NaN, a score collision, or a random unit value, and non-finite score
+  // injections, checked against the brute-force reference.
+  let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+  for _ in 0..200 {
+    let n = (xorshift(&mut state) % 100) as usize;
+    let of = 1 + (xorshift(&mut state) % 64) as usize;
+    let need = 1 + (xorshift(&mut state) % of as u64) as usize;
+
+    let scores: Vec<f32> = (0..n)
+      .map(|_| match xorshift(&mut state) % 16 {
+        0 => f32::NAN,
+        1 => f32::INFINITY,
+        2 => f32::NEG_INFINITY,
+        _ => next_unit(&mut state),
+      })
+      .collect();
+    let thr = match xorshift(&mut state) % 8 {
+      0 => f32::NAN,
+      1 if !scores.is_empty() => scores[(xorshift(&mut state) % scores.len() as u64) as usize],
+      _ => next_unit(&mut state),
+    };
+
+    let expected = vote_oracle(&scores, thr, need, of);
+    let got = gate_bools(&Vote::new(need, of, thr), &scores);
+    assert_eq!(got, expected, "n={n} need={need} of={of} thr={thr}");
+  }
+}
+
+#[test]
+fn vote_earliest_activation_is_at_index_need_minus_1() {
+  // All-true pushes into a window exactly `need` wide: the need-th true vote
+  // — and so the earliest possible activation — lands at index need - 1
+  // (0-based), never earlier.
+  for need in [1usize, 3, 10, 64] {
+    let mut gate = Vote::new(need, need, 0.5).gate();
+    for i in 0..need {
+      let active = gate.push(&Windowed::new(0.9, Span::new(i, 1, 1))).unwrap();
+      assert_eq!(
+        active,
+        i + 1 == need,
+        "need={need} index={i}: activation must land exactly at index need-1"
+      );
+    }
+  }
+}
+
+#[test]
+fn vote_nan_value_is_a_false_vote_that_ages_out() {
+  // NaN never satisfies `>= thr`, so it is an ordinary false vote — it
+  // neither poisons the state nor is treated specially — and ages out of the
+  // window exactly like any other false vote once `of` further pushes have
+  // occurred.
+  let mut gate = Vote::new(1, 3, 0.5).gate();
+  assert!(gate.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap()); // true vote: need=1 met
+  assert!(gate
+    .push(&Windowed::new(f32::NAN, Span::new(1, 1, 1)))
+    .unwrap()); // NaN false vote; the true vote is still in the window
+  assert!(gate
+    .push(&Windowed::new(f32::NAN, Span::new(2, 1, 1)))
+    .unwrap()); // of=3: still in the window
+                // The original true vote ages out of the 3-wide window on this push.
+  assert!(!gate
+    .push(&Windowed::new(f32::NAN, Span::new(3, 1, 1)))
+    .unwrap());
+}
+
+#[test]
+fn vote_deactivates_exactly_when_need_th_true_vote_leaves_the_window() {
+  // need=2, of=4: two true votes at the front of the window, then false
+  // pushes. Deactivation must land exactly when the older of the two true
+  // votes ages out of the 4-wide window, not one push earlier or later.
+  let mut gate = Vote::new(2, 4, 0.5).gate();
+  assert!(!gate.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap()); // 1 true: below need
+  assert!(gate.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap()); // 2 true: need met
+  assert!(gate.push(&Windowed::new(0.1, Span::new(2, 1, 1))).unwrap()); // [t,t,f]: still 2 true
+  assert!(gate.push(&Windowed::new(0.1, Span::new(3, 1, 1))).unwrap()); // [t,t,f,f]: window full, still 2 true
+                                                                        // The window is now full; the next push evicts the oldest vote (the first
+                                                                        // true, at index 0), leaving only 1 true — below need.
+  assert!(!gate.push(&Windowed::new(0.1, Span::new(4, 1, 1))).unwrap());
+}
+
+#[test]
+fn vote_reset_and_discontinuity_clear_history() {
+  fn drive_four(g: &mut VoteState) -> Vec<bool> {
+    [0.9f32, 0.9, 0.1, 0.9]
+      .iter()
+      .enumerate()
+      .map(|(i, &v)| g.push(&Windowed::new(v, Span::new(i, 1, 1))).unwrap())
+      .collect()
+  }
+
+  let policy = Vote::new(2, 3, 0.5);
+
+  let mut fresh = policy.gate();
+  let baseline = drive_four(&mut fresh);
+
+  let mut via_reset = policy.gate();
+  via_reset
+    .push(&Windowed::new(0.9, Span::new(0, 1, 1)))
+    .unwrap();
+  via_reset
+    .push(&Windowed::new(0.9, Span::new(1, 1, 1)))
+    .unwrap();
+  via_reset.reset();
+  assert_eq!(drive_four(&mut via_reset), baseline);
+
+  let mut via_discontinuity = policy.gate();
+  via_discontinuity
+    .push(&Windowed::new(0.9, Span::new(0, 1, 1)))
+    .unwrap();
+  via_discontinuity.discontinuity();
+  assert_eq!(drive_four(&mut via_discontinuity), baseline);
+}
+
+#[test]
+fn vote_batch_segment_equals_streaming_drive() {
+  let policy = Vote::new(2, 3, 0.5);
+  let s = seq(&[0.9, 0.9, 0.1, 0.1, 0.9, 0.9, 0.9, 0.1, 0.1, 0.1]);
+  let batch = policy.segment(&plain(), &s).unwrap();
+
+  let mut gate = policy.gate();
+  let flags: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+  let spans: Vec<Span> = s.iter().map(|w| w.span()).collect();
+  assert_eq!(batch, finalize(&flags, &spans, &plain()));
+}
+
+#[test]
+fn vote_is_object_safe_as_boxed_gate() {
+  let mut boxed: Box<dyn Gate<f32>> = Box::new(Vote::new(2, 3, 0.5).gate());
+  assert!(!boxed.push(&Windowed::new(0.9, Span::new(0, 1, 1))).unwrap());
+  assert!(boxed.push(&Windowed::new(0.9, Span::new(1, 1, 1))).unwrap());
+  boxed.reset();
+  assert!(!boxed.push(&Windowed::new(0.1, Span::new(2, 1, 1))).unwrap());
 }

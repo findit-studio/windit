@@ -10,11 +10,13 @@
 //! [`SegmentOptions`] morphology passes — merge runs separated by at most
 //! `merge_gap` elements, then drop runs shorter than `min_len`.
 //!
-//! The shipped gates are [`Threshold`] (active at or above a fixed cutoff) and
-//! [`Hysteresis`] (a latching two-threshold gate). [`Dwell`] and [`Hangover`]
-//! are gate combinators that wrap an inner gate and reshape its flag sequence
-//! with an element-denominated on-delay or off-delay; they shape the *causal
-//! flag plane*, distinct from the *finalized-range plane* morphology
+//! The shipped gates are [`Threshold`] (active at or above a fixed cutoff),
+//! [`Hysteresis`] (a latching two-threshold gate), and [`Vote`] (active once
+//! at least `need` of the last `of` per-window comparisons were true).
+//! [`Dwell`] and [`Hangover`] are gate combinators that wrap an inner gate and
+//! reshape its flag sequence with an element-denominated on-delay or
+//! off-delay; they shape the *causal flag plane*, distinct from the
+//! *finalized-range plane* morphology
 //! ([`SegmentOptions::merge_gap`], [`SegmentOptions::min_len`]) the
 //! `Segmenter` applies afterward — the two are not interchangeable. A
 //! [`GatePolicy`] is the
@@ -633,9 +635,10 @@ pub trait Gate<V> {
   /// Returns [`WinditError::NonMonotonicSpan`] from a span-reading stage fed a
   /// start before the previous one: [`Dwell`] and [`Hangover`] read spans to
   /// measure their confirm/hold distances and report out-of-order input here,
-  /// each checking independently of any inner or nested combinator. [`Threshold`]
-  /// and [`Hysteresis`] read no spans and are infallible, always returning `Ok`
-  /// and carrying the `Result` only for uniformity with the composable stages.
+  /// each checking independently of any inner or nested combinator.
+  /// [`Threshold`], [`Hysteresis`], and [`Vote`] read no spans and are
+  /// infallible, always returning `Ok` and carrying the `Result` only for
+  /// uniformity with the composable stages.
   fn push(&mut self, w: &Windowed<V>) -> Result<bool, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -855,6 +858,146 @@ impl GatePolicy<f32> for Hysteresis {
     HysteresisState {
       cfg: *self,
       active: false,
+    }
+  }
+}
+
+/// N-of-M voting gate: active once at least `need` of the last `of`
+/// per-window comparisons `value >= thr` were true.
+///
+/// A window not yet pushed in the current epoch counts as an inactive vote —
+/// the pre-fill is all-`false` — so the gate starts inactive and its decision
+/// is causal and deterministic from the very first push. The comparison
+/// itself is raw IEEE, exactly [`Threshold`]'s table: a `NaN` value is never a
+/// true vote; a `NaN` `thr` accepts nothing; `thr = -inf` accepts every
+/// non-`NaN` value; `thr = +inf` accepts only `+inf`. Only the vote *counts*
+/// are checked at construction — `thr` is deliberately free to degrade the
+/// same way `Threshold`'s does. (Lineage: FunASR window-count voting, cited
+/// for lineage only — no recommendation.)
+///
+/// # Cadence coupling
+///
+/// `Vote` counts *windows*, not elements — like [`Ema`](crate::smooth::Ema)'s
+/// per-step alpha, its physical meaning changes with the hop. That is
+/// inherent to N-of-M voting, not a defect, and is stated plainly here: no
+/// portability claim is made. [`Dwell`] is the element-denominated
+/// confirmation alternative when portability across hops matters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vote {
+  need: usize,
+  of: usize,
+  thr: f32,
+}
+
+impl Vote {
+  /// A vote gate active once at least `need` of the last `of` comparisons
+  /// `value >= thr` are true.
+  ///
+  /// # Panics
+  ///
+  /// Panics, in every build, unless `1 <= need <= of <= 64`. Use
+  /// [`try_new`](Vote::try_new) to handle untrusted counts instead.
+  #[must_use]
+  pub const fn new(need: usize, of: usize, thr: f32) -> Self {
+    match Self::try_new(need, of, thr) {
+      Ok(v) => v,
+      Err(_) => panic!("vote counts must satisfy 1 <= need <= of <= 64"),
+    }
+  }
+
+  /// The checked counterpart of [`new`](Vote::new): validate the counts
+  /// rather than panic on them.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`WinditError::InvalidVote`] unless `1 <= need <= of <= 64`:
+  /// `need = 0` would always activate, `need > of` would never activate,
+  /// `of = 0` is vacuous, and `of > 64` exceeds the one-machine-word state
+  /// bound documented on [`VoteState`].
+  pub const fn try_new(need: usize, of: usize, thr: f32) -> Result<Self, WinditError> {
+    if need >= 1 && need <= of && of <= 64 {
+      Ok(Self { need, of, thr })
+    } else {
+      Err(WinditError::InvalidVote { need, of })
+    }
+  }
+
+  /// The required-true count out of the last [`of`](Vote::of) votes.
+  #[must_use]
+  pub const fn need(&self) -> usize {
+    self.need
+  }
+
+  /// The vote window length: how many recent comparisons are considered.
+  #[must_use]
+  pub const fn of(&self) -> usize {
+    self.of
+  }
+
+  /// The cutoff each window's value is compared against: a vote is true when
+  /// `value >= thr`.
+  #[must_use]
+  pub const fn thr(&self) -> f32 {
+    self.thr
+  }
+}
+
+/// The streaming state of a [`Vote`] gate: the cutoff plus a one-machine-word
+/// ring buffer of the last up-to-64 votes and its popcount, all-`false` until
+/// the first push.
+///
+/// `need` and `of` narrow from [`Vote`]'s `usize` (the crate's count
+/// convention) down to `u8`, because a validated configuration's counts
+/// always fit `1..=64`; [`gate`](GatePolicy::gate) is the single place that
+/// defends the narrowing (see its doc). The ring holds the newest vote in bit
+/// 0. The type is a fixed 16 bytes on every platform, independent of target
+/// word size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoteState {
+  thr: f32,
+  need: u8,
+  of: u8,
+  ring: u64,
+}
+
+impl Gate<f32> for VoteState {
+  fn push(&mut self, w: &Windowed<f32>) -> Result<bool, WinditError> {
+    // Raw IEEE, Threshold's table: NaN is never a true vote.
+    let vote = *w.value() >= self.thr;
+    // The newest vote enters bit 0; bit 63 falls off the top, discarding any
+    // history older than 64 votes ago. Vote reads no spans, so this is total
+    // and branch-free.
+    self.ring = (self.ring << 1) | (vote as u64);
+    // `of` is defended into `1..=64` by `gate()`, so `64 - of` is always in
+    // `0..=63` — a shift amount that can never panic.
+    let window = self.ring & (u64::MAX >> (64 - self.of as u32));
+    Ok(window.count_ones() >= self.need as u32)
+  }
+
+  fn reset(&mut self) {
+    self.ring = 0;
+  }
+}
+
+impl GatePolicy<f32> for Vote {
+  type Gate = VoteState;
+
+  fn gate(&self) -> VoteState {
+    // `Vote::new`/`try_new` are the only public ways to set `need`/`of`, and
+    // both validate `1 <= need <= of <= 64` there, so this re-clamp is
+    // currently unreachable. It is kept as the last line of defence for the
+    // shift-amount invariant `VoteState::push` relies on: a future
+    // construction path that bypasses `new`/`try_new` — a serde derive being
+    // the obvious one — degrades to the nearest valid configuration instead
+    // of shifting a `u64` out of range, which would panic in debug and be
+    // silently masked in release.
+    let of = self.of.clamp(1, 64);
+    let need = self.need.clamp(1, of);
+    VoteState {
+      thr: self.thr,
+      need: need as u8,
+      of: of as u8,
+      ring: 0,
     }
   }
 }
