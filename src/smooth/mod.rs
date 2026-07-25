@@ -50,6 +50,17 @@ mod tests;
 /// `finish`; [`discontinuity`](Smoother::discontinuity) defaults to
 /// [`reset`](Smoother::reset). `Box<dyn Smoother<f32>>` is a valid object, so a
 /// smoother can be selected at run time.
+///
+/// # Span contract
+///
+/// Spans arrive in ascending [`Span::start`](crate::plan::Span::start) order,
+/// equal starts admitted — and that is the only ordering guaranteed. **Ends are
+/// not monotone:** nested and overlapping spans are legal, so a later span may end
+/// *before* one already seen. A stage that keeps a temporal horizon must
+/// therefore fold it by maximum (`horizon = max(horizon, span.end())`) and
+/// measure against that fold; reading the current span's end alone would let
+/// the horizon move backward. A strictly backward start is a contract
+/// violation, reported as [`WinditError::NonMonotonicSpan`].
 pub trait Smoother<V> {
   /// Advance by one window. The returned value keeps the input [`Span`].
   ///

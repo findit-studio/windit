@@ -627,6 +627,18 @@ where
 /// is a [`GatePolicy`].
 ///
 /// `Box<dyn Gate<f32>>` is a valid object, so a gate can be selected at run time.
+///
+/// # Span contract
+///
+/// Spans arrive in ascending [`Span::start`] order, equal starts admitted — and
+/// that is the only ordering guaranteed. **Ends are not monotone:** nested and
+/// overlapping spans are legal, so a later span may end *before* one already
+/// seen. A gate that keeps a temporal horizon must therefore fold it by maximum
+/// (`horizon = max(horizon, span.end())`) and measure against that fold, as
+/// [`Dwell`]'s confirmation and [`Hangover`]'s coverage horizon both do;
+/// reading the current span's end alone would let the horizon move backward and
+/// the decision retract. A strictly backward start is a contract violation,
+/// reported as [`WinditError::NonMonotonicSpan`].
 pub trait Gate<V> {
   /// Advance by one window; `Ok(true)` means active/accepted.
   ///
