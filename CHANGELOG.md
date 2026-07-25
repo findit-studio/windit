@@ -280,9 +280,10 @@ accepted domain to its edges and fails if the claim is false.
   And the recurrence is accumulated in `f64` with only the emitted value
   rounded to `f32`, because applying an exact small coefficient to an `f32`
   state made a state near `1.0` a fixed point: at `tau = 4e7` a unit cadence
-  decayed not at all where one `tau`-sized step over the same distance reached
-  ~0.9990005. Both were the type's defining property — that the result does not
-  depend on how finely the signal is sampled — failing in a reachable regime.
+  decayed not at all where one 40,000-element step (0.001 `tau`) covering that
+  same distance reached ~0.9990005. Both were the type's defining property —
+  that the result does not depend on how finely the signal is sampled — failing
+  in a reachable regime.
   Invariance is documented as a bound on `alpha * rho` (`rho` the contrast
   `|x - s| / |s|`), not on `alpha` alone — specifically `alpha * rho > 2^-50`,
   equivalently `alpha * |x - s| > 4 * ulp(s)`. Its `alpha > 2^-26` corollary,
