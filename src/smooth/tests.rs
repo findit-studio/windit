@@ -80,6 +80,109 @@ fn assert_f32_seq(got: &[f32], want: &[f32]) {
   }
 }
 
+/// The retired coefficient spelling, which formed the ratio in `f32` and so
+/// rounded `delta` itself above 2^24.
+///
+/// Kept as the differential the boundary sweep measures the shipped derivation
+/// against: the sweep asserts that this one breaches the published two-ulp
+/// figure on the very same enumerated points, so "the cast is harmless" cannot
+/// be reasserted without a failing test.
+fn cadence_alpha_via_f32_cast(tau: f32, delta: usize) -> f32 {
+  -libm::expm1f(-(delta as f32) / tau)
+}
+
+/// Distance from an `f32` coefficient to its exact value, in `f32` ulps read at
+/// the *exact* value's binade.
+///
+/// Reading the ulp off the returned `f32` instead would halve the measured
+/// distance wherever the two straddle a binade edge — precisely the points this
+/// sweep exists to enumerate.
+fn coefficient_ulps(got: f32, exact: f64) -> f64 {
+  (f64::from(got) - exact).abs() / libm::ldexp(1.0, libm::frexp(exact).1 - 24)
+}
+
+/// The `tau` edges the coefficient claim is quantified over: the ceiling and the
+/// values just under it, every binade edge of the accepted domain with its
+/// neighbours, small integers, and non-dyadic values.
+///
+/// Enumerated, not sampled. The 2.25-ulp breach lived at the ceiling and at
+/// `delta`s a random draw over a 16-`tau` span reaches with vanishing
+/// probability, which is why the randomized predecessor of this sweep ran
+/// 20_000 probes without meeting one.
+fn boundary_taus() -> Vec<f32> {
+  let mut taus: Vec<f32> = Vec::new();
+  // The ceiling and its immediate neighbourhood, where `alpha` is smallest and
+  // every figure on the type is tightest.
+  for k in 0..32u32 {
+    taus.push(f32::from_bits(CadenceEma::MAX_TAU.to_bits() - k));
+  }
+  // Every binade edge of the accepted domain, each with its two neighbours.
+  for e in -30i32..=26 {
+    let p = libm::ldexpf(1.0, e);
+    for d in [-1i64, 0, 1] {
+      let bits = p.to_bits() as i64 + d;
+      if bits > 0 {
+        let tau = f32::from_bits(bits as u32);
+        if tau > 0.0 && tau <= CadenceEma::MAX_TAU {
+          taus.push(tau);
+        }
+      }
+    }
+  }
+  for i in 1..=32u32 {
+    taus.push(i as f32);
+  }
+  for tau in [1.1f32, 3.7, 9.99, 17.5, 14.427, 1e3, 1e5, 1e7, 6.5e7] {
+    taus.push(tau);
+  }
+  taus.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in the ladder"));
+  taus.dedup();
+  taus
+}
+
+/// The `delta` edges for one `tau`: every `f32` cast boundary from 2^24 up, the
+/// ratio's own binade edges, a small exhaustive head, and the exact witness.
+///
+/// Above `delta / tau` of about 17.33 the coefficient is exactly `1.0` on every
+/// path, so the accuracy claim has content only below it; the whole enumerated
+/// set is finite for that reason.
+fn boundary_deltas(tau: f32) -> Vec<usize> {
+  let mut deltas: Vec<usize> = (1..=256).collect();
+  // The cast boundaries: 2^24 is where an `f32` stops holding every integer,
+  // and each binade above it doubles the step it skips. Both the neighbourhood
+  // of each boundary and, inside each binade, the counts an `f32` cast rounds
+  // WORST — the midpoints of its grid, at odd multiples of half its step, which
+  // is where the retired spelling's error peaks.
+  for e in 24..=30u32 {
+    let p = 1usize << e;
+    for j in 0..=64usize {
+      deltas.push(p + j);
+      deltas.push(p - j);
+    }
+    let half_step = 1usize << (e - 24);
+    for j in 0..=256usize {
+      deltas.push(p + (2 * j + 1) * half_step);
+    }
+  }
+  // The ratio's binade edges, where the relative rounding of the narrowing is
+  // largest and the reported ulp changes size.
+  for k in -20i32..=4 {
+    let centre = (f64::from(tau) * libm::ldexp(1.0, k)) as i64;
+    for j in -4i64..=4 {
+      if centre + j > 0 {
+        deltas.push((centre + j) as usize);
+      }
+    }
+  }
+  // The witness the published figure was falsified at, and its neighbours.
+  for j in -2i64..=2 {
+    deltas.push((16_812_203i64 + j) as usize);
+  }
+  deltas.sort_unstable();
+  deltas.dedup();
+  deltas
+}
+
 /// xorshift64 — deterministic and dependency-free; the seed must be nonzero.
 fn xorshift(state: &mut u64) -> u64 {
   let mut x = *state;
@@ -1676,59 +1779,172 @@ fn cadence_ema_one_tau_decay_lands_within_four_ulps_of_exp_minus_one() {
 
 #[test]
 fn cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one() {
-  // The `cadence_alpha` comment's accuracy figure, enforced. `delta as f32`
-  // rounds above 2^24 and the division rounds again, so the coefficient is not
-  // exact — the comment used to claim "within an ulp", which is false: two
-  // half-ulp roundings compose to a full ulp of relative error before `expm1f`
-  // adds its own. Measured worst case 1.46 ulps for the ratio and 1.51 for the
-  // coefficient, over `tau` across the accepted domain and `delta` to 2^40.
+  // The `cadence_alpha` comment's accuracy figure, enforced over an ENUMERATED
+  // boundary set rather than a random draw: the `f32` cast boundaries from 2^24
+  // up, the ratio's binade edges, the accepted domain's binade edges, and the
+  // ceiling itself. The randomized predecessor of this sweep drew 20_000 probes
+  // and reported the figure held; it never landed on a cast boundary, where it
+  // does not. Sampling the interior of a domain cannot enforce a claim about
+  // its edges, so this one walks the edges and nothing else.
   //
-  // The reference is the same expression evaluated in `f64`, an independent
-  // precision path: `delta` is exact there for every count below 2^53.
+  // The reference is the same function evaluated in `f64`, an independent
+  // precision path: `delta` is exact there for every count below 2^53, so its
+  // own error is under 2^-28 of an `f32` ulp and cannot colour the figure.
   const BOUND: f64 = 2.0;
-  let mut rng: u64 = 0x0BAD_C0DE_DEAD_BEEF;
+  // Below this the sweep would not be reaching the hard region at all — the
+  // narrowing alone costs up to a full ulp and `expm1f` adds its own.
+  const REACHED: f64 = 1.4;
+  let mut worst = 0.0f64;
+  let mut worst_at = (0.0f32, 0usize);
+  let mut retired_worst = 0.0f64;
+  let mut retired_breaches = 0u32;
   let mut probed = 0u32;
   let mut past_cast = 0u32;
 
-  for i in 0..20_000u32 {
-    // Half the probes at the top of the domain, where a `delta` large enough to
-    // round in the cast still leaves the coefficient unsaturated — the regime
-    // the comment is actually about — and every sixteenth at the ceiling.
-    let tau = if i % 16 == 0 {
-      CadenceEma::MAX_TAU
-    } else {
-      let exp = if i % 2 == 0 {
-        21 + (xorshift(&mut rng) % 6) as i32
-      } else {
-        (xorshift(&mut rng) % 176) as i32 - 149
-      };
-      libm::ldexpf(1.0 + next_unit(&mut rng), exp).min(CadenceEma::MAX_TAU)
-    };
-    // `delta / tau` under 16 keeps `expm1f` off its large-end saturation, where
-    // both paths return exactly 1.0 and there is no ulp to measure.
-    let span = (16.0 * f64::from(tau)) as u64;
-    let delta = 1 + (xorshift(&mut rng) % span.max(1)) as usize;
-    if delta > (1 << 24) {
-      past_cast += 1;
+  for tau in boundary_taus() {
+    let cfg = CadenceEma::new(tau);
+    for delta in boundary_deltas(tau) {
+      let want = -libm::expm1(-(delta as f64) / f64::from(tau));
+      // A saturated coefficient is exactly 1.0 on every path, with no ulp to
+      // measure against; a zero one cannot arise, since `expm1f` is exact in
+      // that regime.
+      if !(0.0..1.0).contains(&want) || want == 0.0 {
+        continue;
+      }
+      probed += 1;
+      if delta > (1 << 24) {
+        past_cast += 1;
+      }
+
+      let apart = coefficient_ulps(cfg.alpha_for(delta), want);
+      assert!(
+        apart <= BOUND,
+        "tau {tau:e} delta {delta}: alpha is {apart:.4} f32 ulps from {want:e}"
+      );
+      if apart > worst {
+        worst = apart;
+        worst_at = (tau, delta);
+      }
+
+      // The same point measured against the spelling this derivation replaced.
+      // Its breaches are counted, not asserted away: they are what makes this
+      // enumeration a regression rather than a description.
+      let retired = coefficient_ulps(cadence_alpha_via_f32_cast(tau, delta), want);
+      retired_worst = retired_worst.max(retired);
+      if retired > BOUND {
+        retired_breaches += 1;
+      }
     }
-    let got = f64::from(CadenceEma::new(tau).alpha_for(delta));
-    let want = -libm::expm1(-(delta as f64) / f64::from(tau));
-    // A saturated coefficient is exactly 1.0 on both paths, with no ulp to
-    // measure against.
-    if !(0.0..1.0).contains(&want) || want == 0.0 {
-      continue;
-    }
-    probed += 1;
-    let apart = (got - want).abs() / f64::from(ulp32(got as f32));
-    assert!(
-      apart <= BOUND,
-      "tau {tau:e} delta {delta}: alpha {got:e} is {apart:.4} f32 ulps from {want:e}"
-    );
   }
-  assert!(probed > 5_000, "too few unsaturated probes: {probed}");
+
+  // No arm may pass vacuously: the enumeration must be large, must reach past
+  // the cast boundary, and must reach the hard region rather than skirt it.
+  assert!(probed > 100_000, "too few unsaturated probes: {probed}");
   assert!(
-    past_cast > 5_000,
+    past_cast > 50_000,
     "too few probes past the cast: {past_cast}"
+  );
+  assert!(
+    worst > REACHED,
+    "the sweep never reached the hard region: worst {worst:.4} ulps at tau \
+     {:e} delta {}",
+    worst_at.0,
+    worst_at.1
+  );
+  // And the retired spelling must fail on this very set — the sweep is only
+  // evidence for the shipped derivation if it can tell the two apart.
+  assert!(
+    retired_breaches > 50 && retired_worst > 2.2,
+    "the f32-cast spelling must breach the bound on the enumerated boundaries: \
+     {retired_breaches} breaches, worst {retired_worst:.4} ulps"
+  );
+}
+
+#[test]
+fn cadence_ema_coefficient_never_rounds_delta_through_f32() {
+  // The cast-boundary regression, on the exact witness that falsified the
+  // published two-ulp figure. `delta` is a usize count of elements; putting it
+  // through an `f32` rounded the caller's *data* before the configuration was
+  // applied to it, and no `f32` holds an odd integer above 2^24.
+  const DELTA: usize = 16_812_203;
+  let cfg = CadenceEma::new(CadenceEma::MAX_TAU);
+
+  assert_eq!(DELTA as f32, 16_812_204.0, "the cast lands an element away");
+  const { assert!(DELTA > (1 << 24) && DELTA % 2 == 1) };
+  assert_eq!(DELTA as f64, 16_812_203.0, "f64 holds it exactly");
+
+  let want = -libm::expm1(-(DELTA as f64) / f64::from(CadenceEma::MAX_TAU));
+  let retired = cadence_alpha_via_f32_cast(CadenceEma::MAX_TAU, DELTA);
+  let shipped = cfg.alpha_for(DELTA);
+  assert_eq!(retired.to_bits(), 0x3E62_EC78, "the retired cast spelling");
+  assert_eq!(shipped.to_bits(), 0x3E62_EC76, "the shipped f64 ratio");
+  assert!(
+    coefficient_ulps(retired, want) > 2.2,
+    "the retired spelling must be the failing one: {:.4} ulps",
+    coefficient_ulps(retired, want)
+  );
+  assert!(
+    coefficient_ulps(shipped, want) < 0.5,
+    "the shipped one must be within half an ulp here: {:.4} ulps",
+    coefficient_ulps(shipped, want)
+  );
+
+  // `alpha_for` still reports exactly the coefficient the state applies, read
+  // in the region the derivation changed: the emitted value and the retained
+  // `f64` are both reproduced from the reported coefficient alone.
+  let mut s = cfg.smoother();
+  assert_eq!(
+    s.push(Windowed::new(0.25, Span::new(0, 1, 1)))
+      .unwrap()
+      .value,
+    0.25,
+    "seed s_0 = x_0"
+  );
+  let out = s
+    .push(Windowed::new(1.0, Span::new(DELTA, 1, 1)))
+    .unwrap()
+    .value;
+  let alpha = f64::from(shipped);
+  let expected = alpha * 1.0 + (1.0 - alpha) * 0.25;
+  assert_eq!(
+    retained(&s),
+    expected,
+    "the applied coefficient is alpha_for"
+  );
+  assert_eq!(out, expected as f32);
+
+  // Below the cast boundary the two spellings agree bit for bit at every
+  // enumerated `tau`, which is why nothing else on the type moved: the change
+  // is confined to the counts an `f32` cannot hold.
+  let below: Vec<usize> = (1..=512)
+    .chain((1 << 24) - 512..=(1 << 24))
+    .chain([1 << 20, 1 << 23, 12_345_678])
+    .collect();
+  for tau in boundary_taus() {
+    for &delta in &below {
+      assert_eq!(
+        cadence_alpha(tau, delta).to_bits(),
+        cadence_alpha_via_f32_cast(tau, delta).to_bits(),
+        "tau {tau:e} delta {delta} must be unchanged below the cast boundary"
+      );
+    }
+  }
+
+  // Above it they diverge on enumerated boundaries, so the agreement below is a
+  // property of the domain and not of the two spellings being the same code.
+  let mut diverged = 0u32;
+  for tau in boundary_taus() {
+    for delta in boundary_deltas(tau) {
+      if delta > (1 << 24)
+        && cadence_alpha(tau, delta).to_bits() != cadence_alpha_via_f32_cast(tau, delta).to_bits()
+      {
+        diverged += 1;
+      }
+    }
+  }
+  assert!(
+    diverged > 1_000,
+    "the two spellings must differ above 2^24: {diverged}"
   );
 }
 

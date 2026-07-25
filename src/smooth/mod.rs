@@ -323,15 +323,38 @@ fn cadence_alpha(tau: f32, delta: usize) -> f32 {
   // there and saturates to exactly the same 1.0 at the large end, since both
   // forms reach it as soon as `exp(-x)` falls below half an ulp of 1.
   //
-  // `delta as f32` rounds above 2^24, but harmlessly: the cast is correct to a
-  // relative 2^-24 and the division adds another, so the ratio — and with it
-  // the coefficient — lands within two ulps of the exact one at every accepted
-  // `tau`: measured 1.46 for the ratio and 1.51 for the coefficient, over
-  // `delta` to 2^40, and enforced by
-  // `cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one`. `expm1f`
-  // returns no NaN for the non-positive finite arguments produced here, so with
-  // a constructor-validated `tau` the coefficient stays in `[0, 1]`.
-  -libm::expm1f(-(delta as f32) / tau)
+  // The ratio is formed in `f64` and narrowed once. Spelling it
+  // `(delta as f32) / tau` instead rounded the *count* before the division ran
+  // — `delta as f32` cannot represent an integer above 2^24 exactly — and that
+  // avoidable rounding composed with the division's own to put the coefficient
+  // 2.25 ulps from the exact one at `tau = MAX_TAU, delta = 16_812_203`, with
+  // 29_711 further breaches of the two-ulp figure below among the `delta`s that
+  // one `tau` admits. `delta as f64` is exact to 2^53 and `f64::from` widens
+  // `tau` exactly, so the only rounding left on the ratio is the single
+  // narrowing to `f32`: worst case 1.51 coefficient ulps, over the enumerated
+  // boundary sweep in
+  // `cadence_ema_coefficient_stays_within_two_ulps_of_the_exact_one`. A `delta`
+  // past 2^53 rounds in the `f64` cast too, harmlessly this time: `delta / tau`
+  // is then past 2^27 for every accepted `tau`, deep inside the region where
+  // the coefficient is exactly 1.0.
+  //
+  // Narrowing the ratio rather than carrying `f64` through `expm1` is
+  // deliberate. The coefficient IS an `f32` — `alpha_for` returns it and the
+  // state applies exactly that value — and every published figure is quantified
+  // over it, the `2^-26` floor `MAX_TAU` is derived from included. Rounding
+  // only at the end would be about an ulp sharper and would retire that
+  // derivation with it: the correctly rounded coefficient at `MAX_TAU` is
+  // exactly `2^-26`, the same value the first rejected `tau` yields, so the
+  // accepted domain would no longer hold the applied coefficient strictly above
+  // the `4 * ulp(s)` absorption bar. Sharpening the ratio, which is where the
+  // defect was, costs nothing here: below 2^24 the two spellings agree bit for
+  // bit at every accepted `tau`.
+  //
+  // `expm1f` returns no NaN for the non-positive arguments produced here —
+  // including the `-inf` an overflowing ratio narrows to, which returns exactly
+  // `-1.0` — so with a constructor-validated `tau` the coefficient stays in
+  // `[0, 1]`.
+  -libm::expm1f((-(delta as f64) / f64::from(tau)) as f32)
 }
 
 /// Cadence-portable exponential moving average: an EMA whose time constant is
@@ -604,9 +627,9 @@ impl Smoother<f32> for CadenceEmaState {
         let delta = start - prev_start; // cannot underflow after the check
 
         // The `f32` coefficient `alpha_for` reports, applied in `f64`. The
-        // widening is the accumulator's, not the coefficient's: `alpha` is
-        // still derived once, in f32, so the inspectable coefficient and the
-        // streaming state cannot drift.
+        // widening is the accumulator's, not the coefficient's: both paths call
+        // the one `cadence_alpha` and both get the same `f32` back, so the
+        // inspectable coefficient and the streaming state cannot drift.
         //
         // The *state* must be the wider type, not merely the arithmetic — an
         // f32 result would re-round to the same fixed point every step. In the

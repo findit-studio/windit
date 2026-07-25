@@ -339,8 +339,15 @@ accepted domain to its edges and fails if the claim is false.
   published as `2^-128` (read at `f32::MAX`, which no longer constructs) and is
   now `2^-26`; the `|alpha * x|` floor was `2^-277` and is now `2^-175`; and the
   `cadence_alpha` note claimed the derived coefficient lands "within an ulp" of
-  the exact one, which two composed roundings make false — it is within two
-  (measured 1.51). Separately, `Ema` and `CadenceEma` both said the `f64`
+  the exact one; it lands within two (measured 1.51), and holding even that
+  figure took a change to the derivation rather than only to the note. Forming
+  the ratio as `(delta as f32) / tau` rounded the element *count* before the
+  division — no `f32` holds an integer above 2^24 exactly — which put the
+  coefficient 2.25 ulps out at `tau = MAX_TAU, delta = 16_812_203`, with 29_711
+  further breaches of two ulps among the `delta`s that one `tau` admits. The
+  ratio is now formed in `f64`, where `delta` is exact to 2^53, and narrowed
+  once; below 2^24 that is bit for bit what the cast gave, so no other figure on
+  the type moves. Separately, `Ema` and `CadenceEma` both said the `f64`
   `1 - alpha` collapses to exactly `1.0` at `2^-53`. It does not: `1 - 2^-53` is
   exactly representable. The threshold is `2^-54`, the tie that rounds to even,
   which also makes the `f32`-to-`f64` gap 29 binary orders rather than 28. Every
