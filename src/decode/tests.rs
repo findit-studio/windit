@@ -346,6 +346,44 @@ fn parity_randomized_p3_policies() {
 }
 
 #[test]
+fn causal_plane_holds_across_spans_that_end_earlier_than_their_predecessors() {
+  // The geometry grid above is built from fixed `(hop, len, window)` triples, so
+  // its span ends only ever ascend. The contract guarantees ascending *starts*
+  // alone, and a nested or overlapping span may end before one already seen —
+  // the decoder must carry an on-delay gate's causal flag through that without
+  // retracting it, since the flag plane is what a consumer reacts to per push.
+  let spans = [
+    Span::new(0, 10, 10),
+    Span::new(1, 1, 1),
+    Span::new(2, 4, 4),
+    Span::new(4, 2, 2),
+  ];
+  let seq: Vec<Windowed<f32>> = spans.iter().map(|&s| Windowed::new(0.9, s)).collect();
+  let opts = SegmentOptions::new();
+
+  // `Decoder::new` carries no bounds, so nothing there ties the any-`V`
+  // `Identity` to the decoder's `V`; naming it on the factory call does.
+  let mut dec = Decoder::new(
+    SmoothPolicy::<f32>::smoother(&Identity::new()),
+    Dwell::new(Threshold::new(0.5), 10).gate(),
+    opts,
+  );
+  let flags: Vec<bool> = seq
+    .iter()
+    .map(|&w| dec.push(w).expect("push").active())
+    .collect();
+  assert_eq!(flags, vec![true; 4]);
+
+  // And through the canonical nesting. `hold = 0` is deliberate: a positive
+  // hold masks a dwell retraction, because a span that ends early also starts
+  // before the hangover's coverage horizon and is therefore held at gap zero.
+  let nested = Hangover::new(Dwell::new(Vote::new(1, 1, 0.5), 10), 0);
+  let (nested_flags, _) = fresh_run(&Identity::new(), &nested, opts, &seq);
+  assert_eq!(nested_flags, vec![true; 4]);
+  assert_parity(&Identity::new(), &nested, opts, &seq);
+}
+
+#[test]
 fn chunk_partition_invariance() {
   // One decoder driven in a single uninterrupted pass is invariant to where a
   // chunked consumer pauses between pushes: the concatenated output at every

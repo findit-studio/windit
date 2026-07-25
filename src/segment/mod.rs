@@ -1016,16 +1016,21 @@ impl GatePolicy<f32> for Vote {
 ///
 /// On an inner `true`, the wrapper records the *origin* — the `span.start()` of
 /// the first `true` after a `false` (or after fresh/[`reset`](Gate::reset)/
-/// [`discontinuity`](Gate::discontinuity)) — and outputs `true` once the current
-/// window's `span.end()` reaches `confirm` elements past that origin
-/// (`span.end() - origin >= confirm`), otherwise `false` (a suppressed head).
-/// On an inner `false`, the origin is cleared and the output is `false`:
-/// releases are never delayed, this is on-delay only.
+/// [`discontinuity`](Gate::discontinuity)) — and folds the run's coverage
+/// horizon forward: `horizon = max(horizon, span.end())`, a monotone maximum
+/// rather than an overwrite, since ascending starts do not imply ascending
+/// ends. It outputs `true` once that horizon reaches `confirm` elements past
+/// the origin (`horizon - origin >= confirm`), otherwise `false` (a suppressed
+/// head). Because the horizon only grows, a confirmed run stays confirmed: a
+/// nested or overlapping span can never retract an activation. On an inner
+/// `false`, the run is cleared and the output is `false`: releases are never
+/// delayed, this is on-delay only.
 ///
 /// `confirm = 0` is an exact pass-through: every span covers at least one
-/// element, so `end - origin >= 0` always holds on an inner `true`. The
-/// confirmation distance is measured to the current window's *end*, so a
-/// window's own coverage counts toward it — with unit spans and `confirm = 3`,
+/// element, so `horizon - origin >= 0` always holds on an inner `true`. The
+/// confirmation distance is measured to the run's coverage horizon — the
+/// largest span end seen since the origin — so a window's own coverage counts
+/// toward it: with unit spans and `confirm = 3`,
 /// inner-true windows at positions 0, 1, 2 confirm on the third push
 /// (`end 3 - origin 0 >= 3`). Consequently a `confirm` at or below the first
 /// window's length never suppresses anything.
@@ -1092,14 +1097,15 @@ impl<P> Dwell<P> {
 }
 
 /// The streaming state of a [`Dwell`] combinator: the inner gate, the
-/// confirmation distance, the current continuous-run origin (`None` between
-/// runs), and the last pushed span's start (for the wrapper's own
-/// monotonicity check, independent of the inner gate's).
+/// confirmation distance, the current continuous run as
+/// `(origin, coverage horizon)` (`None` between runs), and the last pushed
+/// span's start (for the wrapper's own monotonicity check, independent of the
+/// inner gate's).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DwellState<G> {
   inner: G,
   confirm: usize,
-  origin: Option<usize>,
+  run: Option<(usize, usize)>,
   last_start: Option<usize>,
 }
 
@@ -1122,19 +1128,30 @@ impl<V, G: Gate<V>> Gate<V> for DwellState<G> {
     if inner_active {
       // The origin is the start of the first `true` since the last `false`
       // (or since fresh/reset/discontinuity); set here at most once per run.
-      let origin = *self.origin.get_or_insert(start);
-      // `origin <= start < end` under monotone starts, so this cannot
+      // The horizon is folded by MAX, exactly as `HangoverState`'s is: the
+      // contract guarantees ascending starts, not ascending ends, so a nested
+      // or overlapping span can end before one already seen. Comparing the
+      // current span's end alone would let a confirmed gate deactivate while
+      // the inner gate never released — an on-delay gate must not do that. The
+      // max also makes confirmation permanent for the run: once the horizon
+      // clears `confirm` it can never fall back below it.
+      let (origin, horizon) = match self.run {
+        Some((origin, horizon)) => (origin, horizon.max(span.end())),
+        None => (start, span.end()),
+      };
+      self.run = Some((origin, horizon));
+      // `origin <= start <= horizon` under monotone starts, so this cannot
       // underflow; `saturating_sub` is the last line of defence, not
       // load-bearing.
-      Ok(span.end().saturating_sub(origin) >= self.confirm)
+      Ok(horizon.saturating_sub(origin) >= self.confirm)
     } else {
-      self.origin = None;
+      self.run = None;
       Ok(false)
     }
   }
 
   fn reset(&mut self) {
-    self.origin = None;
+    self.run = None;
     self.last_start = None;
     self.inner.reset();
   }
@@ -1144,7 +1161,7 @@ impl<V, G: Gate<V>> Gate<V> for DwellState<G> {
   // gate's `reset` rather than its `discontinuity`, silently erasing an
   // override the inner gate carries (mirrors the `Box` impl below).
   fn discontinuity(&mut self) {
-    self.origin = None;
+    self.run = None;
     self.last_start = None;
     self.inner.discontinuity();
   }
@@ -1157,7 +1174,7 @@ impl<V, P: GatePolicy<V>> GatePolicy<V> for Dwell<P> {
     DwellState {
       inner: self.inner.gate(),
       confirm: self.confirm,
-      origin: None,
+      run: None,
       last_start: None,
     }
   }

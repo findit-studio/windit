@@ -896,11 +896,11 @@ fn finish_and_discontinuity_emit_at_most_one_range_over_all_small_inputs() {
             }
             assert!(
               seg.clone().finish().len() <= 1,
-              "finish emitted >1: bits={bits:b} span_len={span_len} hop={hop} opts={opts:?}"
+              "finish emitted >1: bits={bits:b} hop={hop} span_len={span_len} opts={opts:?}"
             );
             assert!(
               seg.discontinuity().len() <= 1,
-              "discontinuity emitted >1: bits={bits:b} span_len={span_len} hop={hop} opts={opts:?}"
+              "discontinuity emitted >1: bits={bits:b} hop={hop} span_len={span_len} opts={opts:?}"
             );
           }
         }
@@ -1287,14 +1287,22 @@ impl Gate<f32> for ProbeGate {
 /// [`DwellState`] — the independent oracle the exhaustive sweep checks the
 /// real state machine against.
 fn dwell_oracle(flags: &[(bool, Span)], confirm: usize) -> Vec<bool> {
-  let mut origin: Option<usize> = None;
+  // `(origin, horizon)`: the run's first start and the largest end seen since.
+  // The horizon is a max fold, exactly as `HangoverState`'s is — a later span
+  // may end before an earlier one, and comparing the current span's end alone
+  // would let a confirmed gate deactivate mid-activation.
+  let mut run: Option<(usize, usize)> = None;
   let mut out = Vec::with_capacity(flags.len());
   for &(active, span) in flags {
     if active {
-      let o = *origin.get_or_insert(span.start());
-      out.push(span.end().saturating_sub(o) >= confirm);
+      let (origin, horizon) = match run {
+        Some((origin, horizon)) => (origin, horizon.max(span.end())),
+        None => (span.start(), span.end()),
+      };
+      run = Some((origin, horizon));
+      out.push(horizon.saturating_sub(origin) >= confirm);
     } else {
-      origin = None;
+      run = None;
       out.push(false);
     }
   }
@@ -1349,7 +1357,7 @@ fn drive_dwell(inner_flags: &[bool], spans: &[Span], confirm: usize) -> Vec<bool
   let mut state = DwellState {
     inner: ScriptGate::new(inner_flags),
     confirm,
-    origin: None,
+    run: None,
     last_start: None,
   };
   spans
@@ -1369,6 +1377,31 @@ fn drive_hangover(inner_flags: &[bool], spans: &[Span], hold: usize) -> Vec<bool
   spans
     .iter()
     .map(|&span| state.push(&Windowed::new((), span)).unwrap())
+    .collect()
+}
+
+/// Span geometries for the combinator sweeps, as `(hop, cycle of span lengths)`.
+/// The first four are the fixed-length planner shapes (unit, adjacent, gapped,
+/// overlapping); the last cycles its lengths, so a later span can end *before*
+/// an earlier one. Ascending starts never imply ascending ends, and a
+/// combinator that keeps a temporal horizon has to fold it by max to stay
+/// correct on that geometry.
+const COMBINATOR_GEOMETRIES: [(usize, &[usize]); 5] = [
+  (1, &[1]),
+  (2, &[2]),
+  (3, &[2]),
+  (1, &[2]),
+  (1, &[6, 1, 3, 1, 5, 2]),
+];
+
+/// `len` spans of one [`COMBINATOR_GEOMETRIES`] entry: window `i` starts at
+/// `i * hop` and covers the next length in the cycle.
+fn geometry_spans(len: usize, hop: usize, lens: &[usize]) -> Vec<Span> {
+  (0..len)
+    .map(|i| {
+      let span_len = lens[i % lens.len()];
+      Span::new(i * hop, span_len, span_len)
+    })
     .collect()
 }
 
@@ -1478,6 +1511,94 @@ fn dwell_head_trim_vs_min_len_worked_example() {
 }
 
 #[test]
+fn dwell_does_not_deactivate_when_a_later_span_ends_earlier() {
+  // Ascending starts do not imply ascending ends: `[0, 10)` then the nested
+  // `[1, 2)`, inner active throughout. Confirmation is measured against the
+  // run's folded end horizon, so an on-delay gate that has confirmed cannot
+  // deactivate while the inner gate never releases. Reading the current span's
+  // end alone would report `2 - 0 = 2 < 10` and drop the flag.
+  let spans = [Span::new(0, 10, 10), Span::new(1, 1, 1)];
+  assert_eq!(drive_dwell(&[true, true], &spans, 10), vec![true, true]);
+
+  // Equal ends and a further shrink keep it latched, and the finalized plane
+  // stays the single run the flags describe.
+  let spans = [
+    Span::new(0, 10, 10),
+    Span::new(1, 9, 9),
+    Span::new(2, 3, 3),
+    Span::new(4, 1, 1),
+  ];
+  let got = drive_dwell(&[true; 4], &spans, 10);
+  assert_eq!(got, vec![true; 4]);
+  assert_eq!(finalize(&got, &spans, &plain()), vec![Range::new(0, 10)]);
+}
+
+#[test]
+fn dwell_never_deactivates_while_the_inner_gate_stays_active() {
+  // The property behind the case above, over randomized geometries whose span
+  // lengths vary, so ends rise, fall, and repeat under ascending starts.
+  let mut state: u64 = 0x51A5_3C0D_7E11_9B42;
+  for _ in 0..200 {
+    let len = (xorshift(&mut state) % 40) as usize;
+    let confirm = [0usize, 1, 2, 5, 10, 25][(xorshift(&mut state) % 6) as usize];
+    let inner_flags: Vec<bool> = (0..len)
+      .map(|_| !xorshift(&mut state).is_multiple_of(4))
+      .collect();
+    let mut start = 0usize;
+    let spans: Vec<Span> = (0..len)
+      .map(|_| {
+        let span_len = 1 + (xorshift(&mut state) % 12) as usize;
+        let span = Span::new(start, span_len, span_len);
+        start += (xorshift(&mut state) % 4) as usize;
+        span
+      })
+      .collect();
+
+    let got = drive_dwell(&inner_flags, &spans, confirm);
+    for i in 1..len {
+      assert!(
+        !(got[i - 1] && inner_flags[i] && !got[i]),
+        "deactivated at {i} without an inner release: confirm={confirm} \
+         flags={inner_flags:?} spans={spans:?} got={got:?}"
+      );
+    }
+    // The finalized plane must agree with the oracle's flags too.
+    let pairs: Vec<(bool, Span)> = inner_flags
+      .iter()
+      .copied()
+      .zip(spans.iter().copied())
+      .collect();
+    let expected = dwell_oracle(&pairs, confirm);
+    assert_eq!(got, expected, "confirm={confirm} spans={spans:?}");
+    let opts = plain();
+    assert_eq!(
+      finalize(&got, &spans, &opts),
+      finalize(&expected, &spans, &opts)
+    );
+  }
+}
+
+#[test]
+fn dwell_deactivation_regression_survives_nesting_and_the_batch_driver() {
+  // The same shrinking-end sequence through `Hangover(Dwell(Vote))`, the
+  // canonical nesting, and through the batch driver. `hold = 0` is deliberate:
+  // a positive hold masks this defect, because the shrinking span starts
+  // *before* the hangover's coverage horizon and so is held at gap 0 — only a
+  // pass-through hold lets the dwell decision reach the output unchanged.
+  let policy = Hangover::new(Dwell::new(Vote::new(1, 1, 0.5), 10), 0);
+  let spans = [Span::new(0, 10, 10), Span::new(1, 1, 1), Span::new(2, 2, 2)];
+  let s: Vec<Windowed<f32>> = spans.iter().map(|&sp| Windowed::new(0.9, sp)).collect();
+
+  let mut gate = policy.gate();
+  let flags: Vec<bool> = s.iter().map(|w| gate.push(w).unwrap()).collect();
+  assert_eq!(flags, vec![true, true, true]);
+  assert_eq!(
+    policy.segment(&plain(), &s).unwrap(),
+    finalize(&flags, &spans, &plain())
+  );
+}
+
+#[test]
 fn dwell_suppression_only_invariant_on_randomized_runs() {
   // Dual of Hangover's extension-only: Dwell only ever turns an inner `true`
   // into `false` (a suppressed head), never the reverse.
@@ -1523,15 +1644,12 @@ fn hangover_extension_only_invariant_on_randomized_runs() {
 
 #[test]
 fn dwell_matches_oracle_over_exhaustive_flags_and_geometry() {
-  let geometries = [(1usize, 1usize), (2, 2), (2, 3), (2, 1)]; // (span_len, hop)
   let confirms = [0usize, 1, 2, 5, usize::MAX];
   for len in 0..=8usize {
     for bits in 0u32..(1 << len) {
       let inner_flags: Vec<bool> = (0..len).map(|i| (bits >> i) & 1 == 1).collect();
-      for &(span_len, hop) in &geometries {
-        let spans: Vec<Span> = (0..len)
-          .map(|i| Span::new(i * hop, span_len, span_len))
-          .collect();
+      for &(hop, lens) in &COMBINATOR_GEOMETRIES {
+        let spans = geometry_spans(len, hop, lens);
         let pairs: Vec<(bool, Span)> = inner_flags
           .iter()
           .copied()
@@ -1542,7 +1660,7 @@ fn dwell_matches_oracle_over_exhaustive_flags_and_geometry() {
           let got = drive_dwell(&inner_flags, &spans, confirm);
           assert_eq!(
             got, expected,
-            "flags={inner_flags:?} span_len={span_len} hop={hop} confirm={confirm}"
+            "flags={inner_flags:?} hop={hop} lens={lens:?} confirm={confirm}"
           );
 
           // The finalized-range plane must agree too: driving the oracle
@@ -1552,7 +1670,7 @@ fn dwell_matches_oracle_over_exhaustive_flags_and_geometry() {
           assert_eq!(
             finalize(&got, &spans, &opts),
             finalize(&expected, &spans, &opts),
-            "ranges: flags={inner_flags:?} span_len={span_len} hop={hop} confirm={confirm}"
+            "ranges: flags={inner_flags:?} hop={hop} lens={lens:?} confirm={confirm}"
           );
         }
       }
@@ -1562,15 +1680,12 @@ fn dwell_matches_oracle_over_exhaustive_flags_and_geometry() {
 
 #[test]
 fn hangover_matches_oracle_over_exhaustive_flags_and_geometry() {
-  let geometries = [(1usize, 1usize), (2, 2), (2, 3), (2, 1)];
   let holds = [0usize, 1, 2, 5, usize::MAX];
   for len in 0..=8usize {
     for bits in 0u32..(1 << len) {
       let inner_flags: Vec<bool> = (0..len).map(|i| (bits >> i) & 1 == 1).collect();
-      for &(span_len, hop) in &geometries {
-        let spans: Vec<Span> = (0..len)
-          .map(|i| Span::new(i * hop, span_len, span_len))
-          .collect();
+      for &(hop, lens) in &COMBINATOR_GEOMETRIES {
+        let spans = geometry_spans(len, hop, lens);
         let pairs: Vec<(bool, Span)> = inner_flags
           .iter()
           .copied()
@@ -1581,14 +1696,14 @@ fn hangover_matches_oracle_over_exhaustive_flags_and_geometry() {
           let got = drive_hangover(&inner_flags, &spans, hold);
           assert_eq!(
             got, expected,
-            "flags={inner_flags:?} span_len={span_len} hop={hop} hold={hold}"
+            "flags={inner_flags:?} hop={hop} lens={lens:?} hold={hold}"
           );
 
           let opts = plain();
           assert_eq!(
             finalize(&got, &spans, &opts),
             finalize(&expected, &spans, &opts),
-            "ranges: flags={inner_flags:?} span_len={span_len} hop={hop} hold={hold}"
+            "ranges: flags={inner_flags:?} hop={hop} lens={lens:?} hold={hold}"
           );
         }
       }
@@ -1738,7 +1853,7 @@ fn dwell_backward_start_errs_with_wrapper_and_inner_unchanged() {
   let mut state = DwellState {
     inner: ScriptGate::new(&[true, true, true]),
     confirm: 0,
-    origin: None,
+    run: None,
     last_start: None,
   };
   assert!(state.push(&Windowed::new((), Span::new(5, 2, 2))).unwrap());
@@ -1753,7 +1868,7 @@ fn dwell_backward_start_errs_with_wrapper_and_inner_unchanged() {
   // inner gate's script cursor did not advance (the check runs before the
   // inner push).
   assert_eq!(state.last_start, Some(5));
-  assert_eq!(state.origin, Some(5));
+  assert_eq!(state.run, Some((5, 7)));
   assert_eq!(state.inner.idx, 1);
   // A valid continuation behaves as if the bad push never happened.
   assert!(state.push(&Windowed::new((), Span::new(7, 2, 2))).unwrap());
@@ -1948,7 +2063,7 @@ fn dwell_discontinuity_forwards_to_inner_discontinuity_not_reset() {
   let mut state = DwellState {
     inner: probe,
     confirm: 3,
-    origin: None,
+    run: None,
     last_start: None,
   };
   let _ = state.push(&Windowed::new(0.0, Span::new(0, 1, 1))).unwrap();
@@ -1996,7 +2111,7 @@ fn box_of_dwell_of_probe_forwards_discontinuity_through_both_layers() {
   let inner_state = DwellState {
     inner: probe,
     confirm: 2,
-    origin: None,
+    run: None,
     last_start: None,
   };
   let mut boxed: Box<dyn Gate<f32>> = Box::new(inner_state);

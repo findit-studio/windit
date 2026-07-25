@@ -147,7 +147,9 @@ fn decoder_drive_does_not_allocate_and_state_sizes_are_pinned() {
   {
     assert_eq!(size_of::<CadenceEmaState>(), 32);
     assert_eq!(align_of::<CadenceEmaState>(), 8);
-    assert_eq!(size_of::<DwellState<ThresholdState>>(), 48);
+    // `DwellState` carries its run as `(origin, coverage horizon)`: one word
+    // more than `HangoverState`, which needs the horizon alone.
+    assert_eq!(size_of::<DwellState<ThresholdState>>(), 56);
     assert_eq!(size_of::<HangoverState<ThresholdState>>(), 48);
     assert_eq!(size_of::<Step>(), 32);
     assert_eq!(align_of::<Step>(), 8);
@@ -155,7 +157,7 @@ fn decoder_drive_does_not_allocate_and_state_sizes_are_pinned() {
     // gate nesting, and the segmenter, all held inline.
     assert_eq!(
       size_of::<Decoder<CadenceEmaState, HangoverState<DwellState<VoteState>>, f32>>(),
-      208
+      216
     );
   }
 
