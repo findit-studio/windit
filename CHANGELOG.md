@@ -6,6 +6,93 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Documented
+
+- **`SmoothPolicy::smooth`'s `V: Clone` is kept, and the reason is now a number
+  rather than an argument about the bound's shape** ([#13]). `Smoother::push`
+  takes its window by value, so the batch convenience clones each one out of the
+  borrowed slice — four bytes for a score, a whole vector for an embedding. Three
+  ways out were considered and two rejected:
+
+  - **Taking `&Windowed<V>` in `Smoother::push`** would drop the bound from
+    `smooth` entirely, and it is the option that moves the cost rather than
+    routing around it. It also moves a bound: `IdentityState` can no longer
+    return `Ok(w)`, because there is no owned `V` behind a borrow, so `Identity`
+    — today generic over *every* `V` — would gain `V: Clone` on its streaming
+    path and cascade it to the `SmoothPolicy` impl. That is not a trade between
+    two costs. The embeddings it helps already have a bound-free path (drive the
+    `Smoother`); the value-free pipeline it breaks would have none left, and
+    `Decoder` threads `Identity` over exactly such a payload in
+    `tests/genericity.rs`. Verified with the compiler rather than argued:
+    `Ok(Windowed::new(w.value().clone(), w.span()))` fails with ``expected type
+    parameter `V`, found `&V` `` and the note ``V` does not implement `Clone`, so
+    `&V` was cloned instead``, and completing the change reds the acceptance
+    suite with ``the trait bound `V: Clone` is not satisfied``.
+  - **A second, by-reference batch method** leaves two entry points to justify
+    against a saving measured below.
+
+  What the clone actually costs, against the vector EMA at 512 components —
+  the widest smoother the crate ships and the case that raised the question:
+  **under 2%** of the batch call. 50 ns of a 5.63 µs window at `f32` storage,
+  70 ns of 5.39 µs at `f64`, stable across four (width, length) shapes. The
+  recurrence renormalizes every window — several passes and two divisions per
+  component — against the clone's one allocation and one copy. Its share of the
+  *allocation traffic* is the larger figure and is stated too: one of three
+  allocations per window, a quarter of the bytes (exact counts, not timings).
+
+  The timings are interleaved minima against a counting allocator rather than
+  benchmark means, because a sub-2% difference is under what criterion resolves
+  on a machine that is doing anything else — which is itself part of the answer.
+
+  So the bound stays, on the method where it already was. What changes is that
+  the cost is written down beside it, with the bound-free alternative and a
+  runnable example, and that both are now checkable rather than claimed.
+
+- The `smooth` module note points at that discussion from the batch-convenience
+  paragraph, and `test_support::TestVec` records that its *absence* of `Clone` is
+  load-bearing.
+
+### Added
+
+- **`smooth/vector_ema` and `smooth/vector_ema_streaming` benchmarks**, at 64 and
+  512 components over 256- and 4096-window sequences. The pair is the crate's
+  fourth deliberately comparable one: both arms run one recurrence per window and
+  allocate one output vector, and the streaming arm takes its input copy in
+  untimed setup, so the gap between them is the batch method's per-window clone
+  and nothing else — a bound on it rather than a sharp figure, for the reason the
+  streaming arm's own note gives: that setup churns the allocator between timed
+  regions, biasing against the arm that does less work.
+
+  Until now the bench file covered the scalar smoothers only, so the vector
+  smoother's cost — the one that made the bound worth re-examining — could not be
+  measured from inside the repository at all.
+
+### Tested
+
+- **The vector smoother is reachable without `Clone`, from outside the crate, and
+  returns the identical stream that way.** `tests/genericity.rs` gains an
+  embedding double with no `Clone` and a `smooth_owned_any` helper bounded by
+  `E: Vector` alone, asserted component for component and span for span against
+  the batch path over the same components. This is the escape hatch the decision
+  above rests on, and it was unexercised: a mutation adding `Clone` to
+  `VectorEmaState`'s `Smoother` impl and its `SmoothPolicy` cascade **passed the
+  acceptance suite** before this test (16 passed, 0 failed) and fails to compile
+  after it.
+- **`tests/smooth_alloc.rs`: `SmoothPolicy::smooth` reports a refused output
+  vector rather than aborting.** The fifth refusing-allocator suite, beside the
+  aggregation, chunking, segmentation and decoding ones. Found by re-running the
+  mutation ledger for the work above: deleting the `try_reserve_exact` that backs
+  the method's documented `AllocFailed` passed the whole suite, so the error
+  variant was documented and unreachable. `Ema` over `f32` allocates nothing but
+  the output, which makes the case exact — the refusal can come from nowhere
+  else, and the reported `elements` is pinned to the input length. With the
+  reservation deleted the suite now aborts through `handle_alloc_error`
+  (`SIGABRT`, `memory allocation of 262144 bytes failed`) instead of returning.
+  A pre-existing gap, closed here because it is on the very method this entry is
+  about and the harness it needed was already in the repository.
+
+[#13]: https://github.com/findit-studio/windit/issues/13
+
 ## 0.3.0
 
 One new smoother — the streaming sibling of an aggregation policy that already

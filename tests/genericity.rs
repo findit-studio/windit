@@ -646,6 +646,130 @@ fn smooth_any<E: Vector + Clone>(
   VectorEma::new(alpha).smooth(windows)
 }
 
+/// An embedding double deliberately **without** `Clone`, standing in for a real
+/// one that wraps a resource it cannot duplicate — a mapped buffer, a device
+/// handle, a decoded frame it owns.
+///
+/// It is the witness for the escape hatch beside [`smooth_any`]: the batch
+/// convenience's `V: Clone` is a bound on that method alone, so an embedding
+/// like this one still reaches the vector smoother by driving the
+/// [`Smoother`] directly. Nothing else in this suite is
+/// non-`Clone`, and every other vector-smoothing path here goes through
+/// `smooth`, so without this type the claim is unexercised from outside the
+/// crate.
+struct UncloneableEmbedding(Vec<f32>);
+
+impl Vector for UncloneableEmbedding {
+  type Scalar = f32;
+
+  fn as_slice(&self) -> &[f32] {
+    &self.0
+  }
+
+  fn from_unnormalized(v: &[f64]) -> Result<Self, WinditError> {
+    if v.is_empty() {
+      return Err(WinditError::Empty);
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm == 0.0 {
+      return Err(WinditError::NonFinite);
+    }
+    Ok(Self(v.iter().map(|x| (x / norm) as f32).collect()))
+  }
+}
+
+/// The bound-free twin of [`smooth_any`]: the same filter over windows the
+/// caller already owns, driven one at a time.
+///
+/// `E: Vector` and nothing more — no `Clone`. This is the whole of what a
+/// consumer gives up the batch convenience for, and what they get back.
+fn smooth_owned_any<E: Vector>(
+  windows: Vec<Windowed<E>>,
+  alpha: ComputeOf<E>,
+) -> Result<Vec<Windowed<E>>, WinditError> {
+  let mut smoother = SmoothPolicy::<E>::smoother(&VectorEma::new(alpha));
+  let mut out = Vec::with_capacity(windows.len());
+  for w in windows {
+    out.push(smoother.push(w)?);
+  }
+  Ok(out)
+}
+
+#[test]
+fn the_vector_smoother_is_reachable_without_clone_and_agrees_with_the_batch_path() {
+  // `SmoothPolicy::smooth` clones every window, because `Smoother::push` takes
+  // its window by value; the bound sits on that one method rather than on the
+  // trait, the policy, or the state. Two consequences are asserted here, and
+  // together they are the answer this crate gives to "the batch convenience
+  // clones a 512-component embedding per window":
+  //
+  //   1. An embedding that is not `Clone` is smoothable anyway, by driving the
+  //      `Smoother` — the path `smooth` is a convenience over, not a wrapper
+  //      around a privilege.
+  //   2. That path is not a lesser one. Over identical components it returns
+  //      the identical stream, component for component and span for span, so
+  //      choosing it costs nothing but the loop.
+  //
+  // Failing to compile is a legitimate failure of this test: it means a `Clone`
+  // bound reached the smoother's own path, and with it the only route a
+  // non-`Clone` embedding has.
+  const DIM: usize = 6;
+  let spans = WindowPlan::spans(&WindowOptions::new(4).with_overlap(1), 16).expect("spans");
+  let raw: Vec<Vec<f64>> = (0..spans.len())
+    .map(|i| {
+      (0..DIM)
+        .map(|d| ((d + i) % 7) as f64 - 3.0 + (i as f64) * 0.5)
+        .collect()
+    })
+    .collect();
+
+  // The same components as a `Clone` embedding, through the batch convenience.
+  let cloneable: Vec<Windowed<TestEmbedding>> = spans
+    .iter()
+    .zip(&raw)
+    .map(|(span, r)| {
+      Windowed::new(
+        TestEmbedding::from_unnormalized(r).expect("embedding"),
+        *span,
+      )
+    })
+    .collect();
+  let via_batch = smooth_any(&cloneable, 0.3).expect("batch smooth");
+
+  // And as an embedding with no `Clone` at all, through the direct drive.
+  let uncloneable: Vec<Windowed<UncloneableEmbedding>> = spans
+    .iter()
+    .zip(&raw)
+    .map(|(span, r)| {
+      Windowed::new(
+        UncloneableEmbedding::from_unnormalized(r).expect("embedding"),
+        *span,
+      )
+    })
+    .collect();
+  let via_drive = smooth_owned_any(uncloneable, 0.3).expect("owned smooth");
+
+  assert_eq!(via_drive.len(), via_batch.len());
+  for (drive, batch) in via_drive.iter().zip(&via_batch) {
+    assert_eq!(
+      drive.value().as_slice(),
+      batch.value().as_slice(),
+      "the bound-free path must return the same stream as the batch convenience"
+    );
+    assert_eq!(drive.span(), batch.span(), "and the same spans");
+  }
+
+  // Non-vacuity: the filter genuinely engaged, so the equality above is between
+  // two smoothed streams and not between two copies of the input.
+  assert_ne!(
+    via_drive[1].value().as_slice(),
+    UncloneableEmbedding::from_unnormalized(&raw[1])
+      .expect("embedding")
+      .as_slice(),
+    "after the seed each window must carry the ones before it"
+  );
+}
+
 /// The aggregation twin of [`smooth_any`], for the same reason.
 fn fold_any<E: Vector>(
   windows: &[WindowEmbedding<E>],

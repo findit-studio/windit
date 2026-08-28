@@ -27,6 +27,12 @@ use crate::{
 /// component to `f32` on the way into storage. It rejects an empty slice with
 /// [`WinditError::Empty`] and a zero or non-finite norm with
 /// [`WinditError::NonFinite`].
+///
+/// Deliberately **not** `Clone`, unlike [`RawF64Emb`]: it is the double every
+/// test that drives a [`Smoother`](crate::smooth::Smoother) by hand reaches for,
+/// so its lack of the bound is what holds the smoothers' own path free of one.
+/// Deriving `Clone` here would leave that unwitnessed rather than break
+/// anything, which is why it is said out loud.
 pub(crate) struct TestVec(pub(crate) Vec<f32>);
 
 impl Vector for TestVec {

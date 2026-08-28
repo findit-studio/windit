@@ -39,6 +39,10 @@
 //! through separate calls is not equivalent to one whole-sequence call, because a
 //! running average does not carry across calls. To smooth incrementally, drive a
 //! single [`Smoother`] across the chunks instead.
+//!
+//! Driving one directly is also how a caller sheds the batch method's `V: Clone`
+//! and the per-window copy it exists to make — what that copy costs, measured
+//! against the widest smoother the crate ships, is on the method itself.
 
 use crate::{error::WinditError, windowed::Windowed};
 
@@ -147,6 +151,60 @@ pub trait SmoothPolicy<V> {
   /// Fresh state per call, exactly as the 0.1.x policies documented: smoothing a
   /// sequence chunk by chunk through separate calls is not equivalent to one
   /// whole-sequence call.
+  ///
+  /// # What `V: Clone` costs, and how to not pay it
+  ///
+  /// [`Smoother::push`] takes its window **by value**, so driving one over a
+  /// borrowed slice means cloning each window. For a score that is four bytes;
+  /// for an embedding it is the whole vector, copied for a value the smoother
+  /// reads once and discards. The bound is on this method alone — not on
+  /// [`Smoother`], not on this trait, not on any state — so only a caller of
+  /// the convenience pays it, and a `V` that is not [`Clone`] loses nothing but
+  /// this method.
+  ///
+  /// Priced against the vector EMA, the smoother it is most expensive for,
+  /// at 512 components: the clone is **under 2%** of the batch cost — 50 ns of
+  /// a 5.63 µs window at `f32` storage, 70 ns of 5.39 µs at `f64`. The
+  /// recurrence renormalizes every window, which is several passes and two
+  /// divisions per component, against the clone's one allocation and one copy.
+  /// Its share of the *allocation traffic* is much larger — one of three
+  /// allocations per window and a quarter of the bytes — which is the figure to
+  /// weigh if the allocator, rather than the arithmetic, is the constraint.
+  ///
+  /// Those figures are interleaved minima against a counting allocator, not
+  /// benchmark means: a difference this small is under what criterion resolves
+  /// unless the machine is quiet. The `smooth/vector_ema` and
+  /// `smooth/vector_ema_streaming` pair is the comparison as it lives in the
+  /// repository — the gap between them is this clone, and its own note says why
+  /// that gap reads as a bound rather than as a sharp number.
+  ///
+  /// A caller who *owns* its windows avoids it entirely, and gives up nothing
+  /// else: the two paths run the same state through the same steps, so they
+  /// return the same stream.
+  ///
+  /// ```
+  /// use windit::prelude::*;
+  ///
+  /// let seq = [
+  ///     Windowed::new(0.2_f32, Span::new(0, 1, 1)),
+  ///     Windowed::new(0.8, Span::new(1, 1, 1)),
+  /// ];
+  ///
+  /// // The convenience: `seq` survives the call, each window cloned into the
+  /// // smoother.
+  /// let batch = Ema::new(0.5).smooth(&seq)?;
+  ///
+  /// // The same stream from windows handed over instead, with no clone and no
+  /// // `Clone` bound.
+  /// let mut smoother = Ema::new(0.5).smoother();
+  /// let mut owned = Vec::new();
+  /// for w in seq {
+  ///     owned.push(smoother.push(w)?);
+  /// }
+  ///
+  /// assert_eq!(batch, owned);
+  /// # Ok::<(), windit::WinditError>(())
+  /// ```
   ///
   /// # Errors
   ///

@@ -1,16 +1,20 @@
 //! Temporal smoothing, gating, segmentation, and decoding benchmarks.
 //!
-//! Covers the smoothing policies (`Identity` copy baseline, `Ema`, `CadenceEma`),
-//! the gates and their combinators (`Threshold`, `Hysteresis`, `Vote`, `Dwell`,
-//! `Hangover`), the two segmentation drivers (the batch `GatePolicy::segment`
-//! composition and the incremental `Segmenter` streaming drive), and the
-//! `Decoder` pipeline end to end, over representative lengths and run patterns,
-//! reporting element throughput. Three pairs are deliberately comparable:
-//! `segment/hysteresis_batch` versus `segment/streaming` contrasts the batch and
-//! incremental drivers of the one shared state machine; `smooth/cadence_ema`
-//! versus `smooth/cadence_ema_streaming` does the same for the smoothing side;
-//! and `decode/identity_threshold` versus `decode/hangover_dwell_vote` separates
-//! the pipeline's own per-window cost from what the headline gate stack adds.
+//! Covers the smoothing policies (`Identity` copy baseline, `Ema`, `CadenceEma`,
+//! and the embedding-wide `VectorEma`), the gates and their combinators
+//! (`Threshold`, `Hysteresis`, `Vote`, `Dwell`, `Hangover`), the two segmentation
+//! drivers (the batch `GatePolicy::segment` composition and the incremental
+//! `Segmenter` streaming drive), and the `Decoder` pipeline end to end, over
+//! representative lengths and run patterns, reporting element throughput. Four
+//! pairs are deliberately comparable: `segment/hysteresis_batch` versus
+//! `segment/streaming` contrasts the batch and incremental drivers of the one
+//! shared state machine; `smooth/cadence_ema` versus
+//! `smooth/cadence_ema_streaming` does the same for the smoothing side;
+//! `decode/identity_threshold` versus `decode/hangover_dwell_vote` separates the
+//! pipeline's own per-window cost from what the headline gate stack adds; and
+//! `smooth/vector_ema` versus `smooth/vector_ema_streaming` prices the batch
+//! method's per-window `Windowed<V>` clone, which is the whole of what its
+//! `V: Clone` bound costs an embedding consumer.
 //!
 //! Gated on the heap tier: the batch drivers do not exist without it, so the
 //! featureless build compiles to an empty `main`.
@@ -26,8 +30,9 @@ mod temporal {
     segment::{
       Dwell, Gate, GatePolicy, Hangover, Hysteresis, SegmentOptions, Segmenter, Threshold, Vote,
     },
-    smooth::{CadenceEma, Ema, Identity, SmoothPolicy, Smoother},
-    windowed::Windowed,
+    smooth::{CadenceEma, Ema, Identity, SmoothPolicy, Smoother, VectorEma},
+    windowed::{Vector, Windowed},
+    WinditError,
   };
 
   /// Representative sequence lengths, in windows.
@@ -39,6 +44,21 @@ mod temporal {
   /// inputs carry, which keeps the derived coefficient off both degenerate ends
   /// — neither saturated at `1.0` nor small enough to be absorbed by the state.
   const TAU: f32 = 8.0;
+
+  /// The vector smoother's coefficient, held strictly inside `(0, 1)` so every
+  /// window charges the recurrence — an `alpha` at either end takes `ema_step`'s
+  /// exact-copy branch and would price a filter nobody runs.
+  const VECTOR_ALPHA: f64 = 0.3;
+
+  /// Embedding widths. 512 is the audio-embedding case this group exists for;
+  /// 64 is the small-model contrast that separates the fixed per-window cost
+  /// from the per-component arithmetic.
+  const DIMS: [usize; 2] = [64, 512];
+
+  /// Sequence lengths for the vector group, deliberately shorter than the scalar
+  /// `LENGTHS`: one 512-wide window is 2 KiB of storage, so 4096 of them is
+  /// already 8 MiB of input before the smoother allocates anything.
+  const VECTOR_LENGTHS: [usize; 2] = [256, 4_096];
 
   /// xorshift64 — deterministic and dependency-free; the seed must be nonzero.
   fn xorshift(state: &mut u64) -> u64 {
@@ -144,6 +164,135 @@ mod temporal {
       }
       above
     });
+  }
+
+  /// A minimal `f32`-storage embedding double, L2-normalized on construction —
+  /// the shape a real 512-dimension audio or text embedding has. Benchmarks see
+  /// only the public API, so this is its own [`Vector`] implementor rather than a
+  /// reach into the crate's test doubles.
+  ///
+  /// `Clone` because the streaming arm's untimed setup hands the loop a fresh
+  /// owned copy of the input on every iteration.
+  #[derive(Clone)]
+  struct BenchEmbedding(Vec<f32>);
+
+  impl Vector for BenchEmbedding {
+    type Scalar = f32;
+
+    fn as_slice(&self) -> &[f32] {
+      &self.0
+    }
+
+    fn from_unnormalized(v: &[f64]) -> Result<Self, WinditError> {
+      if v.is_empty() {
+        return Err(WinditError::Empty);
+      }
+      let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+      if !norm.is_finite() || norm == 0.0 {
+        return Err(WinditError::NonFinite);
+      }
+      Ok(Self(v.iter().map(|x| (x / norm) as f32).collect()))
+    }
+  }
+
+  /// `len` unit-norm embeddings of width `dim` over unit spans, components drawn
+  /// from the same xorshift the scalar patterns use so the input is deterministic
+  /// and dependency-free.
+  fn embeddings(len: usize, dim: usize) -> Vec<Windowed<BenchEmbedding>> {
+    let mut state: u64 = 0x0F1E_2D3C_4B5A_6978;
+    (0..len)
+      .map(|i| {
+        let raw: Vec<f64> = (0..dim)
+          .map(|_| (xorshift(&mut state) >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+          .collect();
+        let e = BenchEmbedding::from_unnormalized(&raw).expect("nonzero random direction");
+        Windowed::new(e, unit_span(i))
+      })
+      .collect()
+  }
+
+  /// Every (width, length) pair, built once and shared by both arms of the vector
+  /// smoothing comparison.
+  fn vector_inputs() -> Vec<(usize, usize, Vec<Windowed<BenchEmbedding>>)> {
+    let mut out = Vec::new();
+    for &dim in &DIMS {
+      for &len in &VECTOR_LENGTHS {
+        out.push((dim, len, embeddings(len, dim)));
+      }
+    }
+    out
+  }
+
+  /// The vector EMA through the batch `SmoothPolicy::smooth` convenience.
+  ///
+  /// Paired with `smooth/vector_ema_streaming` below, which drives the same
+  /// filter over the same windows *owned*. Both arms run one recurrence per
+  /// window and allocate one output vector, so the gap between them is the
+  /// per-window `Windowed<E>` clone that the batch method's `V: Clone` bound
+  /// exists to perform — the whole of what the convenience costs an embedding
+  /// consumer.
+  fn smooth_vector_ema(c: &mut Criterion) {
+    let mut g = c.benchmark_group("smooth/vector_ema");
+    for (dim, len, input) in vector_inputs() {
+      g.throughput(Throughput::Elements(len as u64));
+      g.bench_with_input(
+        BenchmarkId::new(format!("dim{dim}"), len),
+        &input,
+        |b, input| {
+          b.iter(|| {
+            black_box(
+              VectorEma::new(VECTOR_ALPHA)
+                .smooth(black_box(input.as_slice()))
+                .unwrap(),
+            )
+          });
+        },
+      );
+    }
+    g.finish();
+  }
+
+  /// The same filter driven one owned window at a time through `Smoother::push`.
+  ///
+  /// The input copy is made in `iter_batched`'s untimed setup, so the measured
+  /// region is the recurrence and the output vector and nothing else.
+  /// `PerIteration` because a 4096-window, 512-wide batch is 8 MiB and criterion
+  /// would otherwise hold many of them at once.
+  ///
+  /// Read the pair as a bound, not as a sharp figure. That untimed setup frees
+  /// and re-takes several thousand blocks between timed regions, where the batch
+  /// arm allocates and frees each clone in one steady loop — so the allocator is
+  /// warmer for the arm that does *more* work, and the bias runs against this
+  /// one. The difference being priced is also under two percent of either arm,
+  /// which is at or below what criterion's means separate from run-to-run noise
+  /// on a machine with anything else on it. The per-window figures quoted on
+  /// `SmoothPolicy::smooth` come from interleaved minima and a counting
+  /// allocator, which is what a difference this small needs; this pair is the
+  /// version that lives in the repository and can be re-run.
+  fn smooth_vector_ema_streaming(c: &mut Criterion) {
+    let mut g = c.benchmark_group("smooth/vector_ema_streaming");
+    for (dim, len, input) in vector_inputs() {
+      g.throughput(Throughput::Elements(len as u64));
+      g.bench_with_input(
+        BenchmarkId::new(format!("dim{dim}"), len),
+        &input,
+        |b, input| {
+          b.iter_batched(
+            || input.clone(),
+            |owned| {
+              let mut sm = SmoothPolicy::<BenchEmbedding>::smoother(&VectorEma::new(VECTOR_ALPHA));
+              let mut out = Vec::with_capacity(owned.len());
+              for w in owned {
+                out.push(sm.push(w).unwrap());
+              }
+              black_box(out)
+            },
+            criterion::BatchSize::PerIteration,
+          );
+        },
+      );
+    }
+    g.finish();
   }
 
   /// The gate-driven batch segmentation (`GatePolicy::segment` over a hysteresis
@@ -269,7 +418,9 @@ mod temporal {
     smooth_identity,
     smooth_ema,
     smooth_cadence_ema,
-    smooth_cadence_ema_streaming
+    smooth_cadence_ema_streaming,
+    smooth_vector_ema,
+    smooth_vector_ema_streaming
   );
   criterion::criterion_group!(
     segment_benches,
