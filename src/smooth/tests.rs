@@ -3502,3 +3502,350 @@ fn vector_ema_gate_floor_decides_below_two_pow_minus_1000() {
   );
   assert_eq!(s.state, vec![libm::ldexp(1.0, floor_exp)]);
 }
+
+// ---------------------------------------------------------------------------
+// The epoch horizon: `M` is itself a floating-point accumulation, and past a
+// proven number of charging steps it stops dominating the mass an exact
+// recurrence carries.
+// ---------------------------------------------------------------------------
+
+/// The `alpha` whose complement is the first to round to exactly `1.0`, and the
+/// coefficient the stagnation counterexample runs at.
+const COLLAPSING_ALPHA: f32 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+
+#[test]
+fn vector_ema_mass_stagnation_is_reachable_by_pushing() {
+  // The reachability argument for the fixture the two tests below start from,
+  // asserted rather than described: every claim here is an actual `f64`
+  // operation or an actual production push.
+  //
+  // At `alpha = 2^-54` the complement is exactly `1.0`, so with `x = 2^-24`:
+  //
+  //   recent    = alpha * x            = 2^-78
+  //   carried   = 1.0 * s              = s
+  //   s         = 2^-78 + 2^-24        = 2^-24        (absorbed, a quarter ulp)
+  //   committed = |2^-78| + |2^-24|    = 2^-24        (the sum rounds back too)
+  //   m         = 2^-24 + m
+  //
+  // so the accumulator is stationary and the mass walks the `2^-24` grid, which
+  // is exact for every partial sum of at most 53 significant bits — that is
+  // `k * 2^-24` for `k <= 2^53`, landing on exactly `2^29` at `k = 2^53`. From
+  // there each further charge is exactly half an ulp of `2^29` and ties back to
+  // even, so `(s, m) = (2^-24, 2^29)` is not a passing value but the epoch's
+  // fixed point, held for every step after the `2^53`rd.
+  let a = f64::from(COLLAPSING_ALPHA);
+  assert_eq!(
+    1.0f64 - a,
+    1.0,
+    "the complement must collapse to exactly one"
+  );
+  let x = libm::ldexp(1.0, -24);
+  let recent = a * x;
+  assert_eq!(recent, libm::ldexp(1.0, -78), "the injection is 2^-78");
+  assert_eq!(recent + x, x, "and is absorbed whole by a state of 2^-24");
+  let committed = recent.abs() + x.abs();
+  assert_eq!(committed, x, "the charge rounds back to exactly 2^-24");
+
+  // The grid is exact right up to the stagnation point, and stagnant after it.
+  let m_before = (libm::ldexp(1.0, 53) - 1.0) * x; // k = 2^53 - 1
+  assert_eq!(
+    m_before / x,
+    libm::ldexp(1.0, 53) - 1.0,
+    "still on the grid"
+  );
+  let m_at = m_before + committed;
+  assert_eq!(m_at, libm::ldexp(1.0, 29), "k = 2^53 lands on exactly 2^29");
+  assert_eq!(
+    m_at + committed,
+    m_at,
+    "and every charge after it ties back: the mass STAGNATES while the exact \
+     mass keeps climbing"
+  );
+
+  // And the same walk on the production path, so the closed form above is not a
+  // second implementation but a description of what `push` does.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  for i in 1..=16usize {
+    s.push(vec_window(&[x], i)).expect("determinate throughout");
+    assert_eq!(s.state, vec![x], "push {i}: the accumulator is stationary");
+    assert_eq!(s.mag, vec![i as f64 * x], "push {i}: the mass is k * 2^-24");
+    assert_eq!(s.steps, i as u64, "push {i}: every one of these charges");
+  }
+}
+
+#[test]
+fn vector_ema_past_the_horizon_the_gate_emits_a_direction_from_an_exact_zero() {
+  // THE finding, on the production path. The fixture is the stagnated pair the
+  // test above proves reachable — `s = 2^-24`, `M = 2^29` — reached after `2^53`
+  // charging steps and held for every step after, so the exact recurrence has
+  // been climbing by `2^-78` a step while neither the accumulator nor the mass
+  // moved. After `2^60` steps the exact recurrence stands at `65 * 2^-24`.
+  //
+  // `steps` is set BELOW the shipped limit here on purpose: this test is the
+  // characterization of what the limit exists to prevent, so it must run the
+  // arithmetic the limit refuses. The companion test below starts from the same
+  // fixture with the step count the fixture actually implies, and gets a
+  // refusal.
+  let x = libm::ldexp(1.0, -24);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  s.state = vec![x];
+  s.mag = vec![libm::ldexp(1.0, 29)];
+  s.steps = 0;
+
+  // `2^60 * 2^-78` is `64 * 2^-24`, so the exact recurrence is at `65 * 2^-24`
+  // and `2_129_920` injections of `-2^-39` take it to exactly zero.
+  const PUSHES: usize = 2_129_920;
+  let injection = libm::ldexp(1.0, -39);
+  assert_eq!(
+    65.0 * x - PUSHES as f64 * injection,
+    0.0,
+    "the exact recurrence must land on zero"
+  );
+
+  let window = -libm::ldexp(1.0, 15); // alpha * -2^15 = -2^-39
+  let mut last = Err(WinditError::Empty);
+  for i in 0..PUSHES {
+    last = s.push(vec_window(&[window], i));
+  }
+
+  assert_eq!(
+    s.state,
+    vec![-libm::ldexp(1.0, -18)],
+    "the computed accumulator ends at -2^-18 where the exact one is zero"
+  );
+  assert_eq!(
+    s.mag[0].to_bits(),
+    0x41c0_0000_0200_0002,
+    "the mass barely moved off its stagnation point: 0x1.0000002000002p29"
+  );
+  let threshold = tau(&s.mag);
+  assert_eq!(
+    threshold.to_bits(),
+    0x3ec0_0000_0200_0002,
+    "which puts the gate's threshold at 0x1.0000002000002p-19"
+  );
+  assert!(
+    s.state[0].abs() > threshold,
+    "and the accumulator is ABOVE it: {:e} > {threshold:e}",
+    s.state[0].abs()
+  );
+  assert_eq!(
+    last.map(|w| emitted(&w).to_vec()),
+    Ok(vec![-1.0]),
+    "so the gate emits a direction for a prefix whose exact value is zero — the \
+     published `|e| <= 2u * M` bound broken by a factor of 32"
+  );
+  // `2u * M` is the bound this type publishes on its own error, and the gate
+  // reads it with a factor of sixteen of headroom. The error here is `2^-18`
+  // against a bound of `2^-23`: past both, which is what makes the emission a
+  // soundness failure rather than a tight call.
+  let bound = f64::EPSILON * s.mag[0];
+  assert!(
+    s.state[0].abs() > 16.0 * bound,
+    "the error {:e} must break the published `2u * M` bound {bound:e} by more \
+     than the gate's headroom",
+    s.state[0].abs()
+  );
+}
+
+#[test]
+fn vector_ema_refuses_the_step_that_would_leave_the_proven_epoch() {
+  // The cure, against the very same fixture. Reaching `(2^-24, 2^29)` takes
+  // `2^53` charging steps — every push of the walk charges — and `2^53` is past
+  // `MAX_EPOCH_STEPS`, so the epoch that produced this state is already over.
+  // Setting the count to the limit is therefore the honest completion of the
+  // fixture, not a second hypothesis: no smaller count can produce this pair.
+  let x = libm::ldexp(1.0, -24);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  s.state = vec![x];
+  s.mag = vec![libm::ldexp(1.0, 29)];
+  s.steps = VectorEma::MAX_EPOCH_STEPS;
+
+  let before = (s.state.clone(), s.mag.clone(), s.steps);
+  assert_eq!(
+    s.push(vec_window(&[-libm::ldexp(1.0, 15)], 1)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the step that would leave the proven range is refused"
+  );
+  assert_eq!(
+    (s.state.clone(), s.mag.clone(), s.steps),
+    before,
+    "and refused before any write: the accumulator, the mass and the count are \
+     exactly as they were"
+  );
+  // Permanent, not per-window: nothing a caller pushes re-enters the range.
+  for i in 2..6usize {
+    assert_eq!(
+      s.push(vec_window(&[0.0], i)).unwrap_err(),
+      WinditError::EpochTooLong,
+      "push {i} is refused too"
+    );
+  }
+  // A clone carries the exhausted epoch with it — a `Clone` that dropped the
+  // count would hand out a smoother that resumes fabricating.
+  let mut copy = s.clone();
+  assert_eq!(
+    copy.push(vec_window(&[0.0], 6)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the clone is exhausted too"
+  );
+}
+
+#[test]
+fn vector_ema_horizon_is_exactly_max_epoch_steps() {
+  // Non-vacuous from both sides, and pinned to the number rather than to the
+  // constant so that moving the constant is a test failure rather than a silent
+  // widening of the accepted regime.
+  assert_eq!(
+    VectorEma::MAX_EPOCH_STEPS,
+    1u64 << 50,
+    "the enforced limit is 2^50 charging steps — inside the ~2^53.4 the mass's \
+     own rounding is proven over, and inside the subnormal term's 2^74"
+  );
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  assert_eq!(s.steps, 0, "the seed rounds nothing, so it charges no step");
+  s.steps = VectorEma::MAX_EPOCH_STEPS - 1;
+  s.push(vec_window(&[0.0, 1.0], 1))
+    .expect("the last step inside the proven range still runs");
+  assert_eq!(s.steps, VectorEma::MAX_EPOCH_STEPS, "and it counted");
+  assert_eq!(
+    s.push(vec_window(&[0.0, 1.0], 2)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the next one is refused"
+  );
+}
+
+#[test]
+fn vector_ema_reset_rearms_an_exhausted_epoch() {
+  // What the caller is expected to do about `EpochTooLong`, and the proof that
+  // the path works: a new epoch starts from a zero mass and a zero count.
+  for rearm in [0u8, 1] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+    s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+    s.steps = VectorEma::MAX_EPOCH_STEPS;
+    assert_eq!(
+      s.push(vec_window(&[0.0, 1.0], 1)).unwrap_err(),
+      WinditError::EpochTooLong
+    );
+
+    // `discontinuity` is the trait default and routes to `reset`; both are
+    // exercised so neither can regress alone.
+    if rearm == 0 {
+      s.reset();
+    } else {
+      s.discontinuity();
+    }
+    assert_eq!(s.steps, 0, "rearm {rearm}: the count is cleared");
+
+    let out = s
+      .push(vec_window(&[0.0, 1.0], 2))
+      .expect("the next window seeds a fresh epoch");
+    assert_eq!(
+      emitted(&out),
+      &[0.0, 1.0],
+      "rearm {rearm}: and it is a seed, not a continuation of the old prefix"
+    );
+    assert_eq!(s.mag, vec![0.0, 0.0], "rearm {rearm}: with a zero mass");
+    assert_eq!(s.steps, 0, "rearm {rearm}: and a zero count");
+  }
+}
+
+#[test]
+fn vector_ema_only_charging_steps_count_against_the_horizon() {
+  // The horizon counts the quantity the induction is stated over — steps that
+  // round `M` — and nothing else. That is what keeps the exact-step exemption's
+  // liveness: an `alpha` of `0` or `1` never spends any of the mass's relative
+  // precision, so its epoch stays unbounded. A count of pushes rather than of
+  // charges would make an exact hold terminal at `2^50` windows, reintroducing
+  // at a further horizon exactly the defect the exemption removed.
+  for alpha in [0.0f32, 1.0] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+    for i in 1..32usize {
+      s.push(vec_window(&[0.25, -0.5], i)).expect("determinate");
+    }
+    assert_eq!(
+      s.mag,
+      vec![0.0, 0.0],
+      "alpha {alpha}: an exact step charges nothing"
+    );
+    assert_eq!(s.steps, 0, "alpha {alpha}: so it advances no count either");
+  }
+
+  // The third exact case: a collapsed complement against an all-zero window.
+  // `recent` is exactly zero and the carry is a copy, so the step is exact even
+  // though `alpha` is neither end of the range.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  for i in 1..8usize {
+    s.push(vec_window(&[0.0, 0.0], i)).expect("determinate");
+  }
+  assert_eq!(
+    s.steps, 0,
+    "an all-zero window under a collapsed complement is exact"
+  );
+  // And the neighbouring inexact case does count, so the exemption is narrow.
+  s.push(vec_window(&[0.25, 0.0], 8)).expect("determinate");
+  assert_eq!(s.steps, 1, "a nonzero injection rounds, and is counted");
+}
+
+#[test]
+fn vector_ema_a_gate_refused_push_still_counts_against_the_horizon() {
+  // The accumulator advances through a determinacy refusal — that is documented
+  // behaviour — so the mass grew and the step must be charged to the epoch.
+  // Counting only emitted windows would let an epoch of refusals run past the
+  // range the bound is proven over and then start emitting again.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  assert_eq!(
+    s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite,
+    "exact cancellation is refused"
+  );
+  assert_eq!(s.steps, 1, "and still counts");
+}
+
+#[test]
+fn vector_ema_horizon_does_not_mask_a_malformed_window() {
+  // Ordering, pinned: the epoch check runs after the window's own validation, so
+  // a caller past the horizon is still told what is wrong with the window it
+  // pushed rather than being handed an epoch-level error for a dimension bug.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  s.steps = VectorEma::MAX_EPOCH_STEPS;
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0, 0.0], 1)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 3,
+      expected: 2
+    },
+    "the window's own defect is reported first"
+  );
+  assert_eq!(
+    s.push(vec_window(&[f64::NAN, 0.0], 2)).unwrap_err(),
+    WinditError::NonFinite,
+    "and so is a non-finite component"
+  );
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0], 3)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "a well-formed window is what reaches the epoch check"
+  );
+}
+
+#[test]
+fn epoch_too_long_names_the_limit_it_enforces() {
+  // The message reads the constant, so it cannot drift from the bound it
+  // reports. Spelled here as the formatted number rather than as the constant so
+  // that a message rewritten to a stale literal fails.
+  let rendered = std::format!("{}", WinditError::EpochTooLong);
+  assert!(
+    rendered.contains("1125899906842624"),
+    "the limit must appear in the message: {rendered}"
+  );
+}

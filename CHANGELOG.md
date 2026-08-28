@@ -31,6 +31,11 @@ unchanged" was false:
 
 ### Added
 
+- **`error::WinditError::EpochTooLong`**: a `VectorEma` epoch reached
+  `VectorEma::MAX_EPOCH_STEPS` charging steps, past which the determinacy gate's
+  error bound is no longer proven. `WinditError` is `#[non_exhaustive]`, so the
+  variant is additive; `cargo semver-checks` agrees.
+
 - **`smooth::VectorEma`** (and its state, `smooth::VectorEmaState`): a
   component-wise exponential moving average over an *embedding*, L2-renormalized
   at every window — the streaming, span-preserving sibling of
@@ -100,6 +105,29 @@ unchanged" was false:
   exactly as `smooth::Ema` does — the smoother idiom, not the aggregate's
   deferred `AlphaOutOfRange`.
 
+  **The epoch is bounded, because `M` is floating point too.**
+  `VectorEma::MAX_EPOCH_STEPS` (`2^50` charging steps) is enforced: the step that
+  would carry an epoch past it is refused with `WinditError::EpochTooLong`,
+  before the accumulator is touched, and so is every push after it until a
+  `reset`. `M` dominates the accumulator's error only while `M` itself is
+  accumulated faithfully, and its three roundings a step are to nearest, so the
+  computed mass can sit *below* the exact one: `M^_t >= (1 - u)^(2t + 1) * M^ex_t`,
+  which the gate's factor of sixteen absorbs only while
+  `(1 - u)^(2t + 1) >= 1/16` — about `2^53.4` charging steps. Past there the
+  guarantee fails, and demonstrably: at `alpha = 2^-54` the complement is exactly
+  `1`, so an accumulator of `2^-24` absorbs every `2^-78` injection while `M`,
+  charged exactly `2^-24` a step, reaches `2^29` after `2^53` steps and then
+  **stagnates** on the round-to-even tie. `2^60` such steps and then `2_129_920`
+  pushes of `-2^15` leave the exact recurrence at zero and the accumulator at
+  `-2^-18` against a threshold of `2^-19` — an emitted direction for a prefix
+  that exactly cancels, with the published `2u * M` bound broken by a factor of
+  32. Every input there is finite, in domain, and exactly representable, so the
+  regime is refused rather than assumed away, and the enforced `2^50` sits three
+  binary orders inside the proven range (and inside the subnormal term's `2^74`
+  reach). Only **charging** steps count, so `alpha = 0` and `alpha = 1` still
+  hold their seed for an unbounded epoch: the exact-step exemption above keeps
+  its liveness, rather than being undone at a further horizon.
+
   Input domain: the aggregation one, unchanged (`aggregate`'s *Input domain*
   note) — every component finite and either zero or between
   `Real::MIN_AGG_MAGNITUDE` and `Real::MAX_AGG_MAGNITUDE`. The two-term
@@ -113,7 +141,8 @@ unchanged" was false:
   non-finite component (the scalar `Ema` absorbs one and poisons; this one
   refuses it), `MagnitudeOutOfRange` for a component outside the domain above,
   `Empty` for a zero-width embedding, `MissingDequantization` for raw
-  quantization codes, and `AllocFailed` for a refused buffer. The one deliberate
+  quantization codes, `EpochTooLong` for an epoch past `MAX_EPOCH_STEPS`, and
+  `AllocFailed` for a refused buffer. The one deliberate
   exception is a window whose *output* fails the determinacy gate: it has still
   advanced the accumulator, because it was a real observation and the prefix the
   aggregate would fold includes it.

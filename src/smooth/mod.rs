@@ -59,6 +59,12 @@ use crate::{
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
 
+/// The value behind `VectorEma::MAX_EPOCH_STEPS`, kept in the featureless tier
+/// so [`WinditError::EpochTooLong`]'s message can read the limit it reports in
+/// every feature configuration — the vector smoother itself is `alloc`-gated,
+/// and the error type is not.
+pub(crate) const VECTOR_EMA_MAX_EPOCH_STEPS: u64 = 1 << 50;
+
 /// Stateful, span-preserving value rewriter: one window in, one window out.
 ///
 /// The decision plane's value stage — a running filter that carries whatever
@@ -98,8 +104,8 @@ pub trait Smoother<V> {
   /// Reading no spans does not by itself make a stage infallible, though: the
   /// vector EMA reads none either and is fallible for reasons of its own — a
   /// width that changed mid-epoch, a non-finite component, an accumulator with
-  /// no determinate direction, a refused allocation. Its own documentation
-  /// enumerates them.
+  /// no determinate direction, an epoch past the range its determinacy gate is
+  /// proven over, a refused allocation. Its own documentation enumerates them.
   fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -900,6 +906,66 @@ impl SmoothPolicy<f32> for CadenceEma {
 /// `alpha = 0` it was reachable through mass an exact hold never committed,
 /// which is the defect the exact-step rule removes.)
 ///
+/// That horizon is the gate turning *over*-conservative, which costs liveness
+/// and nothing else. The one below is the opposite failure and is why this type
+/// counts its epoch.
+///
+/// # Epoch horizon
+///
+/// `M` bounds the accumulator's error only while `M` itself is accumulated
+/// faithfully, and `M` is carried in the same floating point everything else
+/// here is. Five roundings a charging step feed it — the two term products,
+/// their sum, the damped carry, and the final add — each to nearest, so the
+/// computed mass can sit *below* the mass an exactly-evaluated recurrence would
+/// carry. Writing
+/// `M^` for the computed mass, `M^ex` for the exact one, and `t` for the number
+/// of charging steps, this crate's `ema_step` gives by induction
+///
+/// ```text
+/// M^_t  >=  (1 - u)^(2t + 1) * M^ex_t
+/// ```
+///
+/// and the gate's constant of sixteen against a `2u` bound absorbs exactly that
+/// while `(1 - u)^(2t + 1) >= 1/16` — `t` up to about `2^53.4`. Past there the
+/// gate is no longer *proven* conservative, and the failure is not hypothetical.
+/// At `alpha = 2^-54` the complement rounds to exactly `1`, so an accumulator of
+/// `2^-24` absorbs every `2^-78` injection unchanged while `M`, charged exactly
+/// `2^-24` a step, reaches exactly `2^29` after `2^53` steps and then
+/// **stagnates**: each further `2^-24` is exactly half an ulp there and ties
+/// back to even. After `2^60` such steps the exact recurrence stands at
+/// `65 * 2^-24` and the accumulator still reads `2^-24`; `2_129_920` pushes of
+/// `-2^15` then take the exact recurrence to zero while the accumulator lands on
+/// `-2^-18` against a threshold of `2^-19`, and the gate emits a direction for a
+/// prefix whose exact value is zero. Every input there is finite, in domain, and
+/// exactly representable.
+///
+/// So [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) is enforced rather than
+/// described. The step that would carry an epoch past `2^50` charging steps is
+/// refused with [`EpochTooLong`](WinditError::EpochTooLong) — before the
+/// accumulator is touched, so the refusal is a no-op — and every push after it
+/// is refused the same way. The enforced limit sits three binary orders inside
+/// the proven one, so the regime the code accepts is strictly inside the regime
+/// the proof covers. It is inside the absolute term's own reach too: *Subnormals*
+/// on `ema_step` needs `t * sqrt(dim) <= 2^74` for the accumulated subnormal
+/// allowance to stay under the gate's `2^-1000` floor, which `2^50` satisfies for
+/// every `dim` an embedding has.
+///
+/// Only **charging** steps count, which is the same `t` the induction is stated
+/// over. A step that rounds nothing charges nothing and costs `M` no precision
+/// either — at `alpha = 1` the complement is exactly zero, and where the
+/// complement collapses to exactly `1` the carry is a rounding-free copy — so an
+/// exact hold still holds its seed direction, and an exact pass-through still
+/// tracks its input, for an unbounded epoch, as both did before this bound
+/// existed.
+///
+/// A caller that means to keep filtering past the horizon starts a new epoch:
+/// [`reset`](Smoother::reset), or the equivalent
+/// [`discontinuity`](Smoother::discontinuity), clears the accumulator, the mass
+/// and the count, and the next window seeds afresh. Nothing can be offered that
+/// keeps the old prefix — the point of the refusal is that the prefix's error is
+/// no longer bounded — so a typed refusal the caller can act on is the honest
+/// answer.
+///
 /// # Dimension
 ///
 /// The first push after construction (or after a
@@ -989,6 +1055,26 @@ pub struct VectorEma {
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl VectorEma {
+  /// The longest epoch the determinacy gate is proven over: `2^50` charging
+  /// steps.
+  ///
+  /// Counted in `ema_step` applications that charge mass, not in pushes: the
+  /// seed rounds nothing, and neither does an exact step, so an `alpha` of `0`
+  /// or `1` never advances the count at all. Once an epoch reaches this many,
+  /// every further push is refused with
+  /// [`EpochTooLong`](WinditError::EpochTooLong) until a
+  /// [`reset`](Smoother::reset).
+  ///
+  /// The value is the proof's, rounded inward. The gate is conservative while
+  /// the computed mass stays within a factor of sixteen of the exact one, which
+  /// *Epoch horizon* on [`VectorEma`] puts at about `2^53.4` charging steps;
+  /// `2^50` is three binary orders inside that and inside the subnormal term's
+  /// `2^74` reach as well. It is not a resource limit and not a guess about
+  /// workloads — at one window a millisecond an epoch would run for 35,700
+  /// years before reaching it — it is the edge of what this type can prove about
+  /// its own threshold.
+  pub const MAX_EPOCH_STEPS: u64 = VECTOR_EMA_MAX_EPOCH_STEPS;
+
   /// A renormalizing vector EMA with the given smoothing factor, clamped into
   /// `[0, 1]`.
   ///
@@ -1052,6 +1138,11 @@ pub struct VectorEmaState<E: Vector> {
   mag: Vec<ComputeOf<E>>,
   /// The renormalized copy of `state` that each window emits.
   unit: Vec<ComputeOf<E>>,
+  /// `t`: the epoch's charging steps, the quantity
+  /// [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) bounds. Advanced only by a
+  /// step that rounds `mag`, because only such a step costs the mass the
+  /// relative precision the gate's proof spends.
+  steps: u64,
 }
 
 /// Hand-written rather than derived: a derive would demand `E: Clone` for a
@@ -1064,6 +1155,7 @@ impl<E: Vector> Clone for VectorEmaState<E> {
       state: self.state.clone(),
       mag: self.mag.clone(),
       unit: self.unit.clone(),
+      steps: self.steps,
     }
   }
 }
@@ -1080,6 +1172,7 @@ impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
       .field("alpha", &self.alpha)
       .field("seeded", &!self.state.is_empty())
       .field("dim", &self.state.len())
+      .field("steps", &self.steps)
       .finish()
   }
 }
@@ -1212,13 +1305,52 @@ fn refit<C: Real>(buf: &mut Vec<C>, dim: usize) -> Result<(), WinditError> {
 /// `2^-1075`, against a `2u * M` of about `2^-1118`. The floor had already
 /// refused that accumulator 75 windows earlier.
 ///
-/// `M` is itself computed in floating point, and its three roundings a step are
-/// monotone adds that can leave it *below* the exact mass by a relative `3tu`.
-/// The gate's constant is sixteen against a `2u` bound — a factor of sixteen of
-/// headroom — which absorbs that for every epoch below `2^50` pushes, again past
-/// the horizon.
+/// # `M`'s own rounding, and the horizon it sets
+///
+/// `M` is itself computed in floating point, and every rounding a charging step
+/// feeds it is to nearest, so they can leave it *below* the exact mass rather
+/// than above it. Write `A_t = |alpha * x_t|` and `B_t = |c * s_{t-1}|` for the
+/// two exact products, `M^ex_t = A_t + B_t + c * M^ex_{t-1}` for the
+/// exactly-evaluated mass, and `M^` for the one this function writes. Each of
+/// the two products lands within a relative `u` of its exact value, their sum
+/// within another, the damped carry within another, and the final add within a
+/// fifth:
+///
+/// ```text
+/// M^_t  >=  (1 - u)^3 * (A_t + B_t)  +  (1 - u)^2 * c * M^_{t-1}
+/// ```
+///
+/// so `M^_t >= (1 - u)^(2t + 1) * M^ex_t` by induction over the charging steps
+/// `t` (base `M^_0 = M^ex_0 = 0`; the step uses `(1 - u)^3 >= (1 - u)^(2t + 1)`).
+/// The gate needs `M^ex <= 16 * M^` to stay conservative — a `2u` bound read
+/// against a `32u` threshold — so the guarantee holds while
+/// `(1 - u)^(2t + 1) >= 1/16`, which is `t` up to about `2^53.4`.
+///
+/// It is not an asymptotic caveat. The bound genuinely fails past there, by
+/// `M^` **stagnating**: once a step's charge falls to half an ulp of `M^` and
+/// ties to even, `M^` stops moving while `M^ex` keeps climbing. *Epoch horizon*
+/// on [`VectorEma`] carries the worked counterexample and the enforced limit
+/// this returns the count for. Only a step that rounds `M^` costs that relative
+/// precision, which is why the return value is the charge flag rather than a
+/// plain "a step happened": an exact step leaves `M^` bit-identical
+/// (`c` is exactly `1`, so `c * M^` is a copy) or exactly zero (`c` is exactly
+/// `0`), and neither spends anything the horizon is counting.
+///
+/// The absolute contribution to `M^`'s own rounding — an operand or a result in
+/// the subnormal range, where `(1 - u)` says nothing — is at most `3 * 2^-1075`
+/// a step and so at most `3t * 2^-1075` over the epoch, which reaches the
+/// verdict only through `2u`, at `3t * 2^-1127`. That is under the gate's
+/// `MIN_GATE_THRESHOLD` floor by the same margin the *Subnormals* note above
+/// computes for the accumulator itself.
+///
+/// # Returns
+///
+/// Whether this step **charged**: `true` if any component took the rounding
+/// branch, `false` for an exact step, which leaves `M` unrounded and so does not
+/// advance the epoch count.
 #[cfg(any(feature = "std", feature = "alloc"))]
-fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
+#[must_use]
+fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) -> bool {
   let complement = C::ONE - alpha;
   // Hoisted coefficient facts, read once per window rather than per component:
   // a coefficient of `ONE` makes its product a rounding-free copy, and a
@@ -1226,6 +1358,7 @@ fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
   // enough to make the whole step exact — see the *Exact steps* note above.
   let carry_is_a_copy = complement == C::ONE;
   let injection_is_everything = alpha == C::ONE;
+  let mut charged = false;
   for ((s, m), &xj) in state.iter_mut().zip(mag.iter_mut()).zip(x.iter()) {
     let recent = alpha * xj;
     let carried = complement * *s;
@@ -1235,10 +1368,20 @@ fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
     let committed = if injection_is_everything || (carry_is_a_copy && recent == C::ZERO) {
       C::ZERO
     } else {
+      // The one place the epoch count can advance, and it is the branch itself
+      // that decides: taking it is exactly the condition under which `*m` below
+      // CAN round, since the exempt branch leaves `complement` at `ONE` or
+      // `ZERO`, either of which makes `complement * *m` and its zero-addend sum
+      // exact. So the count and the induction's `t` are the same quantity by
+      // construction rather than by agreement between two spellings, and it
+      // over-counts (a charging step whose three operations happen to be exact
+      // still counts) in the only direction that is safe.
+      charged = true;
       recent.abs() + carried.abs()
     };
     *m = committed + complement * *m;
   }
+  charged
 }
 
 /// Gate `state` against its own rounding floor and write its unit direction
@@ -1317,6 +1460,17 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
       }
     }
 
+    // The epoch's own precondition, and the last rejection before the recurrence.
+    // It is checked after the window's — a malformed window is still malformed
+    // past the horizon, and reporting the epoch instead would mask it — and
+    // before any write, so this refusal is a no-op like the rest. `steps` counts
+    // charging steps, so an unseeded state (or an epoch of exact holds) never
+    // reaches it. *Epoch horizon* on `VectorEma` says why the limit exists and
+    // what a caller does about it.
+    if self.steps >= VectorEma::MAX_EPOCH_STEPS {
+      return Err(WinditError::EpochTooLong);
+    }
+
     if self.state.is_empty() {
       // First push of an epoch seeds `s_0 = x_0` — a copy, not arithmetic, so it
       // rounds by nothing and the gate's mass starts at zero rather than at
@@ -1337,13 +1491,18 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
       refit(&mut self.unit, x.len())?;
       refit(&mut self.state, x.len())?;
       self.state.copy_from_slice(x);
-    } else {
-      ema_step(
-        &mut self.state,
-        &mut self.mag,
-        x,
-        <ComputeOf<E> as Real>::from_f32(self.alpha),
-      );
+    } else if ema_step(
+      &mut self.state,
+      &mut self.mag,
+      x,
+      <ComputeOf<E> as Real>::from_f32(self.alpha),
+    ) {
+      // Counted here rather than at the top of `push`, and only when the step
+      // charged: the epoch's budget is the mass's relative precision, and a step
+      // that left `mag` unrounded spent none of it. A push the gate then refuses
+      // still counts — the accumulator advanced and the mass grew, which is the
+      // whole reason the refusal is not a no-op.
+      self.steps += 1;
     }
 
     gate_and_renorm(&self.state, &self.mag, &mut self.unit)?;
@@ -1360,6 +1519,7 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
     self.state.clear();
     self.mag.clear();
     self.unit.clear();
+    self.steps = 0;
   }
 }
 
@@ -1386,6 +1546,7 @@ impl<E: Vector> SmoothPolicy<E> for VectorEma {
       state: Vec::new(),
       mag: Vec::new(),
       unit: Vec::new(),
+      steps: 0,
     }
   }
 }

@@ -174,6 +174,24 @@ pub enum WinditError {
     /// The rejected window length, in votes.
     of: usize,
   },
+  /// A `VectorEma` epoch ran past `VectorEma::MAX_EPOCH_STEPS` recurrence steps,
+  /// beyond which the determinacy gate's error bound is no longer proven.
+  ///
+  /// The gate compares the accumulator against `16 * EPSILON * ||M||`, and `M`
+  /// — the propagated mass that bound is stated in — is itself a floating-point
+  /// accumulation. Its own rounding is monotone downward relative to the mass an
+  /// exact recurrence would carry, so far enough out `M` stops dominating and
+  /// the gate stops being conservative. The smoother therefore refuses the step
+  /// that would leave the proven range rather than emitting a direction it can
+  /// no longer certify: a permanent, epoch-level refusal, not a property of the
+  /// pushed window, and it leaves the accumulator untouched.
+  ///
+  /// A caller that means to keep filtering starts a new epoch with
+  /// `Smoother::reset` (or the equivalent `Smoother::discontinuity`), which
+  /// re-seeds from the next window with a zero mass and a zero step count.
+  /// Carries no payload: the count is always the enforced limit — a step past it
+  /// is never taken — and the limit itself is the public constant.
+  EpochTooLong,
 }
 
 impl core::fmt::Display for WinditError {
@@ -244,6 +262,15 @@ impl core::fmt::Display for WinditError {
         write!(
           f,
           "vote counts must satisfy 1 <= need <= of <= 64, got need {need} of {of}"
+        )
+      }
+      Self::EpochTooLong => {
+        // The limit is read from the constant rather than spelled again, so the
+        // message cannot drift from the bound it reports.
+        write!(
+          f,
+          "vector-EMA epoch reached its {} step limit, past which the determinacy gate's error bound is unproven; reset the smoother to start a new epoch",
+          crate::smooth::VECTOR_EMA_MAX_EPOCH_STEPS
         )
       }
     }
