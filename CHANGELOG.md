@@ -26,8 +26,8 @@ compiling**, and it moves `CoverageWeightedMean`'s output for every caller.
 
 **Three numeric re-measures, not two** — and a fourth change to
 `CoverageWeightedMean` that is deliberately not one, because it moves only the
-answers that were wrong (20736 of 20736 plan-reachable coverage slices fold
-bit-identically across it). Reviewing the coverage change turned up
+answers that were wrong (20736 of 20736 synthetic four-window coverage slices
+fold bit-identically across it). Reviewing the coverage change turned up
 two more defects it had inherited rather than introduced, both fixed here and
 both listed below with measured numbers. `Span::coverage` was rounding each
 `usize` into an `f64` *before* dividing — a defect of the operands, not of the
@@ -360,15 +360,28 @@ consumer against this crate:
   unchanged.
 
   **`shift` is zero unless the smallest nonzero weight would itself be
-  subnormal** — a coverage ratio past `2^1022`, which `aggregate` cannot reach
-  because a plan's coverages are at worst `1 / usize::MAX` apart. Measured over
-  the same 20736 four-window slices the change above was measured on:
+  subnormal** — a coverage ratio past `2^1022`. That never happens on a real
+  plan slice, and it is structural rather than sampled: a plan's non-final
+  windows all carry coverage exactly `1.0` (`coverage() == 1.0` iff
+  `len == window`), so the largest coverage in an actual slice is always `1.0`,
+  making the smallest-to-largest ratio the lift tests against just the smallest
+  coverage itself — already bounded below by `1 / usize::MAX`, since a plan's
+  coverages are at worst that far apart. `shift` is `0` on every slice a plan
+  can produce, whatever the sample size.
+
+  The sweep below sits on top of that proof rather than substituting for it:
+  its 20736 cases are arbitrary four-tuples of the twelve `len / 12` ratios
+  `Span::coverage` can produce, pushed through `CoverageWeightedMean` directly
+  rather than through a `WindowPlan`. Most are therefore *not* slices any plan
+  would emit — a real four-window plan carries at most one ragged coverage
+  against three windows pinned at `1.0` — so this is a broader characterization
+  check over synthetic input, not the source of the guarantee above:
 
   ```text
-  plan-reachable coverage slices   20736 of 20736 bit-identical
-  engaged regime (64 ratios)       63 of 64 changed
-    largest error before           1.42e-1   14% of a unit vector
-    largest error after            1.00 * EPSILON
+  synthetic four-window coverage slices   20736 of 20736 bit-identical
+  engaged regime (64 ratios)              63 of 64 changed
+    largest error before                  1.42e-1   14% of a unit vector
+    largest error after                   1.00 * EPSILON
   ```
 
   So this is the fourth change to this fold in the release only in the sense that
@@ -396,10 +409,14 @@ consumer against this crate:
   nothing at all and every weight is the caller's own coverage with its exponent
   moved. It also forfeits a largest weight of exactly `1` for one anywhere in
   `[1, 2)`, which moves the answer for **every slice whose largest coverage is not
-  a power of two**:
+  a power of two** — no real *four*-window plan slice among them, since three of
+  its four windows are always full and so its largest coverage is always exactly
+  `1`; the figure below is a synthetic sweep, arbitrary tuples pushed through the
+  policy directly rather than through a `WindowPlan`:
 
   ```text
-  ldexp-only weighting, over the 46 distinct len/window ratios up to 12
+  ldexp-only weighting: 46 distinct len/window ratios up to 12, arbitrary
+  four-tuples pushed through the policy directly (not a WindowPlan)
     3177923 of 4477456 four-window slices changed (71.0%)
     largest displacement 4.0e-16
     aggregate(&CoverageWeightedMean, [Windowed([3, 4], Span::new(0, 2, 3))])
@@ -409,7 +426,8 @@ consumer against this crate:
 
   That last row is the ragged single window this release had just made exact, and
   `[0.6, 0.7999999999999999]` is the value the previous entry names as the defect
-  it cured. Exactness and a largest weight of `1` are
+  it cured — a real, single-window plan slice, not a member of the sweep above.
+  Exactness and a largest weight of `1` are
   not jointly achievable — the second requires dividing by `max`, and that
   division is exact only when `max` is a power of two — so the choice is which to
   keep. A relative `u` on the weight costs the fold nothing the bound does not
@@ -418,12 +436,13 @@ consumer against this crate:
 
 - **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
   supertrait.** The trait is sealed, so no downstream *impl* can break.
-  `from_f64` and `'static` are additive for callers; **the `Debug` supertrait is
-  not, and the earlier wording here calling all three additive was wrong** — see
-  *Source compatibility* below. `from_f64` widens an `f64` value the fold will
-  multiply an embedding by — an EMA smoothing factor, a `Span::coverage`, or the
-  wire alpha `AggregatePolicyKind::into_policy` reads before any compute scalar
-  exists — into the compute domain (the identity for `f64`). `'static` is a fact
+  `'static` is additive for callers; **neither `from_f64` nor the `Debug`
+  supertrait is, and the earlier wording here calling all three additive was
+  wrong** — see *Source compatibility* below. `from_f64` widens an `f64` value
+  the fold will multiply an embedding by — an EMA smoothing factor, a
+  `Span::coverage`, or the wire alpha `AggregatePolicyKind::into_policy` reads
+  before any compute scalar exists — into the compute domain (the identity for
+  `f64`). `'static` is a fact
   about every implementor — an owned, borrow-free arithmetic type — spelled so
   that `Box<dyn AggregatePolicy<C>>` needs no re-declaration at each use site.
   `Debug` is a fact about every implementor too (they are core floats), and it is
@@ -462,6 +481,32 @@ consumer against this crate:
   because it models items appearing and disappearing rather than ambiguity at a
   use site, and its silence was read as evidence once already in this release.
   A `compile_fail,E0034` doctest on `Real` now pins the break and the workaround.
+
+- **`scalar::Real` gained `from_f64`, and an associated function is not purely
+  additive either.** Sealing prevents downstream *implementations*; it says
+  nothing about *method resolution* at a call site, and that is as true of an
+  associated function reached through a type parameter as it is of a
+  supertrait method. Generic code bounded on `Real` **and** on a local trait
+  that also names a `from_f64` associated function saw one candidate at
+  `0.2.0` and sees two here:
+
+  ```text
+  fn widen<T: Real + LocalFromF64>(x: f64) -> T { T::from_f64(x) }
+    error[E0034]: multiple applicable items in scope
+  ```
+
+  An associated function has no receiver to name the trait through, so the fix
+  is fully qualified syntax rather than `Debug`'s call-site form —
+  `<T as Real>::from_f64(x)` — which is likewise stable against any future
+  addition to either trait. **The function is kept**: it is the only way a
+  coefficient resolved before a compute scalar exists in scope — the wire
+  alpha `AggregatePolicyKind::into_policy` reads, or a `Span::coverage`
+  computed in a tier with no compute scalar at all — reaches the accumulator's
+  own width instead of rounding through `f32` first. What is corrected is the
+  claim, not the design: `cargo semver-checks` misses this the same way it
+  missed the `Debug` break, because it models items appearing and disappearing
+  rather than ambiguity at a use site. A `compile_fail,E0034` doctest on
+  `Real::from_f64` now pins the break and the workaround.
 
 The glob-collision note this release inherits still applies, since it also adds
 public names:

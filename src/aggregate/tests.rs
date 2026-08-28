@@ -418,15 +418,25 @@ fn the_weight_lift_engages_only_below_the_normal_boundary() {
 
 /// The lift changes nothing it does not have to change.
 ///
-/// A characterization test against the weighting as it stood before the lift, on
-/// the same 20736 four-window coverage slices this release's previous
-/// `CoverageWeightedMean` change was measured over. Every one of them folds
-/// bit-identically, because a plan's coverages are at worst `1 / usize::MAX`
-/// apart and the lift engages only past a ratio of `2^1022`. A fourth
-/// re-measure of this fold would need its own entry in the changelog; this test
-/// is what says there is not one.
+/// **Real plan output never engages the lift, and that is structural:** a
+/// plan's non-final windows all carry coverage exactly `1.0`, so a real slice's
+/// largest coverage is always `1.0`, and its smallest is bounded below by
+/// `1 / usize::MAX` — a plan's coverages are at worst that far apart — which
+/// keeps `shift` at `0` (the lift engages only past a ratio of `2^1022`) on
+/// every slice a plan can produce, independent of this or any other sample.
+///
+/// This is a broader characterization check on top of that proof, not the
+/// source of it: a sweep over the same 20736 *synthetic* four-window coverage
+/// slices this release's previous `CoverageWeightedMean` change was measured
+/// over — arbitrary four-tuples of the twelve `len / 12` ratios
+/// `Span::coverage` can produce, pushed through the policy directly rather than
+/// through a `WindowPlan`, so most of them are not slices any plan would
+/// actually emit. Every one of them still folds bit-identically against the
+/// weighting as it stood before the lift. A fourth re-measure of this fold
+/// would need its own entry in the changelog; this test is what says there is
+/// not one.
 #[test]
-fn the_weight_lift_is_the_identity_on_every_plan_reachable_slice() {
+fn the_weight_lift_is_the_identity_on_every_synthetic_direct_api_slice() {
   // The weighting verbatim as it was, folded through the very same routine, so
   // the weight is the only thing that differs.
   fn unlifted(

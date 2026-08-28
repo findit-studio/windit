@@ -292,6 +292,53 @@ pub trait Real:
   /// because what a value multiplies is what decides how finely it must be
   /// carried.
   ///
+  /// # Not purely additive
+  ///
+  /// Sealing prevents a downstream *implementation* of `Real`; it says nothing
+  /// about *method resolution* at a call site, and an associated function
+  /// reached through a type parameter is exactly as exposed to that as the
+  /// `Debug` supertrait documented above is. Generic code bounded on `Real`
+  /// **and** on a local trait that also names a `from_f64` associated function
+  /// saw one candidate at `0.2.0` and sees two here:
+  ///
+  /// ```compile_fail,E0034
+  /// use windit::scalar::Real;
+  ///
+  /// trait LocalFromF64 {
+  ///   fn from_f64(x: f64) -> Self;
+  /// }
+  ///
+  /// fn widen<T: Real + LocalFromF64>(x: f64) -> T {
+  ///   T::from_f64(x) // E0034: multiple applicable items in scope
+  /// }
+  /// ```
+  ///
+  /// An associated function has no receiver to name the trait through, so the
+  /// fix is fully qualified syntax rather than `Debug`'s `Trait::method(&x, ..)`
+  /// shape, and it is likewise stable against any future addition to either
+  /// trait:
+  ///
+  /// ```
+  /// use windit::scalar::Real;
+  ///
+  /// trait LocalFromF64 {
+  ///   fn from_f64(x: f64) -> Self;
+  /// }
+  ///
+  /// fn widen<T: Real + LocalFromF64>(x: f64) -> T {
+  ///   <T as Real>::from_f64(x)
+  /// }
+  /// ```
+  ///
+  /// **The function is kept**: it is the only way a coefficient resolved before
+  /// a compute scalar exists in scope — the wire alpha
+  /// `AggregatePolicyKind::into_policy` reads, or a `Span::coverage` computed in
+  /// a tier with no compute scalar at all — reaches the accumulator's own width
+  /// instead of rounding through `f32` first. What is corrected is the claim,
+  /// not the design: `cargo semver-checks` misses this the same way it missed
+  /// the `Debug` break, because it models items appearing and disappearing
+  /// rather than ambiguity at a use site.
+  ///
   /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f64(x: f64) -> Self;
 

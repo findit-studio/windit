@@ -435,11 +435,14 @@ pub fn keep_separate<E>(windows: Vec<WindowEmbedding<E>>) -> Vec<WindowEmbedding
 /// outright is possible — divide by `2^exponent(max_j c_j)` instead of by
 /// `max_j c_j`, which is a shift and rounds nothing — but it forfeits a largest
 /// weight of exactly `1` for one anywhere in `[1, 2)`, and so moves the answer for
-/// every slice whose largest coverage is not a power of two: 71% of the
-/// plan-reachable four-window slices, including the ragged single window whose
-/// answer this release had just made exact. A relative `u` on the weight costs
-/// the fold nothing the bound does not already carry; that trade is why the
-/// division stays.
+/// every slice whose largest coverage is not a power of two: 71% of a synthetic
+/// four-window sweep (arbitrary tuples pushed through the policy directly, not
+/// through a `WindowPlan`), including the ragged single window whose answer this
+/// release had just made exact. No real *four*-window plan slice is among the
+/// swept 71%: three of its four windows are always full, so its largest coverage
+/// is always exactly `1`, already a power of two. A relative `u` on the weight
+/// costs the fold nothing the bound does not already carry; that trade is why
+/// the division stays.
 ///
 /// # Scaling, bit for bit and otherwise
 ///
