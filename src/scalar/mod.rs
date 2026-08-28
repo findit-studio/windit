@@ -158,11 +158,12 @@ pub trait Real:
   ///
   /// With [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) it bounds the input
   /// domain within which every intermediate of every built-in aggregation policy
-  /// stays finite, and — for the policies whose weights are bounded below
-  /// (`MeanRenormalized`, `CoverageWeightedMean`, `SaliencyWeighted`) — every
-  /// nonzero intermediate stays a normal value, with no overflow and no flush to
-  /// a subnormal. `EmaRenormalized`'s recency weights are unbounded below, so its
-  /// oldest-window products may underflow toward a subnormal; the determinacy
+  /// stays finite, and — for the policies whose weights the domain itself bounds
+  /// below (`MeanRenormalized`, `SaliencyWeighted`) — every nonzero intermediate
+  /// stays a normal value, with no overflow and no flush to a subnormal.
+  /// `EmaRenormalized`'s recency weights decay without limit, and
+  /// `CoverageWeightedMean`'s weight is a coverage the domain admits anywhere in
+  /// `[0, 1]`, so either can drive a product toward a subnormal; the determinacy
   /// gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor keeps that
   /// regime sound (see the `aggregate` module's Input domain note). A nonzero
   /// component below this bound is rejected before any arithmetic. Every magnitude
@@ -184,36 +185,41 @@ pub trait Real:
   /// The determinacy gate rejects a folded result whose norm is at or below
   /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD`, where `M`
   /// is the accumulated term-magnitude vector. The relative `16 * EPSILON * ||M||`
-  /// part underflows to zero once `EmaRenormalized`'s unbounded-below recency
-  /// weights drive the fold's products into the subnormal range, where per-term
-  /// rounding is absolute (at most `2^-1075`) rather than relative. This floor
-  /// dominates the largest residue such an exactly-cancelling fold can leave
+  /// part underflows to zero once a weight the input domain does not bound below
+  /// drives the fold's products into the subnormal range, where per-term rounding
+  /// is absolute (at most `2^-1075`) rather than relative. This floor dominates
+  /// the largest residue such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
-  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass the
-  /// three bounded-weight policies can accumulate in-domain, so their verdicts are
-  /// bit-for-bit unchanged. For `EmaRenormalized` it engages whenever the
-  /// accumulated mass falls below about `2^-948`, including folds whose products
-  /// are still normal — where it monotonically turns a sub-floor direction into
-  /// `NonFinite` (an engagement boundary a regression test pins); no realizable
-  /// `f32` workload reaches that regime. See the `aggregate` module's Input domain
-  /// note.
+  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
+  /// domain-bounded weight can accumulate, so those verdicts are bit-for-bit
+  /// unchanged. It engages whenever the accumulated mass falls below about
+  /// `2^-948`, including folds whose products are still normal — where it
+  /// monotonically turns a sub-floor direction into `NonFinite` (an engagement
+  /// boundary a regression test pins). Reaching that needs `EmaRenormalized`'s
+  /// decaying recency weights or a caller-supplied coverage far below anything
+  /// `Span::coverage` produces; no realizable `f32` workload gets there. See the
+  /// `aggregate` module's Input domain note.
   const MIN_GATE_THRESHOLD: Self;
 
-  /// Widen an `f32` configuration value — a [`Span::coverage`], or one of the
-  /// determinacy gate's own dimensionless constants — into this domain. Exact
-  /// for every implementor.
+  /// Widen one of the determinacy gate's own dimensionless constants — the `16`
+  /// its threshold carries — into this domain. Exact for every implementor.
   ///
-  /// A smoothing factor does **not** arrive this way. It multiplies an
-  /// accumulator, so it is configured at the accumulator's own width and widens
-  /// through [`from_f64`](Real::from_f64); a coverage is a geometric fraction of
-  /// a window, computed in `f32` and never accumulated in.
+  /// Nothing the fold *multiplies an embedding by* arrives this way any more.
+  /// Both such weights — an EMA smoothing factor and a [`Span::coverage`] — are
+  /// resolved at the accumulator's own width and reach a `Real` through
+  /// [`from_f64`](Real::from_f64); a coverage stopped coming through here in
+  /// `0.3.0`, when it stopped being typed by its provenance. What is left is a
+  /// small exact integer written into a threshold, which is not a weight and
+  /// never was a tuning knob, so the narrow constructor names it without
+  /// implying either.
   ///
   /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f32(x: f32) -> Self;
 
-  /// Widen an `f64` configuration value — an EMA smoothing factor — into this
-  /// domain. Exact for every implementor, and the identity for `f64`.
+  /// Widen an `f64` value the fold will multiply an embedding by — an EMA
+  /// smoothing factor, or a [`Span::coverage`] — into this domain. Exact for
+  /// every implementor, and the identity for `f64`.
   ///
   /// Every implementor of this trait *is* the compute domain (`Real` is
   /// `Scalar<Compute = Self>`), and that domain is `f64` for every shipped
@@ -225,9 +231,16 @@ pub trait Real:
   /// constructors — `aggregate::EmaRenormalized::new` and
   /// `smooth::VectorEma::new`, named rather than linked because both sit behind
   /// `alloc` and this tier is featureless — take the compute domain itself
-  /// rather than widening into it. What still reaches them through here is the
-  /// serde selector `AggregatePolicyKind`, a wire value read before any compute
-  /// scalar exists.
+  /// rather than widening into it. Two kinds of value cannot be asked for in the
+  /// compute domain because they exist before one does, and both reach it
+  /// through here instead: the serde selector `AggregatePolicyKind`, a wire value
+  /// read before any embedding, and a `Span::coverage`, which the planner derives
+  /// from two `usize`s in a tier that has no compute scalar at all. Neither is
+  /// configured at the accumulator's width; both are nonetheless resolved at it,
+  /// because what a value multiplies is what decides how finely it must be
+  /// carried.
+  ///
+  /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f64(x: f64) -> Self;
 
   /// The square root, for L2 norms.

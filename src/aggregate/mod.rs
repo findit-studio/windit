@@ -12,17 +12,31 @@
 //! reconstruction out of the trait is what lets the trait stay object-safe while
 //! embedding reconstruction stays generic.
 //!
-//! Policy *configuration* is typed by what it multiplies. A coverage stays
-//! `f32` — it is a window-geometry fraction rather than an embedding value —
-//! and widens where it is used, through [`Real::from_f32`]; that is a choice of
-//! API shape, and [`EmaRenormalized`]'s own note says why it is still open. A
-//! smoothing factor multiplies the accumulator, so it is the compute scalar
-//! itself:
-//! [`EmaRenormalized`] carries a `C`, defaulted to `f64` exactly as the trait
-//! is, and a coefficient can no longer be resolved more coarsely than the
-//! arithmetic it drives. Only the serde selector `AggregatePolicyKind` keeps
-//! an `f64` there, being a wire type read before any compute scalar exists; it
-//! widens through [`Real::from_f64`].
+//! Policy *configuration* is typed by **what it multiplies**, not by where the
+//! number came from. A coverage used to be typed the other way — a
+//! window-geometry fraction rather than an embedding value, therefore `f32` —
+//! and that classification asked the wrong question. [`Span::coverage`] is a
+//! *weight*: [`CoverageWeightedMean`] multiplies an embedding by it, inside an
+//! `f64` fold. A weight resolved more coarsely than the arithmetic it drives
+//! discards information that arithmetic would have used, whatever its
+//! provenance. So a coverage is `f64` — the domain its own division runs in and
+//! the widest this crate has — and widens into a policy's `C` through
+//! [`Real::from_f64`]. A smoothing factor multiplies the accumulator too, and is
+//! the compute scalar itself: [`EmaRenormalized`] carries a `C`, defaulted to
+//! `f64` exactly as the trait is.
+//!
+//! Why a coverage is a concrete `f64` in the trait signature rather than the
+//! policy's own `C`, when a coefficient is `C`: a coefficient is *configured*,
+//! by a caller who already has an embedding in mind, so it can be asked for in
+//! the domain that embedding computes in. A coverage is *derived* — by
+//! [`Span::coverage`] from two `usize`s, in the featureless `plan` tier, before
+//! any embedding or compute scalar is in sight — so there is no `C` to ask for
+//! it in. `f64` is exact for the whole quotient that division can produce and
+//! widens exactly into every [`Real`], which is the same shape the serde
+//! selector `AggregatePolicyKind` has for the same reason: a wire value read
+//! before any compute scalar exists. (Named rather than linked, here and below:
+//! that selector is behind `serde` and this prose is not, so a link would be
+//! unresolved on every feature row that leaves `serde` off.)
 //!
 //! Built-in strategies weight the windows by different signals:
 //!
@@ -90,16 +104,30 @@
 //! must be finite and in `[0, 1]`. Inputs outside this domain are rejected with
 //! [`WinditError::MagnitudeOutOfRange`] or [`WinditError::CoverageOutOfRange`]
 //! before any arithmetic. The bounds are sized so that within them every
-//! intermediate of every built-in policy is finite, and — for the three policies
-//! whose weights are bounded below ([`MeanRenormalized`] at `1`,
-//! [`CoverageWeightedMean`] at a coverage `>= 2^-149`, and [`SaliencyWeighted`] at
-//! a norm `>= 2^-400`) — every nonzero intermediate is a normal `f64`, no overflow
-//! and no subnormal flush, including the squared term [`SaliencyWeighted`] forms.
-//! [`EmaRenormalized`] is the exception: its recency weights
-//! `w_i = alpha * (1 - alpha)^(n - 1 - i)` are unbounded below, so at a large
-//! window count the oldest windows' products can underflow toward a subnormal (or
-//! to zero) even for in-domain inputs — a regime the determinacy gate's absolute
-//! floor handles (see below). Every value an `f32`-storage embedding can produce
+//! intermediate of every built-in policy is finite, and — for the policies whose
+//! weights the domain itself bounds below ([`MeanRenormalized`] at `1` and
+//! [`SaliencyWeighted`] at a norm `>= 2^-400`) — every nonzero intermediate is a
+//! normal `f64`, no overflow and no subnormal flush, including the squared term
+//! [`SaliencyWeighted`] forms. Two policies have weights the domain does not
+//! bound below:
+//!
+//! - [`EmaRenormalized`]'s recency weights `w_i = alpha * (1 - alpha)^(n - 1 - i)`
+//!   decay without limit, so at a large window count the oldest windows' products
+//!   can underflow toward a subnormal (or to zero) even for in-domain inputs.
+//! - [`CoverageWeightedMean`]'s weight is the coverage itself, and the domain
+//!   admits every finite fraction in `[0, 1]` — down to `2^-1074`. A coverage the
+//!   [`aggregate`] path supplies is never that small: [`Span::coverage`] is
+//!   `len / window` with `len >= 1`, so it is at least `1 / usize::MAX` — above
+//!   `2^-64` on any target this crate builds for — and a plan-driven fold's
+//!   products stay normal at `2^-464` or above. Only a caller assembling its own
+//!   coverage slice for [`aggregate_values`](AggregatePolicy::aggregate_values)
+//!   can reach below that. (While a coverage was `f32` the domain bounded it at
+//!   `2^-149` for free, that being the smallest positive `f32`; widening the
+//!   channel is what moved this policy into the same regime as EMA's.)
+//!
+//! Both are regimes the determinacy gate's absolute floor handles (see below),
+//! and the floor's soundness argument is about products rather than about which
+//! policy formed them. Every value an `f32`-storage embedding can produce
 //! lies more than 250 binary orders inside this window on both sides, so no
 //! realizable `f32` input ever reaches a boundary.
 //!
@@ -121,8 +149,8 @@
 //! `K_abs <= sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40` and
 //! `dim <= 2^32`. The threshold
 //! `τ = 16 * EPSILON * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] carries a matching
-//! absolute floor (`2^-1000` for `f64`, above `K_abs` and — for any mass the
-//! bounded-weight policies accumulate — far below `16 * EPSILON * ||M||`), so an
+//! absolute floor (`2^-1000` for `f64`, above `K_abs` and — for any mass a
+//! domain-bounded weight accumulates — far below `16 * EPSILON * ||M||`), so an
 //! exactly cancelling sum has `||R|| <= 4 * EPSILON * ||M|| + K_abs < τ` and is
 //! always gated, whatever the ordering, tier structure, or weight range — so no
 //! fold can fabricate a direction from in-domain cancellation without violating the
@@ -130,16 +158,16 @@
 //! `||M||` is itself subnormal and `16 * EPSILON * ||M||` underflows, leaving the
 //! floor to gate alone: the entire signal then sits below the precision the domain
 //! guarantees, so `NonFinite` remains the honest verdict. The floor also engages
-//! earlier, while every product is still normal: for `EmaRenormalized` alone, once
-//! the accumulated mass falls below about `2^-948`, `16 * EPSILON * ||M||` itself
-//! drops beneath the `2^-1000` floor and the floor decides the verdict alone,
-//! monotonically turning a sub-floor direction into `NonFinite` rather than
-//! admitting it — an over-rejection-only widening of the gate, pinned by a
-//! regression test. Neither regime — whole-fold-subnormal or sub-`2^-948`
-//! normal-product — is one a realizable `f32` workload reaches.
+//! earlier, while every product is still normal: once the accumulated mass falls
+//! below about `2^-948`, `16 * EPSILON * ||M||` itself drops beneath the `2^-1000`
+//! floor and the floor decides the verdict alone, monotonically turning a
+//! sub-floor direction into `NonFinite` rather than admitting it — an
+//! over-rejection-only widening of the gate, pinned by a regression test. Only a
+//! weight the domain does not bound below reaches either regime, and neither —
+//! whole-fold-subnormal or sub-`2^-948` normal-product — is one a realizable
+//! `f32` workload reaches through [`aggregate`].
 //!
 //! [`Real`]: crate::scalar::Real
-//! [`Real::from_f32`]: crate::scalar::Real::from_f32
 //! [`Real::from_f64`]: crate::scalar::Real::from_f64
 //! [`Span`]: crate::plan::Span
 //! [`Span::coverage`]: crate::plan::Span::coverage
@@ -186,7 +214,7 @@ mod tests;
 ///   fn aggregate_values(
 ///     &self,
 ///     embeddings: &[&[f64]],
-///     _coverages: &[f32],
+///     _coverages: &[f64],
 ///     dim: usize,
 ///   ) -> Result<Vec<f64>, WinditError> {
 ///     let first = embeddings.first().ok_or(WinditError::Empty)?;
@@ -207,9 +235,13 @@ pub trait AggregatePolicy<C: Real = f64> {
   /// The built-in policies return an L2-normalized vector, and a custom policy
   /// should do the same; either way [`aggregate`] re-normalizes the result
   /// through [`Vector::from_unnormalized`]. `coverages` must have the same length
-  /// as `embeddings` even for policies that do not weight by coverage. They stay
-  /// `f32` at every scalar: a coverage is a geometric fraction from
-  /// [`Span::coverage`](crate::plan::Span::coverage), not an embedding value.
+  /// as `embeddings` even for policies that do not weight by coverage. They are
+  /// `f64` at every scalar, and deliberately not `C`: a coverage is *derived*
+  /// rather than configured — [`Span::coverage`](crate::plan::Span::coverage)
+  /// computes it from two `usize`s before any embedding or compute scalar
+  /// exists — so it arrives in the domain that division runs in and widens
+  /// through [`Real::from_f64`] where a policy uses it. It is still a weight on
+  /// an `f64` fold, which is why it is not narrower than one.
   ///
   /// Every component must be finite and either zero or of magnitude within
   /// `[MIN_AGG_MAGNITUDE, MAX_AGG_MAGNITUDE]`, and every coverage finite and in
@@ -229,7 +261,7 @@ pub trait AggregatePolicy<C: Real = f64> {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
-    coverages: &[f32],
+    coverages: &[f64],
     dim: usize,
   ) -> Result<Vec<C>, WinditError>;
 }
@@ -354,19 +386,20 @@ pub struct MeanRenormalized;
 /// nearest `f32` is exactly `1.0`, at which the weights collapse to
 /// `[0, .., 0, 1]` and the fold returns its last window), and its grid is
 /// `2^-24` apart relatively where the weights, the products and the compensated
-/// sum all round at `2^-53`. A coverage stays `f32` — it is a window-geometry
-/// fraction that [`Span::coverage`](crate::plan::Span::coverage) computes in
-/// `f32` from two `usize`s, and moving it would change the object-safe
+/// sum all round at `2^-53`. The same argument decided the coverage channel:
+/// [`Span::coverage`](crate::plan::Span::coverage) is a weight on this fold too,
+/// so its `f32` grid inside an `f64` sum was this defect wearing a different
+/// provenance, and it is `f64` now. What had kept it was price rather than
+/// numerics — widening it changes the object-safe
 /// [`AggregatePolicy::aggregate_values`] signature every custom policy
-/// implements. It is a *weight* on the fold all the same, so it is on the `f32`
-/// grid inside an `f64` sum for a reason of API shape rather than of numerics;
-/// that is a live question, not one this note settles.
+/// implements — and a price is a reason to schedule a break, not to leave one
+/// standing.
 ///
 /// Carrying the domain as a type parameter rather than hardcoding `f64` is what
 /// keeps the policy honest if a second `Real` is ever sealed in: its
 /// coefficient would follow its own domain with no further signature change.
-/// The serde selector `AggregatePolicyKind` is the one place an `f64` remains,
-/// being a wire type that is read before any compute scalar exists.
+/// The serde selector `AggregatePolicyKind` is the one place a *bare* `f64`
+/// remains, being a wire type that is read before any compute scalar exists.
 ///
 /// The bound is on the type and not only on its impls, matching
 /// [`AggregatePolicy`] itself: `C` names a compute domain, and
@@ -421,10 +454,10 @@ impl<C: Real> AggregatePolicy<C> for CoverageWeightedMean {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
-    coverages: &[f32],
+    coverages: &[f64],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
-    weighted_sum_renorm(embeddings, coverages, dim, |i, _| C::from_f32(coverages[i]))
+    weighted_sum_renorm(embeddings, coverages, dim, |i, _| C::from_f64(coverages[i]))
   }
 }
 
@@ -432,7 +465,7 @@ impl<C: Real> AggregatePolicy<C> for MeanRenormalized {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
-    coverages: &[f32],
+    coverages: &[f64],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
     weighted_sum_renorm(embeddings, coverages, dim, |_, _| C::ONE)
@@ -443,7 +476,7 @@ impl<C: Real> AggregatePolicy<C> for SaliencyWeighted {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
-    coverages: &[f32],
+    coverages: &[f64],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
     check_inputs(embeddings, coverages, dim)?;
@@ -465,7 +498,7 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
-    coverages: &[f32],
+    coverages: &[f64],
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
     // A convex EMA needs alpha in [0, 1]; anything else (including NaN, which
@@ -571,7 +604,7 @@ impl AggregatePolicyKind {
 /// [Scale](self#scale) note.
 fn check_inputs<C: Real>(
   embeddings: &[&[C]],
-  coverages: &[f32],
+  coverages: &[f64],
   dim: usize,
 ) -> Result<(), WinditError> {
   if embeddings.is_empty() {
@@ -611,8 +644,9 @@ fn check_inputs<C: Real>(
 /// One pass, no retry, no prescaling: the compute scalar is `f64` (an `f32`
 /// embedding widened before this ran), and [`check_inputs`] has confined every
 /// component to the input domain, so every product and partial sum is finite —
-/// and normal for the bounded-weight policies, while [`EmaRenormalized`]'s
-/// unbounded-below weights can drive the oldest windows' products subnormal. The
+/// and normal wherever the domain bounds the weight below, while a weight it does
+/// not ([`EmaRenormalized`]'s decaying recency factors, or a caller-supplied
+/// subnormal coverage) can drive a product subnormal. The
 /// sum is *compensated* (Neumaier, exact for subnormal operands), and alongside it
 /// the routine accumulates `M`, the componentwise sum of the term magnitudes.
 /// Before normalizing, a determinacy gate rejects any result whose norm is at or
@@ -626,7 +660,7 @@ fn check_inputs<C: Real>(
 /// note for the proof.
 fn weighted_sum_renorm<C: Real>(
   embeddings: &[&[C]],
-  coverages: &[f32],
+  coverages: &[f64],
   dim: usize,
   weight: impl Fn(usize, &[C]) -> C,
 ) -> Result<Vec<C>, WinditError> {
@@ -666,8 +700,9 @@ fn weighted_sum_renorm<C: Real>(
   // rounding turns absolute, so without the floor the gate would degenerate into an
   // exact-zero check a nonzero subnormal residue slips past (module Input domain
   // note). With it, exact cancellation (`||exact|| = 0`) is always caught, at every
-  // ordering, tier structure, and weight range. For the three bounded-weight
-  // policies the floor is far below `16 * EPSILON * ||M||` and changes no verdict.
+  // ordering, tier structure, and weight range. Wherever the domain bounds the
+  // weight below the floor sits far under `16 * EPSILON * ||M||` and changes no
+  // verdict.
   let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(&mag) + C::MIN_GATE_THRESHOLD;
   if l2_norm(&acc) <= tau {
     return Err(WinditError::NonFinite);

@@ -108,6 +108,33 @@ fn span_new_exposes_geometry_through_accessors() {
   assert!((span.coverage() - 0.75).abs() < 1e-6);
 }
 
+/// A geometry past `f32`'s integer-exact range must report the exactly-correct
+/// ratio, not one whose operands rounded before the division.
+///
+/// A window of `16_777_217` (`2^24 + 1`, the first integer `f32` cannot hold)
+/// over `16_777_216` elements plans a single ragged tail, one element short of
+/// full. Narrowing the operands first rounds that window down to `2^24` and the
+/// tail reports as a full window at exactly `1.0` — the ragged tail and the full
+/// window become indistinguishable. Both operands are exact in `f64`, so the
+/// quotient there is the correctly-rounded ratio.
+#[test]
+fn coverage_past_f32_integer_range_is_the_exact_ratio() {
+  let s = WindowPlan::spans(&WindowOptions::new(16_777_217), 16_777_216).unwrap();
+  assert_eq!(s.len(), 1);
+  assert_eq!((s[0].len(), s[0].window()), (16_777_216, 16_777_217));
+
+  let cov = s[0].coverage();
+  assert!(
+    cov < 1.0,
+    "a tail one element short of the window must not report full coverage, got {cov:?}"
+  );
+  assert_eq!(
+    cov,
+    16_777_216.0 / 16_777_217.0,
+    "coverage must be the exact ratio, not a ratio of rounded operands"
+  );
+}
+
 #[test]
 #[should_panic(expected = "0 < len <= window")]
 fn span_new_rejects_len_above_window_in_every_build() {

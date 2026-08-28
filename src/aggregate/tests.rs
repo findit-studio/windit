@@ -58,6 +58,70 @@ fn coverage_weighted_mean_f64_pinned() {
   assert!(diff > 1e-12, "f32 precision must not satisfy the f64 pin");
 }
 
+/// Two window geometries whose true coverages differ by far less than an `f32`
+/// ulp must reach the fold as *different* weights.
+///
+/// Every operand is at most `2^24` and so exactly representable in `f32`, which
+/// is what makes this a statement about the quotient alone — nothing rounds on
+/// the way into the division, unlike the geometry
+/// `coverage_past_f32_integer_range_is_the_exact_ratio` pins. The two ratios
+/// `8388607/16777213` and `8388608/16777215` differ by exactly
+/// `1/(16777213 * 16777215)`, about `3.6e-15`: 32 `f64` ulps, and `6e-8` of the
+/// `f32` ulp at `0.5`. A coverage channel narrower than the fold rounds both to
+/// `0.50000006` and weighs two different windows identically.
+#[test]
+fn sub_ulp_coverages_reach_the_fold_as_distinct_weights() {
+  let cov_a = Span::new(0, 8_388_607, 16_777_213).coverage();
+  let cov_b = Span::new(0, 8_388_608, 16_777_215).coverage();
+
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let out_a = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[1.0, cov_a], 2)
+    .unwrap();
+  let out_b = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[1.0, cov_b], 2)
+    .unwrap();
+
+  assert_ne!(
+    out_a, out_b,
+    "spans (len 8388607, window 16777213) and (len 8388608, window 16777215) \
+     have true coverages 3.6e-15 apart, yet both folded at {cov_a:?} / {cov_b:?} \
+     and produced one vector"
+  );
+  assert_ne!(
+    cov_a, cov_b,
+    "two window geometries 3.6e-15 apart in true coverage must not share a coverage"
+  );
+
+  // And through `aggregate`, which collects the coverages itself: the seam above
+  // is the one a caller reaches directly, this is the one the crate walks, and a
+  // narrowing anywhere along it collapses the two geometries again.
+  let mk = |len, window| {
+    [
+      Windowed::new(
+        RawF64Emb {
+          data: vec![1.0, 0.0],
+          captured: Vec::new(),
+        },
+        Span::new(0, 4, 4),
+      ),
+      Windowed::new(
+        RawF64Emb {
+          data: vec![0.0, 1.0],
+          captured: Vec::new(),
+        },
+        Span::new(0, len, window),
+      ),
+    ]
+  };
+  let folded_a = aggregate(&CoverageWeightedMean, &mk(8_388_607, 16_777_213)).unwrap();
+  let folded_b = aggregate(&CoverageWeightedMean, &mk(8_388_608, 16_777_215)).unwrap();
+  assert_ne!(
+    folded_a.captured, folded_b.captured,
+    "`aggregate` must carry the distinction its spans hold"
+  );
+}
+
 #[test]
 fn ema_alpha_range_is_rejected_at_f64() {
   // The alpha range check runs on the configuration field, which is now the
@@ -310,7 +374,7 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
 
 /// A built-in policy's `aggregate_values`, as a plain function pointer so a test
 /// can iterate over the four of them.
-type PolicyRun = fn(&[&[f64]], &[f32], usize) -> Result<Vec<f64>, WinditError>;
+type PolicyRun = fn(&[&[f64]], &[f64], usize) -> Result<Vec<f64>, WinditError>;
 
 /// The four built-in policies, paired with a name for failure messages, over one
 /// compute scalar. Saves each magnitude test from spelling the list four times.
@@ -609,7 +673,7 @@ fn exact_cancellation_is_rejected() {
     113.0 / 512.0,
     -2799.0 / 512.0,
   ];
-  let coverages = [1.0_f32; 4];
+  let coverages = [1.0_f64; 4];
   for order in permutations(4) {
     let cols = [
       [raw[order[0]]],
@@ -653,7 +717,7 @@ fn exact_cancellation_is_rejected() {
 fn assert_wide_spread_cancellation_rejected(e: f64, d: f64, domain_rejected: bool) {
   let de = d * e; // exact: the tiny term that rides on `e`
   let values = [e, -e, 48.0 * de, -32.0 * de, -16.0 * de];
-  let coverages = [1.0_f32; 5];
+  let coverages = [1.0_f64; 5];
   for order in permutations(5) {
     let cols: Vec<[f64; 1]> = order.iter().map(|&i| [values[i]]).collect();
     let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
@@ -777,7 +841,7 @@ fn exact_cancellation_across_three_tiers_is_gated() {
     [d, -1.0],
     [1.0, 0.0],
   ];
-  let coverages = [1.0_f32; 6];
+  let coverages = [1.0_f64; 6];
   let mut orders = 0;
   for order in permutations(6) {
     orders += 1;
@@ -850,7 +914,7 @@ fn ema_subnormal_product_cancellation_family_a_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
   cols.resize(700, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 700];
+  let coverages = vec![1.0_f64; 700];
   let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -874,7 +938,7 @@ fn ema_subnormal_product_cancellation_family_b_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
   cols.resize(84, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 84];
+  let coverages = vec![1.0_f64; 84];
   let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -897,7 +961,7 @@ fn ema_single_subnormal_product_term_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e, 0.0]];
   cols.resize(701, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 701];
+  let coverages = vec![1.0_f64; 701];
   let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -924,7 +988,7 @@ fn determinacy_gate_floor_boundary_is_monotone() {
   cols_above.resize(606, [0.0, 0.0]);
   let e_above: Vec<&[f64]> = cols_above.iter().map(|c| c.as_slice()).collect();
   let out = EmaRenormalized::new(0.5)
-    .aggregate_values(&e_above, &vec![1.0_f32; 606], 2)
+    .aggregate_values(&e_above, &vec![1.0_f64; 606], 2)
     .unwrap();
   assert_close_f64(&out, &[0.447_213_595_499_957_9, 0.894_427_190_999_915_9]);
 
@@ -932,7 +996,7 @@ fn determinacy_gate_floor_boundary_is_monotone() {
   let mut cols_below: Vec<[f64; 2]> = vec![[below, 2.0 * below]];
   cols_below.resize(606, [0.0, 0.0]);
   let e_below: Vec<&[f64]> = cols_below.iter().map(|c| c.as_slice()).collect();
-  let got = EmaRenormalized::new(0.5).aggregate_values(&e_below, &vec![1.0_f32; 606], 2);
+  let got = EmaRenormalized::new(0.5).aggregate_values(&e_below, &vec![1.0_f64; 606], 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
     "sub-floor mass must be NonFinite, got {got:?}"
@@ -1001,6 +1065,71 @@ fn domain_corners_are_accepted_at_the_boundary_and_rejected_beyond() {
   }
 }
 
+/// Widening the coverage channel widened the domain it accepts, and the gate is
+/// what keeps the new part of that domain sound.
+///
+/// While a coverage was `f32` the smallest positive one the type could express
+/// was `2^-149`, so `CoverageWeightedMean`'s weight was bounded below for free
+/// and its products stayed normal. An `f64` coverage reaches `2^-1074`, which the
+/// input domain still admits — it is a finite fraction in `[0, 1]` — so this
+/// policy joins `EmaRenormalized` in the regime the determinacy gate's absolute
+/// floor decides: a fold whose whole mass sits under `MIN_GATE_THRESHOLD` has no
+/// direction at working precision, and the honest answer is `NonFinite` rather
+/// than the unit vector renormalization would manufacture from it.
+///
+/// Nothing reachable through `aggregate` gets here: `Span::coverage` is
+/// `len / window` with `len >= 1`, so a plan-supplied weight is at least
+/// `1 / usize::MAX`.
+#[test]
+fn a_subnormal_caller_supplied_coverage_is_gated_not_fabricated() {
+  let subnormal = f64::from_bits(1); // 2^-1074, unrepresentable as a nonzero f32
+  assert!(subnormal.is_finite() && subnormal > 0.0 && subnormal < 1.0);
+  assert_eq!(subnormal as f32, 0.0, "no f32 carries this coverage");
+
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let got = CoverageWeightedMean.aggregate_values(&embeddings, &[subnormal; 2], 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a fold whose entire mass is below the gate's floor must be rejected, got {got:?}"
+  );
+
+  // The same geometry at the smallest coverage the old `f32` channel could carry
+  // still folds to a direction, so the rejection above is about where the mass
+  // landed and not about the policy having become stricter.
+  let old_floor = f64::from(f32::from_bits(1)); // 2^-149
+  let ok = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[old_floor; 2], 2)
+    .expect("2^-149 is far above the gate's floor and must still resolve");
+  assert_close_f64(&ok, &[core::f64::consts::FRAC_1_SQRT_2; 2]);
+}
+
+/// The coverage slice must be as long as the window sequence, at every policy.
+///
+/// The shared input check enforces it, so even a policy that never reads a
+/// coverage rejects a mismatched one rather than folding a sequence it was
+/// handed no geometry for. Both directions are checked: a short slice is the one
+/// that would index out of bounds inside `CoverageWeightedMean`, and a long one
+/// is the one the per-window zip would silently truncate.
+#[test]
+fn a_coverage_slice_that_does_not_match_the_windows_is_rejected() {
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  for (label, coverages) in [("short", &[1.0][..]), ("long", &[1.0, 1.0, 1.0][..])] {
+    for (name, run) in builtin_policies() {
+      let got = run(&embeddings, coverages, 2);
+      assert!(
+        matches!(
+          got,
+          Err(WinditError::DimMismatch {
+            got: g,
+            expected: 2
+          }) if g == coverages.len()
+        ),
+        "{name} must reject a {label} coverage slice, got {got:?}"
+      );
+    }
+  }
+}
+
 #[test]
 fn out_of_range_coverage_is_rejected() {
   // A coverage is a geometric fraction in [0, 1]; NaN, above 1, or below 0 is
@@ -1008,7 +1137,7 @@ fn out_of_range_coverage_is_rejected() {
   // lives in the shared input path, so even the policies that ignore coverage
   // enforce its range.
   let embeddings: [&[f64]; 1] = [&[1.0, 0.0]];
-  for bad in [f32::NAN, 1.5, -0.1] {
+  for bad in [f64::NAN, 1.5, -0.1] {
     for (name, run) in builtin_policies() {
       let got = run(&embeddings, &[bad], 2);
       assert!(
@@ -1131,7 +1260,7 @@ fn kind_into_policy_matches_builtin() {
   let fine = 1.0 - libm::ldexp(1.0, -30);
   assert_eq!(fine as f32, 1.0, "no f32 is nearer to this alpha than 1.0");
   let raw: [&[f64]; 3] = [&[0.0, 1.0], &[0.0, 1.0], &[1.0, 0.0]];
-  let cov = [1.0f32; 3];
+  let cov = [1.0f64; 3];
   let via_kind = AggregatePolicyKind::Ema { alpha: fine }
     .into_policy()
     .aggregate_values(&raw, &cov, 2)

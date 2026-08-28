@@ -106,9 +106,32 @@ impl Span {
   ///
   /// Both constructors enforce `0 < len <= window` in every build, so the
   /// denominator is positive and the quotient is finite.
+  ///
+  /// # The fraction is a weight, so it is `f64`
+  ///
+  /// This is not a report a caller merely reads: it is what the
+  /// `CoverageWeightedMean` aggregation policy multiplies an embedding by, in
+  /// the `f64` domain every shipped scalar computes in (named rather than
+  /// linked — that policy sits behind `alloc` and this tier is featureless). A
+  /// weight resolved more coarsely than the arithmetic it drives loses two
+  /// distinct things, and this fraction lost both while it was `f32`:
+  ///
+  /// - **The operands rounded before the division.** `f32` represents every
+  ///   integer only to `2^24`; `f64` to `2^53`. A window of `2^24 + 1` narrowed
+  ///   to `2^24`, so a tail one element short of it divided out to exactly `1.0`
+  ///   and a ragged tail was indistinguishable from a full window.
+  /// - **The quotient was rounded to the `f32` grid.** That grid is `2^-24`
+  ///   apart relatively where the fold rounds at `2^-53`, so two window
+  ///   geometries whose true coverages differ by less than an `f32` ulp — as
+  ///   `8388607/16777213` and `8388608/16777215` do, by `3.6e-15` — arrived at
+  ///   an `f64` fold as one weight.
+  ///
+  /// `f64` moves the first rounding out to `2^53` and the second to the fold's
+  /// own `2^-53`; a plan whose window exceeds `2^53` elements rounds again, and
+  /// there is no wider domain to move it to.
   #[must_use]
-  pub fn coverage(&self) -> f32 {
-    self.len as f32 / self.window as f32
+  pub fn coverage(&self) -> f64 {
+    self.len as f64 / self.window as f64
   }
 }
 

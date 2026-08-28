@@ -9,21 +9,42 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## 0.3.0
 
 One new smoother — the streaming sibling of an aggregation policy that already
-existed — and **one breaking change the two of them share**: an EMA smoothing
-factor is now the compute scalar itself rather than an `f32` widened into it.
-The new smoother was written with the defect, the aggregation policy has carried
-it since `0.2.0`, and both are fixed here rather than one now and one at a
-later major.
+existed — and **two breaking changes of one class**: a number the fold multiplies
+by must not be resolved more coarsely than the fold. An EMA smoothing factor is
+now the compute scalar itself rather than an `f32` widened into it, and a window
+coverage is `f64` rather than `f32` from `Span::coverage` all the way to the
+weight. The new smoother was written with the first defect, the aggregation
+policy has carried it since `0.2.0`, and the coverage channel has carried the
+second since `0.1.0`; all of it is fixed here rather than a piece now and a piece
+at a later major.
 
-`cargo semver-checks` does **not** report this break, and that is worth stating
-plainly rather than leaning on: forced to evaluate the change as a *patch* it
-returns `223 checks: 223 pass` and `no semver update required`. It models items
-appearing and disappearing, and nothing here disappears — a type parameter with a
-default keeps `EmaRenormalized` nameable — while a changed *parameter* type and a
-changed public *field* type have no lint at all. Its verdict is evidence about
+**The two breaks have different audiences, and are listed separately below.** The
+coefficient change breaks no downstream implementor — it reaches callers as a
+silently different number. The coverage change alters the signature of an
+*object-safe trait method*, so **every downstream `AggregatePolicy` stops
+compiling**, and it moves `CoverageWeightedMean`'s output for every caller: a
+second re-measure in one release.
+
+`cargo semver-checks` reports **neither** break, and that is worth stating plainly
+rather than leaning on: forced to evaluate the release as a *patch* against
+`0.2.0` it returns `223 checks: 223 pass, 30 skip` and `no semver update
+required`, exit `0`. It models items appearing and disappearing, and nothing here
+disappears. A type parameter with a default keeps `EmaRenormalized` nameable; a
+trait method that keeps its name and arity is still present whatever its
+parameter types are; a public method that keeps its name is still present
+whatever it returns; and a supertrait added to a sealed trait is invisible.
+Changed *parameter* types, changed *return* types, changed public *field* types,
+and added supertraits have no lint at all between them.
+
+That last point settles a question this release opened. When only the coefficient
+had moved it was reasonable to suppose the tool was silent because a changed
+*field* type is an unusual thing to lint, and that a changed *method signature*
+on a public trait would be a different story. It is not: the same run, with
+`Span::coverage`'s return type and `AggregatePolicy::aggregate_values`'s parameter
+type both changed, still passes every check. The tool's verdict is evidence about
 its own coverage, not about this release.
 
-The break was verified the only way it can be, by compiling a `0.2.0`-shaped
+Both breaks were verified the only way they can be, by compiling a `0.2.0`-shaped
 consumer against this crate:
 
 - `EmaRenormalized::new(cfg_alpha)` with `cfg_alpha: f32` fails with
@@ -33,6 +54,18 @@ consumer against this crate:
   `[0.9664376833865183, 0.2569011563432517]` here, while
   `EmaRenormalized::new(f64::from(0.3f32))` reproduces the `0.2.0` vector bit
   for bit.
+- A custom `impl AggregatePolicy for FirstWindow` taking `_coverages: &[f32]`
+  fails with ``method `aggregate_values` has an incompatible type for trait``,
+  quoting `expected signature fn(&FirstWindow, &[&[f64]], &[f64], _) -> _`
+  against `found signature fn(&FirstWindow, &[&[f64]], &[f32], _) -> _`.
+- A four-window plan (`WindowOptions::new(3)` over `10` elements: three full
+  windows and a one-element ragged tail) aggregated with `CoverageWeightedMean`
+  returns `[0.9938837343123988, 0.11043152932582692]` at `0.2.0` and
+  `[0.993883734673619, 0.11043152607484655]` here. The coefficient work earlier
+  in this release does not move that fixture: `Span::coverage` and
+  `CoverageWeightedMean`'s weight are byte-identical between `0.2.0` and the
+  point in this release where the coverage widening lands, so `0.2.0` and
+  "before this change" are the same baseline for it.
 
 ### Breaking
 
@@ -76,20 +109,117 @@ consumer against this crate:
     configuration files are unaffected — but a configured `0.3` that used to
     round through `f32` now reaches the fold at full `f64` precision, which is
     the same re-measure as above.
-  - A custom `impl AggregatePolicy for MyPolicy` is untouched: the trait, its
-    method signature, and the `f32` coverage slice are all unchanged.
+  - A custom `impl AggregatePolicy for MyPolicy` is untouched **by this break** —
+    it changes no trait and no signature. The coverage break below does touch it.
 
-- **`scalar::Real` gains `from_f64` and a `'static` bound.** The trait is sealed,
-  so no downstream impl can break and both are additive for callers. `from_f64`
-  widens an `f64` configuration value into the compute domain (the identity for
-  `f64`), and is how `AggregatePolicyKind::into_policy` reaches a generic `C`
-  from a wire type read before any compute scalar exists. `'static` is a fact
+- **`plan::Span::coverage` returns `f64`, and
+  `aggregate::AggregatePolicy::aggregate_values` takes `coverages: &[f64]`.**
+
+  ```text
+  0.2.0:  pub fn coverage(&self) -> f32
+          fn aggregate_values(&self, embeddings: &[&[C]], coverages: &[f32], dim: usize)
+              -> Result<Vec<C>, WinditError>
+
+  0.3.0:  pub fn coverage(&self) -> f64
+          fn aggregate_values(&self, embeddings: &[&[C]], coverages: &[f64], dim: usize)
+              -> Result<Vec<C>, WinditError>
+  ```
+
+  This is the same defect as the coefficient above wearing a different
+  provenance. A coverage was typed by where it came from — a window-geometry
+  fraction rather than an embedding value, therefore `f32` — when what types a
+  number is **what it multiplies**. `CoverageWeightedMean` multiplies an
+  embedding by it, inside an `f64` fold, and computing it in `f32` from two
+  `usize`s cost two distinct things:
+
+  - **The operands rounded before the division.** `f32` holds every integer only
+    to `2^24`. A window of `16_777_217` narrowed to `16_777_216`, so a tail one
+    element short of it divided out to exactly `1.0` — a ragged tail
+    indistinguishable from a full window, in a crate whose front page asserts
+    `spans[2].coverage() < 1.0`.
+  - **The quotient landed on the `f32` grid**, `2^-24` apart relatively where the
+    fold rounds at `2^-53`. Spans `(len 8388607, window 16777213)` and
+    `(len 8388608, window 16777215)` — every operand exactly representable in
+    `f32`, so nothing rounded going in — have true coverages `3.6e-15` apart, 32
+    `f64` ulps and about `6e-8` of an `f32` ulp. Both arrived at the fold as
+    `0.50000006`, and two different windows weighed the same. Each defect has a
+    falsifier in the suite.
+
+  **What a custom policy's diff is.** One character, and the compiler points at
+  it. Nothing else about an implementor changes — not the trait, not its name,
+  not its arity, not the compute-scalar type parameter:
+
+  ```diff
+   impl AggregatePolicy for FirstWindow {
+     fn aggregate_values(
+       &self,
+       embeddings: &[&[f64]],
+  -    _coverages: &[f32],
+  +    _coverages: &[f64],
+       dim: usize,
+     ) -> Result<Vec<f64>, WinditError> {
+  ```
+
+  A policy that only length-checks the slice, as most do, stops there. A policy
+  that *reads* it drops whatever widening it was doing: `C::from_f32(coverages[i])`
+  becomes `C::from_f64(coverages[i])`, and a policy already computing in `f64`
+  drops the call entirely. A policy that *builds* a coverage slice to hand to
+  `aggregate_values` retypes its literals; `[1.0_f32; n]` becomes `[1.0; n]`.
+
+  **What an existing caller's numbers do.** They move — this is the release's
+  second re-measure, and unlike the first there is no source edit that opts out
+  of it, because the coverage is derived by the planner rather than configured by
+  the caller. A one-element ragged tail in a window of three is the commonest
+  ragged geometry there is, and its coverage goes from `0.3333333432674408`
+  (`1/3` rounded through `f32`) to `0.3333333333333333`: a relative move of
+  `3.0e-8`, the **eighth significant digit**, exactly the size of the
+  coefficient change above. Through a whole aggregation the move survives at the
+  same order. The four-window fold quoted earlier returns
+
+  ```text
+  0.2.0:  [0.9938837343123988,  0.11043152932582692]
+  0.3.0:  [0.993883734673619,   0.11043152607484655]
+  ```
+
+  — a relative change of `3.6e-10` in the dominant component (10th significant
+  digit) and `2.9e-8` in the one the tail weight actually steers (8th). Anyone
+  who has pinned an aggregate bit-for-bit, or tuned a similarity threshold
+  against one, should **re-measure rather than recompile**. Callers whose plans
+  have no ragged tail are unaffected: a full window's coverage is exactly `1.0`
+  in both widths.
+
+  **One consequence in the input domain.** The accepted range is unchanged in
+  words — a coverage must still be a finite fraction in `[0, 1]` — but `f64`
+  reaches `2^-1074` where `f32` stopped at `2^-149`, and that bound was doing
+  quiet work: it kept `CoverageWeightedMean`'s weight bounded below, so its
+  products were guaranteed normal. It no longer is, and the policy joins
+  `EmaRenormalized` in the regime the determinacy gate's `MIN_GATE_THRESHOLD`
+  floor decides — a fold whose whole mass sits under the floor is `NonFinite`
+  rather than a direction manufactured out of subnormals. The `aggregate` path
+  cannot reach it (`Span::coverage` is `len / window` with `len >= 1`, so at
+  least `1 / usize::MAX`); only a caller assembling its own coverage slice for
+  `aggregate_values` can. The module's Input domain note now says which policies
+  the domain bounds below and which it does not, and a test pins the boundary.
+
+- **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
+  supertrait.** The trait is sealed, so no downstream impl can break and all
+  three are additive for callers. `from_f64` widens an `f64` value the fold will
+  multiply an embedding by — an EMA smoothing factor, a `Span::coverage`, or the
+  wire alpha `AggregatePolicyKind::into_policy` reads before any compute scalar
+  exists — into the compute domain (the identity for `f64`). `'static` is a fact
   about every implementor — an owned, borrow-free arithmetic type — spelled so
   that `Box<dyn AggregatePolicy<C>>` needs no re-declaration at each use site.
+  `Debug` is a fact about every implementor too (they are core floats), and it is
+  what lets `smooth::VectorEmaState`'s hand-written `Debug` report the
+  coefficient it was configured with: without it a `ComputeOf<E>` could not be
+  formatted at all, so the impl could only describe buffer shapes. It still
+  describes the buffers by shape rather than dumping one component per embedding
+  dimension — that part was a choice, not the missing bound.
 
-- **`Real::from_f32` keeps its job and loses a claim.** It still widens a
-  `Span::coverage` and the determinacy gate's own constant; it is no longer how a
-  smoothing factor arrives, and its documentation no longer says it is.
+- **`Real::from_f32` is down to one job.** It widens the determinacy gate's own
+  dimensionless constant, and nothing else: a smoothing factor stopped arriving
+  through it, and so did a `Span::coverage`. Nothing the fold multiplies an
+  embedding by is resolved at `f32` any more, and its documentation says so.
 
 ### Source compatibility
 
