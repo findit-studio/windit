@@ -22,8 +22,17 @@ at a later major.
 coefficient change breaks no downstream implementor — it reaches callers as a
 silently different number. The coverage change alters the signature of an
 *object-safe trait method*, so **every downstream `AggregatePolicy` stops
-compiling**, and it moves `CoverageWeightedMean`'s output for every caller: a
-second re-measure in one release.
+compiling**, and it moves `CoverageWeightedMean`'s output for every caller.
+
+**Three numeric re-measures, not two.** Reviewing the coverage change turned up
+two more defects it had inherited rather than introduced, both fixed here and
+both listed below with measured numbers. `Span::coverage` was rounding each
+`usize` into an `f64` *before* dividing — a defect of the operands, not of the
+width, so widening had only moved the first geometry that shows it from `2^24 + 1`
+to `2^53 + 1`. And `CoverageWeightedMean` was reading the *scale* of a coverage
+slice, which a normalized weighted mean has no business reading; the first
+attempt to bound that scale with the determinacy gate's absolute floor was
+itself wrong and is reverted.
 
 `cargo semver-checks` reports **neither** break, and that is worth stating plainly
 rather than leaning on: forced to evaluate the release as a *patch* against
@@ -188,18 +197,116 @@ consumer against this crate:
   have no ragged tail are unaffected: a full window's coverage is exactly `1.0`
   in both widths.
 
-  **One consequence in the input domain.** The accepted range is unchanged in
-  words — a coverage must still be a finite fraction in `[0, 1]` — but `f64`
-  reaches `2^-1074` where `f32` stopped at `2^-149`, and that bound was doing
-  quiet work: it kept `CoverageWeightedMean`'s weight bounded below, so its
-  products were guaranteed normal. It no longer is, and the policy joins
-  `EmaRenormalized` in the regime the determinacy gate's `MIN_GATE_THRESHOLD`
-  floor decides — a fold whose whole mass sits under the floor is `NonFinite`
-  rather than a direction manufactured out of subnormals. The `aggregate` path
-  cannot reach it (`Span::coverage` is `len / window` with `len >= 1`, so at
-  least `1 / usize::MAX`); only a caller assembling its own coverage slice for
-  `aggregate_values` can. The module's Input domain note now says which policies
-  the domain bounds below and which it does not, and a test pins the boundary.
+  **One consequence in the input domain, and it was first answered wrongly.** The
+  accepted range is unchanged in words — a coverage must still be a finite
+  fraction in `[0, 1]` — but `f64` reaches `2^-1074` where `f32` stopped at
+  `2^-149`, and that bound had been doing quiet work: it kept
+  `CoverageWeightedMean`'s weight bounded below, so its products were guaranteed
+  normal. The first answer to that was to extend the determinacy gate's absolute
+  `MIN_GATE_THRESHOLD` floor to this policy, so that a fold whose whole mass sat
+  under `2^-1000` came back `NonFinite`. **That was wrong, and it is reverted
+  below.** One window `[1.0]` at the perfectly valid coverage `2^-1001` produces
+  the exact normal value `[2^-1001]` — one term, no cancellation, finite,
+  nonzero, safely normalizable — and it was rejected, while the same fold at
+  coverage `1.0` returned `[1.0]`. An absolute floor is sound against a *norm*
+  carried in the embedding's units, which the input domain bounds below; it says
+  nothing about a dimensionless *weight*, whose scale the caller sets. See
+  **Coverage weights are normalized** below for the fix and the property it
+  establishes.
+
+- **`plan::Span::coverage` is the correctly rounded ratio, not a division of two
+  rounded operands.** *(A third re-measure, and the narrowest of the three.)*
+
+  Widening the quotient to `f64` fixed one of the two `f32` defects above and
+  only looked like it fixed the other. Rounding each `usize` into an `f64`
+  *before* dividing is not a fault of the width: `f64` holds every integer only
+  to `2^53`, so `WindowPlan::spans(&WindowOptions::new(2^53 + 1), 2^53)` — one
+  span, one allocation, no hand-built `Span` — cast both counts to the same `f64`
+  and returned exactly `1.0` for a tail one element short of its window. The same
+  falsifier that caught it at `2^24 + 1` catches it at `2^53 + 1`:
+
+  ```text
+  before  Span::new(0, 2^53, 2^53 + 1).coverage() == 1.0
+  after   Span::new(0, 2^53, 2^53 + 1).coverage() == 0.9999999999999999
+                                                    (0x3fef_ffff_ffff_ffff)
+  ```
+
+  The quotient is now formed from the integers themselves and is the correctly
+  rounded value of the exact rational `len / window` — checked against CPython's
+  unbounded-rational `float(Fraction(len, window))` for ten geometries past
+  `2^53`, and against the exact-operand `f64` division over a 2485-geometry sweep
+  scaled onto the integer path. **Where `window <= 2^53` nothing moves at all**:
+  both counts are exact `f64`s there, so IEEE division already *was* the
+  correctly rounded ratio, and that branch is the same one instruction it always
+  was — every geometry a 32-bit target can express included.
+
+  **The saturation is now defined rather than emergent.** Above `2^54` a window
+  can be ragged by so little that the true ratio is within half an ulp of `1.0`
+  and correct rounding would land there. Those saturate *downwards*, to
+  `1 - 2^-53`, the largest `f64` below one:
+
+  ```text
+  Span::new(0, 2^54 - 1, 2^54).coverage()
+    true ratio          1 - 2^-54   the midpoint, which ties to 1.0
+    correctly rounded   1.0
+    returned            0.9999999999999999   (0x3fef_ffff_ffff_ffff)
+  ```
+
+  so that **`coverage() == 1.0` if and only if `len == window`**, at every
+  geometry rather than at the ones `f64` happens to resolve. The under-report is
+  at most one ulp and never claims coverage a span does not have.
+
+- **`aggregate::CoverageWeightedMean` normalizes its weights by the largest
+  coverage.** *(The third change to a fold's output in this release, and the
+  widest of the three.)*
+
+  A normalized weighted mean's weights are defined only up to a common positive
+  factor: `sum_i (s * c_i) * e_i` is `s * sum_i c_i * e_i`, and the
+  renormalization that ends the policy divides `s` back out. So multiplying every
+  coverage by a positive factor must leave the result unchanged — and it did not,
+  because the determinacy gate's absolute floor read a quantity the caller's scale
+  controls. The fold's weights are now `c_i / max_j c_j`, so the largest is
+  exactly `1.0` however the slice was scaled, and the property holds by
+  construction rather than by argument: scaling by an exact `s` leaves every
+  quotient's exact value untouched, and IEEE division is correctly rounded, so the
+  whole fold is bit-identical. A test pins it across `1.0`, `2^-1001`, and a
+  factor reaching the minimum `f64` subnormal.
+
+  **What moves.** Only slices with no full window — every plan that has one
+  divides by exactly `1.0`, which is the identity:
+
+  ```text
+  coverage slices containing 1.0     6095 of 6095 bit-identical
+  coverage slices without one       10777 of 14641 changed (73.6%)
+    largest displacement            3.5e-16  (about 1.6 ulp of a unit component)
+    largest per-component gap       21 ulp, on a component of 0.0130
+  ```
+
+  Through `aggregate` that regime is exactly one shape: a plan whose input is
+  shorter than a single window, so its only span is ragged. There the new result
+  is not merely different but *exactly right* — one window has nothing to weigh
+  against, so the answer is its own direction, and the old fold spent an ulp
+  multiplying by a coverage it was about to renormalize away:
+
+  ```text
+  aggregate(&CoverageWeightedMean, [Windowed([3, 4], Span::new(0, 2, 3))])
+    before  [0.6000000000000001, 0.8]
+    after   [0.6,                0.8]
+  ```
+
+  A direct `aggregate_values` caller sees the same size of move:
+  `[[1,0],[0,1]]` at coverages `[0.75, 0.25]` goes `[0.9486832980505138,
+  0.31622776601683794]` -> `[0.9486832980505138, 0.3162277660168379]`.
+
+  **And a rejection becomes an answer.** `[1.0]` at coverage `2^-1001` returned
+  `NonFinite` before this change and returns `[1.0]` now, as does the same fold
+  at the minimum subnormal `2^-1074`. The floor still decides a
+  `CoverageWeightedMean` verdict, but only where `EmaRenormalized` reaches it —
+  through an unbounded weight *ratio*, when the windows carrying the largest
+  coverages contribute no mass of their own — and never through a scale. The
+  module's Input domain note, `Real::MIN_AGG_MAGNITUDE`, and
+  `Real::MIN_GATE_THRESHOLD` all say so now; each had been rewritten to claim the
+  opposite.
 
 - **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
   supertrait.** The trait is sealed, so no downstream impl can break and all

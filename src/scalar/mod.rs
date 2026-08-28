@@ -159,15 +159,18 @@ pub trait Real:
   /// With [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) it bounds the input
   /// domain within which every intermediate of every built-in aggregation policy
   /// stays finite, and — for the policies whose weights the domain itself bounds
-  /// below (`MeanRenormalized`, `SaliencyWeighted`) — every nonzero intermediate
-  /// stays a normal value, with no overflow and no flush to a subnormal.
-  /// `EmaRenormalized`'s recency weights decay without limit, and
-  /// `CoverageWeightedMean`'s weight is a coverage the domain admits anywhere in
-  /// `[0, 1]`, so either can drive a product toward a subnormal; the determinacy
-  /// gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor keeps that
-  /// regime sound (see the `aggregate` module's Input domain note). A nonzero
-  /// component below this bound is rejected before any arithmetic. Every magnitude
-  /// an `f32`-storage embedding can produce sits far above it.
+  /// below (`MeanRenormalized` at the constant `1`, `SaliencyWeighted` at a norm
+  /// this bound itself puts at `2^-400`) — every nonzero intermediate stays a
+  /// normal value, with no overflow and no flush to a subnormal.
+  /// `EmaRenormalized` and `CoverageWeightedMean` are the two that reach below
+  /// it, and in neither is the cause a small weight *scale*: EMA's weights sum to
+  /// exactly `1` and a normalized coverage's largest is exactly `1`. It is the
+  /// *ratio* — EMA's recency factors decaying without limit, a coverage far below
+  /// the fullest window's — that drives a product toward a subnormal. The
+  /// determinacy gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor
+  /// keeps that regime sound (see the `aggregate` module's Input domain note). A
+  /// nonzero component below this bound is rejected before any arithmetic. Every
+  /// magnitude an `f32`-storage embedding can produce sits far above it.
   const MIN_AGG_MAGNITUDE: Self;
 
   /// The largest magnitude a nonzero input component may carry into aggregation
@@ -185,21 +188,27 @@ pub trait Real:
   /// The determinacy gate rejects a folded result whose norm is at or below
   /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD`, where `M`
   /// is the accumulated term-magnitude vector. The relative `16 * EPSILON * ||M||`
-  /// part underflows to zero once a weight the input domain does not bound below
-  /// drives the fold's products into the subnormal range, where per-term rounding
-  /// is absolute (at most `2^-1075`) rather than relative. This floor dominates
-  /// the largest residue such an exactly-cancelling fold can leave
+  /// part underflows to zero once an unbounded weight *ratio* drives the fold's
+  /// products into the subnormal range, where per-term rounding is absolute (at
+  /// most `2^-1075`) rather than relative. This floor dominates the largest
+  /// residue such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
   /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
-  /// domain-bounded weight can accumulate, so those verdicts are bit-for-bit
-  /// unchanged. It engages whenever the accumulated mass falls below about
+  /// fold whose heaviest window carries its own accumulates, so those verdicts
+  /// are bit-for-bit unchanged. It engages whenever the accumulated mass falls below about
   /// `2^-948`, including folds whose products are still normal — where it
   /// monotonically turns a sub-floor direction into `NonFinite` (an engagement
-  /// boundary a regression test pins). Reaching that needs `EmaRenormalized`'s
-  /// decaying recency weights or a caller-supplied coverage far below anything
-  /// `Span::coverage` produces; no realizable `f32` workload gets there. See the
-  /// `aggregate` module's Input domain note.
+  /// boundary a regression test pins).
+  ///
+  /// **This bound is absolute, so it is sound only against a quantity carried in
+  /// the embedding's own units** — the accumulator's norm and `M`, which the
+  /// input domain bounds below, and not a dimensionless *weight*, whose scale a
+  /// caller sets and which every policy divides back out. Reaching the regime
+  /// therefore takes an unbounded weight ratio: `EmaRenormalized`'s decaying
+  /// recency factors, or a `CoverageWeightedMean` fold whose fullest windows are
+  /// all zero. No realizable `f32` workload gets there. See the `aggregate`
+  /// module's Input domain note.
   const MIN_GATE_THRESHOLD: Self;
 
   /// Widen one of the determinacy gate's own dimensionless constants — the `16`
