@@ -6,6 +6,264 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.3.0
+
+One new smoother — the streaming sibling of an aggregation policy that already
+existed — and **one breaking change the two of them share**: an EMA smoothing
+factor is now the compute scalar itself rather than an `f32` widened into it.
+The new smoother was written with the defect, the aggregation policy has carried
+it since `0.2.0`, and both are fixed here rather than one now and one at a
+later major.
+
+`cargo semver-checks` does **not** report this break, and that is worth stating
+plainly rather than leaning on: forced to evaluate the change as a *patch* it
+returns `223 checks: 223 pass` and `no semver update required`. It models items
+appearing and disappearing, and nothing here disappears — a type parameter with a
+default keeps `EmaRenormalized` nameable — while a changed *parameter* type and a
+changed public *field* type have no lint at all. Its verdict is evidence about
+its own coverage, not about this release.
+
+The break was verified the only way it can be, by compiling a `0.2.0`-shaped
+consumer against this crate:
+
+- `EmaRenormalized::new(cfg_alpha)` with `cfg_alpha: f32` fails with
+  `the trait bound f32: Real is not satisfied`.
+- The same three-window fold at a bare `0.3` literal returns
+  `[0.9664376815532346, 0.2569011632398902]` at `0.2.0` and
+  `[0.9664376833865183, 0.2569011563432517]` here, while
+  `EmaRenormalized::new(f64::from(0.3f32))` reproduces the `0.2.0` vector bit
+  for bit.
+
+### Breaking
+
+- **`aggregate::EmaRenormalized` and `smooth::VectorEma` carry a `C: Real`
+  coefficient, defaulted to `f64`, instead of an `f32` one.**
+
+  ```text
+  0.2.0:  pub struct EmaRenormalized       { alpha: f32 }
+          pub const fn new(alpha: f32) -> Self
+          pub const fn alpha(&self) -> f32
+
+  0.3.0:  pub struct EmaRenormalized<C: Real = f64> { alpha: C }
+          pub const fn new(alpha: C) -> Self
+          pub const fn alpha(&self) -> C
+  ```
+
+  `VectorEma` is new in this release and takes the same shape. `smooth::Ema`,
+  `smooth::CadenceEma`, and the `segment` thresholds are **unchanged**, because
+  their value type really is `f32` and a coefficient should match what it
+  multiplies. What was wrong was a coefficient *narrower* than the arithmetic it
+  drives: `Real` has one implementor, `f64`, and every storage scalar computes in
+  it, so the EMA's weights, products and compensated sum were all `f64` around
+  one `f32` constant. No `f32` expresses `1 - 2^-30` — its nearest is exactly
+  `1.0`, which is a pass-through and not a slow filter — and the `f32` grid is
+  `2^-24` apart relatively where the fold rounds at `2^-53`.
+
+  **What a `0.2.x` caller edits.** Usually nothing, and that is the hazard:
+
+  - `EmaRenormalized::new(0.3)` still compiles — and now means a **different
+    number**. `0.3f32` widened to `0.30000001192092896`; `0.3f64` is
+    `0.29999999999999999`. The weights change in the eighth significant digit,
+    so for anyone who has pinned outputs bit-for-bit or tuned against a
+    threshold this is a **re-measure, not a recompile**. To keep the old
+    behaviour exactly, write `EmaRenormalized::new(f64::from(0.3f32))`; to take
+    the value you meant, change nothing.
+  - An `f32` *variable* — `EmaRenormalized::new(cfg.alpha)` where
+    `cfg.alpha: f32` — stops compiling, with `f32: Real` unsatisfied. That one
+    the compiler catches: write `f64::from(cfg.alpha)`.
+  - `AggregatePolicyKind::Ema { alpha }` keeps a concrete field, now `f64`. The
+    serde wire form is unchanged (a JSON number carries no width), so
+    configuration files are unaffected — but a configured `0.3` that used to
+    round through `f32` now reaches the fold at full `f64` precision, which is
+    the same re-measure as above.
+  - A custom `impl AggregatePolicy for MyPolicy` is untouched: the trait, its
+    method signature, and the `f32` coverage slice are all unchanged.
+
+- **`scalar::Real` gains `from_f64` and a `'static` bound.** The trait is sealed,
+  so no downstream impl can break and both are additive for callers. `from_f64`
+  widens an `f64` configuration value into the compute domain (the identity for
+  `f64`), and is how `AggregatePolicyKind::into_policy` reaches a generic `C`
+  from a wire type read before any compute scalar exists. `'static` is a fact
+  about every implementor — an owned, borrow-free arithmetic type — spelled so
+  that `Box<dyn AggregatePolicy<C>>` needs no re-declaration at each use site.
+
+- **`Real::from_f32` keeps its job and loses a claim.** It still widens a
+  `Span::coverage` and the determinacy gate's own constant; it is no longer how a
+  smoothing factor arrives, and its documentation no longer says it is.
+
+### Source compatibility
+
+The glob-collision note this release inherits still applies, since it also adds
+public names:
+
+- **Guaranteed.** The prelude is unchanged, so `use windit::prelude::*;`
+  resolves exactly as it did at `0.2.0`, including alongside a glob of the
+  dependent's own module that happens to export a `VectorEma`.
+- **Not guaranteed, and not guaranteeable by any release that adds a public
+  name.** A dependent that globs the *module* — `use windit::smooth::*;`
+  together with `use their_own::*;` where the other glob also supplies
+  `VectorEma` — compiles at `0.2.0` and fails here with `E0659`, reported at
+  the use site. Adding a public item anywhere carries that hazard; it is not
+  special to the prelude, which is why the paragraph below argues about
+  *exposure* rather than about safety. If your build globs `windit::smooth`,
+  check for the collision before taking this release.
+
+### Added
+
+- **`error::WinditError::EpochTooLong`**: a `VectorEma` epoch reached
+  `VectorEma::MAX_EPOCH_STEPS` charging steps, past which the determinacy gate's
+  error bound is no longer proven. `WinditError` is `#[non_exhaustive]`, so the
+  variant is additive; `cargo semver-checks` agrees.
+
+- **`smooth::VectorEma`** (and its state, `smooth::VectorEmaState`): a
+  component-wise exponential moving average over an *embedding*, L2-renormalized
+  at every window — the streaming, span-preserving sibling of
+  `aggregate::EmaRenormalized`. Where the aggregate folds a finished slice to one
+  point, this rewrites one window in / one window out with the input span intact,
+  so a per-window embedding stream can be denoised without being collapsed. That
+  was the one shape the crate could not express: `smooth` had only the `f32`
+  scalar low-passes, and a downstream `impl Smoother<TheirEmbedding>` is an
+  orphan impl.
+
+  It is generic over `windowed::Vector` — the carrier trait the aggregation half
+  already reads embeddings through — so a consumer's own embedding type flows
+  through `Windowed<E>` with no conversion at any window, and the crate gains no
+  new public trait. The accumulator is carried in the embedding's compute domain
+  (`ComputeOf<E>`, `f64` for every shipped scalar) and read through
+  `Vector::compute_components`, so quantized storage with no dequantization
+  override fails closed with `MissingDequantization` exactly as aggregation does.
+
+  The renormalization is applied to an emitted *copy*; the accumulator stays raw.
+  That is what makes window `i` emit the direction `EmaRenormalized` folds over
+  the prefix `[0..=i]`, and a differential test pins it at five smoothing factors
+  over every prefix and both storage widths. Renormalizing the accumulator in
+  place would be a different filter with different weights.
+
+  The equivalence is exact in exact arithmetic and **not bit-exact in
+  floating point**, and cannot be made so: the aggregate materializes each weight
+  and folds the prefix with Neumaier compensation, this carries a two-term
+  recurrence. What the tests establish across prefix lengths, smoothing factors
+  and storage widths is that determinate prefixes agree to within the sum of the
+  two error bounds and that neither side fabricates a direction out of
+  cancellation. **Near either threshold the verdicts can differ in *either*
+  direction**, and no ordering between the two thresholds is claimed: a
+  three-window prefix at `alpha = 0.3` is emitted by the aggregate and refused
+  here, and the exact-bit case `alpha = 0x3e99999a` over the one-dimensional
+  windows `0x3f0ca8ca28200000`, `0xbf20b7cb3226ac2d`, `0xbc2767b60c530643` puts
+  both accumulators on `0x3c0c160dbb1cff8d` with the two thresholds one ulp
+  apart the other way, so this side emits where the aggregate refuses. Both are
+  regression tests.
+
+  **The gate's contract is self-contained: it refuses when the accumulator is
+  within its own error bound of zero.** That is provable from this type's own
+  recurrence and says nothing about how another code path rounds; whether the
+  two siblings agree on a given prefix is measured, not promised. (An earlier
+  draft of this entry claimed this smoother was never the less conservative of
+  the two. The induction behind it compared against the mass an *ideal* fold
+  would accumulate, and `EmaRenormalized` rematerializes its weights instead —
+  so the ordering does not survive its actual roundings.) The gate keeps the
+  aggregate's shape, constant and absolute floor
+  (`16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`) and its scale-aware
+  renormalization is the aggregation half's own routine, but the mass `M` is the
+  recurrence's, which carries the damped rounding of every step rather than the
+  term magnitudes of one — the error a recurrence propagates is not the error a
+  fold commits.
+
+  A step that rounds nothing charges nothing: `alpha = 0` (an exact hold) and
+  `alpha = 1` (an exact pass-through) accumulate no mass at all. Without that
+  rule a held seed still charged `|s_0|` a push, so the threshold grew linearly
+  and reached the seed's own magnitude after `2^48` pushes, after which the gate
+  refused the hold forever. The mass does still grow at every other coefficient,
+  and the horizon where it would overtake a determinate accumulator
+  (`alpha < 2^-48`, upward of `2^48` pushes) is documented as reachable in
+  principle rather than argued away. The published error bound now carries the
+  absolute term the subnormal range needs — `|e_t| <= 2u * M_t + t * 2^-1074` —
+  since a purely relative bound is false there; the gate's `MIN_GATE_THRESHOLD`
+  floor dominates that term for every epoch with `t * sqrt(dim) <= 2^74`, so no
+  verdict ever turned on it. `alpha` clamps into `[0, 1]` at construction, NaN to `0.0`,
+  exactly as `smooth::Ema` does — the smoother idiom, not the aggregate's
+  deferred `AlphaOutOfRange`. The clamp is three comparisons rather than
+  `f64::clamp` (which propagates NaN, where `Real` offers ordering but no
+  `is_nan`), and that costs `VectorEma::new` its `const`: a trait method cannot
+  run in a `const fn`. `EmaRenormalized::new` stores without comparing and stays
+  `const`.
+
+  The coefficient is `C: Real` defaulted to `f64`, and the `SmoothPolicy` impl is
+  for `VectorEma<ComputeOf<E>>` — so the coefficient sits in the same domain as
+  the accumulator it multiplies by construction rather than by convention, while
+  `VectorEma::new(0.3)` still needs no turbofish. `MAX_EPOCH_STEPS` is stated on
+  `VectorEma<f64>` rather than on the generic impl: the horizon is derived from
+  the compute domain's own `EPSILON`, so a second `Real` would carry a different
+  number, and a `const` on the generic impl could not be reached through the bare
+  path `VectorEma::MAX_EPOCH_STEPS` (a type parameter's default does not apply to
+  an associated-item path).
+
+  **The epoch is bounded, because `M` is floating point too.**
+  `VectorEma::MAX_EPOCH_STEPS` (`2^50` charging steps) is enforced: the step that
+  would carry an epoch past it is refused with `WinditError::EpochTooLong`,
+  before the accumulator is touched, and so is every push after it until a
+  `reset`. `M` dominates the accumulator's error only while `M` itself is
+  accumulated faithfully, and its three roundings a step are to nearest, so the
+  computed mass can sit *below* the exact one: `M^_t >= (1 - u)^(2t + 1) * M^ex_t`,
+  which the gate's factor of sixteen absorbs only while
+  `(1 - u)^(2t + 1) >= 1/16` — about `2^53.4` charging steps. Past there the
+  guarantee fails, and demonstrably: at `alpha = 2^-54` the complement is exactly
+  `1`, so an accumulator of `2^-24` absorbs every `2^-78` injection while `M`,
+  charged exactly `2^-24` a step, reaches `2^29` after `2^53` steps and then
+  **stagnates** on the round-to-even tie. `2^60` such steps and then `2_129_920`
+  pushes of `-2^15` leave the exact recurrence at zero and the accumulator at
+  `-2^-18` against a threshold of `2^-19` — an emitted direction for a prefix
+  that exactly cancels, with the published `2u * M` bound broken by a factor of
+  32. Every input there is finite, in domain, and exactly representable, so the
+  regime is refused rather than assumed away, and the enforced `2^50` sits three
+  binary orders inside the proven range (and inside the subnormal term's `2^74`
+  reach). Only **charging** steps count, so `alpha = 0` and `alpha = 1` still
+  hold their seed for an unbounded epoch: the exact-step exemption above keeps
+  its liveness, rather than being undone at a further horizon.
+
+  Input domain: the aggregation one, unchanged (`aggregate`'s *Input domain*
+  note) — every component finite and either zero or between
+  `Real::MIN_AGG_MAGNITUDE` and `Real::MAX_AGG_MAGNITUDE`. The two-term
+  recurrence would not need it, but the determinacy gate's mass is an `n`-term
+  geometric fold over the epoch, which is exactly what that domain exists to keep
+  inside `f64`. No `f32`-storage embedding can reach the boundary; only an
+  `f64`-storage one can.
+
+  Errors, all raised before the accumulator is written so a refused push is a
+  no-op: `DimMismatch` for a width that changed mid-epoch, `NonFinite` for a
+  non-finite component (the scalar `Ema` absorbs one and poisons; this one
+  refuses it), `MagnitudeOutOfRange` for a component outside the domain above,
+  `Empty` for a zero-width embedding, `MissingDequantization` for raw
+  quantization codes, `EpochTooLong` for an epoch past `MAX_EPOCH_STEPS`, and
+  `AllocFailed` for a refused buffer. The one deliberate
+  exception is a window whose *output* fails the determinacy gate: it has still
+  advanced the accumulator, because it was a real observation and the prefix the
+  aggregate would fold includes it.
+
+  **Not re-exported from the prelude.** Adding a name to a glob prelude and
+  adding one to a module carry the same hazard — `E0659` at a downstream use
+  site where two globs both supply the name — so keeping it out of the prelude
+  buys *less* exposure, not safety, and the release note above no longer claims
+  otherwise. The difference is real all the same: `use windit::prelude::*;` is
+  the import this crate documents and asks every dependent to write, while
+  `use windit::smooth::*;` is suggested nowhere. Removing the larger exposure
+  costs a dependent one line, `use windit::smooth::VectorEma;`. Both breaks were
+  reproduced directly rather than argued from the language reference;
+  `cargo-semver-checks` passes either way, because it does not model downstream
+  glob resolution. Whether the name joins the prelude is a decision separate from
+  this release's coefficient change, and is not taken here. Unlike the three scalar smoothers it
+  gates on `alloc` rather than living in the featureless core tier: its state is
+  one accumulator component per embedding dimension, which is a heap buffer and
+  not the O(1) that tier admits. The buffers are grown on the first push of an
+  epoch and reused by every push after it; `reset` keeps their capacity, so a
+  discontinuity costs no allocation.
+
+### Documented
+
+- `Smoother::push`'s error note no longer implies that reading no spans makes a
+  stage infallible, and `SmoothPolicy::smooth`'s "none for the shipped built-ins"
+  is corrected. Both statements predate a fallible smoother existing.
+
 ## 0.2.0 - 2026-07-25
 
 The temporal half of the crate — smoothing, gating, segmentation — is rebuilt

@@ -1,7 +1,16 @@
 use std::{boxed::Box, vec, vec::Vec};
 
-use super::{cadence_alpha, CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother};
-use crate::{error::WinditError, plan::Span, windowed::Windowed};
+use super::{
+  cadence_alpha, CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother, VectorEma,
+  VectorEmaState,
+};
+use crate::{
+  aggregate::EmaRenormalized,
+  error::WinditError,
+  plan::Span,
+  test_support::{BareI8Emb, RawF64Emb, TestVec},
+  windowed::{Vector, Windowed},
+};
 
 /// The coefficient floor the accepted `tau` domain is built around: every
 /// accepted `tau` derives an `alpha` strictly above this at every `delta >= 1`.
@@ -2252,4 +2261,1721 @@ fn boxed_smoother_forwards_discontinuity_not_reset() {
     "Box must forward discontinuity explicitly, not via its own reset"
   );
   assert_eq!(boxed.resets, 1, "Box must forward reset");
+}
+
+// ---------------------------------------------------------------------------
+// VectorEma: the renormalizing, span-preserving sibling of the aggregation
+// half's `EmaRenormalized`.
+// ---------------------------------------------------------------------------
+
+/// One `Windowed<RawF64Emb>` covering a single element at `start`.
+///
+/// [`RawF64Emb`] rather than [`TestVec`] on purpose. Its `from_unnormalized`
+/// captures the compute-domain slice **verbatim** instead of normalizing it, so
+/// these tests read exactly what the smoother emitted. An embedding double that
+/// normalized in its own `from_unnormalized` would return a unit vector whether
+/// or not the smoother renormalized, and could not falsify the renormalization
+/// at all — the property that separates this type from a plain component-wise
+/// vector EMA would be untestable through it.
+fn vec_window(values: &[f64], start: usize) -> Windowed<RawF64Emb> {
+  Windowed::new(
+    RawF64Emb {
+      data: values.to_vec(),
+      captured: Vec::new(),
+    },
+    Span::new(start, 1, 1),
+  )
+}
+
+/// What a pushed window emitted, at full `f64` precision.
+fn emitted(w: &Windowed<RawF64Emb>) -> &[f64] {
+  &w.value.captured
+}
+
+/// The L2 norm, spelled independently of the crate's own scale-aware routine so
+/// a unit-norm assertion is not checked by the code it is checking.
+fn l2(v: &[f64]) -> f64 {
+  libm::sqrt(v.iter().map(|x| x * x).sum::<f64>())
+}
+
+#[test]
+fn vector_ema_renormalizes_every_window() {
+  // THE falsifier for "renormalized", the one property that separates this from
+  // a plain component-wise vector EMA. `[1, 0]` then `[0, 1]` at alpha 0.5
+  // leaves the accumulator at exactly `[0.5, 0.5]` — norm 2^-0.5, emphatically
+  // not 1 — so an emit that skipped the renormalization reads back as
+  // `[0.5, 0.5]` here and both assertions below fail. Non-vacuous by
+  // construction: the seed at index 0 is already unit-norm, so only the second
+  // window can distinguish the two implementations, and it is the one asserted.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let first = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let second = s.push(vec_window(&[0.0, 1.0], 1)).unwrap();
+
+  // One ulp below `core::f64::consts::FRAC_1_SQRT_2`, and pinned as the
+  // division rather than as the constant because that is what the arithmetic
+  // is: renormalization divides by the norm, and `1.0 / sqrt(2)` is not the
+  // correctly rounded `1/sqrt(2)`.
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(
+    emitted(&first),
+    &[1.0, 0.0],
+    "the seed emits its own unit direction"
+  );
+  assert_eq!(
+    emitted(&second),
+    &[want, want],
+    "the accumulator is [0.5, 0.5]; the emitted window must be its direction"
+  );
+  // Restated as the norm, so a failure names the property rather than only the
+  // golden: an unrenormalized emit has norm 2^-0.5.
+  let norm = l2(emitted(&second));
+  assert!(
+    (norm - 1.0).abs() <= f64::EPSILON,
+    "emitted window must be unit-norm, got {norm}"
+  );
+}
+
+#[test]
+fn vector_ema_seeds_the_accumulator_with_the_first_window() {
+  // `s_0 = x_0`, not `alpha * x_0` and not a zero start. At `alpha = 0` the
+  // accumulator can never move, so every later window must still emit the FIRST
+  // window's direction however far the input has travelled — and an
+  // accumulator that started at zero would stay at zero and be gated as
+  // indeterminate instead of emitting anything at all.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  for (i, x) in [[3.0, 4.0], [0.0, -1.0], [-5.0, 12.0]].iter().enumerate() {
+    let out = s.push(vec_window(x, i)).unwrap();
+    assert_eq!(
+      emitted(&out),
+      &[0.6, 0.8],
+      "alpha 0 holds the seed direction at window {i}"
+    );
+  }
+
+  // The other endpoint: at `alpha = 1` the accumulator IS the input, so every
+  // window emits its own direction. Together the two pin the clamp's ends
+  // behaviourally rather than only through the `alpha()` accessor.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(1.0));
+  assert_eq!(
+    emitted(&s.push(vec_window(&[3.0, 4.0], 0)).unwrap()),
+    &[0.6, 0.8]
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, -2.0], 1)).unwrap()),
+    &[0.0, -1.0]
+  );
+}
+
+#[test]
+fn vector_ema_reset_and_discontinuity_reseed_the_accumulator() {
+  // Both return the smoother to `s_0 = x_0`: the window after the break emits
+  // its own direction, not the recurrence against the pre-break accumulator.
+  // Without the re-seed the third push would mix `[0, 1]` into the retained
+  // `[0.5, 0.5]`, giving `[0.25, 0.75]` — direction `[0.316…, 0.948…]`, which
+  // is neither `[0, 1]` nor within any tolerance of it.
+  for reseed in [Smoother::reset, Smoother::discontinuity] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+    let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+    let _ = s.push(vec_window(&[0.0, 1.0], 1)).unwrap();
+    reseed(&mut s);
+    let after = s.push(vec_window(&[0.0, 4.0], 2)).unwrap();
+    assert_eq!(
+      emitted(&after),
+      &[0.0, 1.0],
+      "a re-seed must restore s_0 = x_0"
+    );
+  }
+}
+
+#[test]
+fn vector_ema_preserves_spans_and_batch_equals_streaming() {
+  // Deliberately irregular spans (0, 5, 11) with a window wider than one
+  // element: a stage that regenerated spans instead of carrying the input's
+  // would have to reproduce this exact sequence by accident.
+  let input = vec![
+    Windowed::new(
+      RawF64Emb {
+        data: vec![1.0, 0.0, 0.0],
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: vec![0.0, 1.0, 0.0],
+        captured: Vec::new(),
+      },
+      Span::new(5, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: vec![0.0, 0.0, 1.0],
+        captured: Vec::new(),
+      },
+      Span::new(11, 2, 4),
+    ),
+  ];
+  let batch = VectorEma::new(0.4).smooth(&input).unwrap();
+  assert_eq!(
+    batch.iter().map(|w| w.span).collect::<Vec<_>>(),
+    input.iter().map(|w| w.span).collect::<Vec<_>>(),
+    "spans must survive the rewrite untouched"
+  );
+
+  // The batch method IS a fresh smoother driven over the slice, so the two must
+  // agree component for component.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.4));
+  let streamed: Vec<Windowed<RawF64Emb>> =
+    input.iter().map(|w| s.push(w.clone()).unwrap()).collect();
+  for (b, t) in batch.iter().zip(&streamed) {
+    assert_eq!(emitted(b), emitted(t));
+    assert_eq!(b.span, t.span);
+  }
+  // Non-vacuity: the sequence genuinely mixes, so the three outputs differ from
+  // each other and from the inputs.
+  assert_ne!(emitted(&batch[1]), &[0.0, 1.0, 0.0]);
+  assert_ne!(emitted(&batch[1]), emitted(&batch[2]));
+}
+
+#[test]
+fn vector_ema_rejects_a_width_change_and_leaves_the_accumulator_unchanged() {
+  // The first push fixes the epoch's dimension; a later window of another width
+  // has no component to mix into and is refused.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0, 0.0], 1)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 3,
+      expected: 2
+    }
+  );
+  assert_eq!(
+    s.push(vec_window(&[1.0], 2)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 1,
+      expected: 2
+    }
+  );
+
+  // Checked BEFORE any component is written, so the two refused pushes are
+  // no-ops: the next in-width window emits exactly what it would have emitted
+  // had they never happened. Without this assertion a guard that rejected only
+  // after mutating the accumulator would still pass.
+  let want = 1.0 / libm::sqrt(2.0);
+  let after = s.push(vec_window(&[0.0, 1.0], 3)).unwrap();
+  assert_eq!(emitted(&after), &[want, want]);
+}
+
+#[test]
+fn vector_ema_rejects_a_zero_width_window() {
+  // A zero-dimension embedding is structurally empty rather than
+  // direction-less, so it reports `Empty` — and refusing it is what keeps an
+  // epoch from "seeding" with an accumulator that is still empty, which is
+  // exactly the unseeded state.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(s.push(vec_window(&[], 0)).unwrap_err(), WinditError::Empty);
+  // Still unseeded: the next window seeds the epoch itself.
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 3.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_new_clamps_alpha_into_range() {
+  assert_eq!(VectorEma::new(2.0).alpha(), 1.0);
+  assert_eq!(VectorEma::new(f64::INFINITY).alpha(), 1.0);
+  assert_eq!(VectorEma::new(-1.0).alpha(), 0.0);
+  assert_eq!(VectorEma::new(f64::NEG_INFINITY).alpha(), 0.0);
+  assert_eq!(VectorEma::new(f64::NAN).alpha(), 0.0);
+  assert_eq!(VectorEma::new(0.25).alpha(), 0.25);
+  // The coefficient is the compute domain itself, so a value no `f32` can hold
+  // survives the clamp untouched rather than being rounded to a neighbour.
+  let fine = 1.0 - libm::ldexp(1.0, -30);
+  assert_eq!(VectorEma::new(fine).alpha(), fine);
+
+  // The re-clamp inside `smoother()` is unreachable through `new`, exactly as
+  // `Ema`'s is, so it is exercised the only way it can be: by building the
+  // config through its private field, which this module can do and downstream
+  // cannot. Without it a future construction path that bypassed `new` (a serde
+  // derive, say) would hand the recurrence a NaN coefficient.
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: f64::NAN }.smoother();
+  assert_eq!(bypassed.alpha, 0.0);
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: 4.0 }.smoother();
+  assert_eq!(bypassed.alpha, 1.0);
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: -4.0 }.smoother();
+  assert_eq!(bypassed.alpha, 0.0);
+}
+
+#[test]
+fn vector_ema_carries_a_coefficient_no_f32_can_hold() {
+  // FALSIFIER for the coefficient's precision. Everything this recurrence
+  // multiplies is `ComputeOf<E>` — `f64` for every shipped scalar, `f32` not
+  // being a `Real` at all — so a coefficient narrower than the arithmetic
+  // cannot express the filters that arithmetic can carry.
+  //
+  // `1 - 2^-30` is the witness. The `f32` grid immediately below `1` is spaced
+  // `2^-24`, so the nearest `f32` to this value is exactly `1.0`: an `f32`
+  // coefficient does not approximate this filter, it deletes it. A
+  // near-pass-through that still retains `2^-30` of the accumulator becomes an
+  // exact pass-through that retains nothing — and, `alpha == 1` being an exact
+  // step, one that charges no mass and never advances the epoch either.
+  let two_m30 = libm::ldexp(1.0, -30);
+  const ALPHA: f64 = 0.999_999_999_068_677_425_384_521_484_375; // 1 - 2^-30
+  assert_eq!(ALPHA, 1.0 - two_m30, "the literal is exactly 1 - 2^-30");
+  assert_ne!(ALPHA, 1.0, "in f64 the coefficient is below 1");
+  assert_eq!(
+    ALPHA as f32, 1.0,
+    "and no f32 is nearer to it than 1.0 itself"
+  );
+
+  let cfg = VectorEma::new(ALPHA);
+  assert_eq!(cfg.alpha(), ALPHA, "construction must not round it away");
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&cfg);
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("seed");
+  let got = s.push(vec_window(&[0.0, 1.0], 1)).expect("second window");
+  let got = emitted(&got).to_vec();
+
+  // `1 - alpha` is exact by Sterbenz, so the accumulator is exactly
+  // `[2^-30, 1 - 2^-30]` and the retained component is the whole of what an
+  // `f32` coefficient destroys.
+  assert_eq!(
+    s.state,
+    vec![two_m30, ALPHA],
+    "the accumulator must keep 2^-30 of the seed"
+  );
+  assert!(
+    got[0] > 0.0,
+    "the retained component must survive renormalization: {got:?}"
+  );
+  assert!(
+    (got[0] / two_m30 - 1.0).abs() < 1e-9,
+    "and it must be the coefficient's own 2^-30: {got:?}"
+  );
+  assert_eq!(
+    s.steps, 1,
+    "a coefficient below 1 rounds, so the step charges"
+  );
+
+  // The other side of the same input, so the difference is measured rather than
+  // asserted: at the alpha an `f32` would have rounded this to, the emitted
+  // direction is the input window exactly, the accumulator keeps nothing, and
+  // the epoch never advances.
+  let mut collapsed = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(1.0));
+  collapsed.push(vec_window(&[1.0, 0.0], 0)).expect("seed");
+  let flat = collapsed
+    .push(vec_window(&[0.0, 1.0], 1))
+    .expect("second window");
+  assert_eq!(emitted(&flat), &[0.0, 1.0]);
+  assert_eq!(collapsed.state, vec![0.0, 1.0]);
+  assert_eq!(collapsed.steps, 0, "an exact pass-through charges nothing");
+}
+
+#[test]
+fn vector_ema_resolves_two_coefficients_the_f32_grid_merges() {
+  // The tunable's resolution, which is the other half of the same defect:
+  // adjacent `f32` coefficients are `2^-24` apart relatively, while the
+  // recurrence they drive rounds at `2^-53`. `0.3` and the nearest `f32` to it
+  // are two distinct `f64` coefficients that an `f32` field cannot tell apart —
+  // it stores the same bits for both — and they filter differently.
+  let exact = 0.3_f64;
+  let via_f32 = f64::from(0.3_f32);
+  assert_ne!(exact, via_f32, "the two coefficients differ in f64");
+  assert_eq!(exact as f32, via_f32 as f32, "and coincide in f32");
+
+  let run = |alpha: f64| {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    s.push(vec_window(&[1.0, 0.0], 0)).expect("seed");
+    emitted(&s.push(vec_window(&[0.0, 1.0], 1)).expect("second")).to_vec()
+  };
+  let a = run(exact);
+  let b = run(via_f32);
+  assert_ne!(a, b, "two coefficients, two filters");
+  // Non-vacuity: the gap is the coefficients' own, ~1.2e-8 relative, not noise.
+  let gap = (a[0] - b[0]).abs() / a[0];
+  assert!(
+    (1e-9..1e-7).contains(&gap),
+    "the separation must be the coefficient's own, got {gap:e}"
+  );
+}
+
+#[test]
+fn vector_ema_nan_alpha_holds_the_seed_rather_than_poisoning_the_stream() {
+  // A NaN `alpha` clamps to 0.0 — hold the seed — rather than propagating. It
+  // matters that this is asserted through a *second* push: a NaN coefficient
+  // would make the accumulator all-NaN, whose largest magnitude is zero, so the
+  // determinacy gate would reject it and this would be `Err(NonFinite)` rather
+  // than a wrong value.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(f64::NAN));
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 2.0], 0)).unwrap()),
+    &[0.0, 1.0]
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[7.0, 0.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_rejects_a_non_finite_window_and_leaves_the_accumulator_unchanged() {
+  // Unlike the scalar `Ema`, which documents a non-finite input poisoning its
+  // state until a reset, a non-finite component is refused here before the
+  // accumulator is touched.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for bad in [
+    [f64::NAN, 0.0],
+    [0.0, f64::INFINITY],
+    [f64::NEG_INFINITY, 1.0],
+  ] {
+    assert_eq!(
+      s.push(vec_window(&bad, 1)).unwrap_err(),
+      WinditError::NonFinite
+    );
+  }
+  // The epoch is intact: the next finite window sees the seed, not a poisoned
+  // accumulator. Drop the finiteness guard and the accumulator is NaN here, the
+  // gate rejects it, and this `unwrap` panics.
+  let want = 1.0 / libm::sqrt(2.0);
+  let after = s.push(vec_window(&[0.0, 1.0], 2)).unwrap();
+  assert_eq!(emitted(&after), &[want, want]);
+
+  // A non-finite *seed* is refused the same way, leaving the smoother unseeded
+  // so the next window seeds the epoch itself.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&[f64::NAN, 1.0], 0)).unwrap_err(),
+    WinditError::NonFinite
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 2.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_gate_rejects_an_indeterminate_direction() {
+  // Exact cancellation: `[1, 0]` then `[-1, 0]` at alpha 0.5 leaves the
+  // accumulator at exactly zero, which has no direction to emit.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+
+  // And the case an exact-zero test could never catch: a residue that is
+  // NONZERO but below the fold's own rounding floor. The accumulator here is
+  // ~5.0e-16 while the gate stands at 16 * EPSILON * ||M|| ~= 3.55e-15, so
+  // without the gate `l2_renorm` would amplify it into the fabricated unit
+  // direction `[1, 0]` and the push would succeed.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[-1.0 + 1e-15, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+
+  // Non-vacuity: the gate has a real boundary rather than rejecting everything
+  // small. One decimal order out — an accumulator of ~5.0e-15 against the same
+  // ~3.55e-15 threshold — the residue is determinate and the direction is
+  // emitted.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let out = s.push(vec_window(&[-1.0 + 1e-14, 0.0], 1)).unwrap();
+  assert_eq!(emitted(&out), &[1.0, 0.0]);
+}
+
+#[test]
+fn vector_ema_gate_failure_still_advances_the_accumulator() {
+  // The one push that is NOT a no-op on failure, and deliberately so: a window
+  // whose output was gated was still a real observation, and the epoch the
+  // aggregate would fold over includes it. After the exact cancellation above,
+  // the accumulator is zero, so the next window's direction is its own —
+  // whereas a rolled-back accumulator would still hold `[1, 0]` and mix into
+  // `[0.5, 0.5]`.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let _ = s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err();
+  let out = s.push(vec_window(&[0.0, 1.0], 2)).unwrap();
+  assert_eq!(emitted(&out), &[0.0, 1.0]);
+}
+
+#[test]
+fn vector_ema_refuses_raw_quantization_codes() {
+  // The projection is `compute_components`, the same value surface `aggregate`
+  // reads, so quantized storage with no dequantization override fails closed
+  // here too. Reading `as_slice` and widening it directly would be one line
+  // shorter and would silently smooth raw codes as if they were values.
+  let mut s = SmoothPolicy::<BareI8Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(Windowed::new(BareI8Emb(vec![1, 2, 3]), Span::new(0, 1, 1)))
+      .unwrap_err(),
+    WinditError::MissingDequantization
+  );
+}
+
+#[test]
+fn vector_ema_drives_an_f32_storage_embedding_through_the_widening_projection() {
+  // `TestVec` stores `f32` and normalizes inside its own `from_unnormalized`,
+  // which is the shape of every real embedding (a 512-wide CLAP vector, say):
+  // it drives the `Cow::Owned` elementwise-widening branch of
+  // `compute_components` rather than the `f64` zero-copy borrow the other
+  // vector tests take, and it proves the emitted value survives a narrowing
+  // reconstruction.
+  let mut s = SmoothPolicy::<TestVec>::smoother(&VectorEma::new(0.5));
+  let first = s
+    .push(Windowed::new(
+      TestVec::from_unnormalized(&[1.0, 0.0]).unwrap(),
+      Span::new(0, 1, 1),
+    ))
+    .unwrap();
+  let second = s
+    .push(Windowed::new(
+      TestVec::from_unnormalized(&[0.0, 1.0]).unwrap(),
+      Span::new(1, 1, 1),
+    ))
+    .unwrap();
+  assert_eq!(first.value.as_slice(), &[1.0f32, 0.0]);
+  let want = (1.0 / libm::sqrt(2.0)) as f32;
+  assert_eq!(second.value.as_slice(), &[want, want]);
+}
+
+#[test]
+fn vector_ema_emits_the_aggregate_ema_of_every_prefix() {
+  // The defining equivalence, and the reason the renormalization is applied to
+  // an emitted COPY rather than to the accumulator: the recurrence this
+  // smoother carries is exactly the recency weighting
+  // `w_0 = (1 - alpha)^t`, `w_i = alpha * (1 - alpha)^(t - i)` that
+  // `EmaRenormalized` builds explicitly, so window `i` must emit the direction
+  // the aggregate folds over the prefix `[0..=i]`.
+  //
+  // A genuine differential: the two sides share no code below `l2_renorm` —
+  // the aggregate materializes the weights and runs a Neumaier-compensated
+  // sum over the whole prefix, this one runs a two-term recurrence — so
+  // agreement is evidence rather than a tautology. Renormalizing the
+  // accumulator in place instead (the "spherical EMA" this type deliberately
+  // is not) breaks it in the second decimal place, thousands of times the
+  // tolerance below.
+  let fixture: [[f64; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.5, 0.5, 0.0],
+    [-0.25, 0.75, 0.5],
+    [0.125, -0.625, 0.25],
+  ];
+
+  for alpha in [0.5f64, 0.3, 0.75, 1.0] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s.push(vec_window(&fixture[i], i)).unwrap();
+      let prefix: Vec<Windowed<RawF64Emb>> = fixture[..=i]
+        .iter()
+        .enumerate()
+        .map(|(j, v)| vec_window(v, j))
+        .collect();
+      let want =
+        crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+          .unwrap();
+      let got = emitted(&got);
+      assert_eq!(got.len(), want.captured.len());
+      for (g, w) in got.iter().zip(&want.captured) {
+        let diff = if g > w { g - w } else { w - g };
+        assert!(
+          diff < 1e-15,
+          "alpha {alpha}, prefix {i}: {got:?} vs {:?}",
+          want.captured
+        );
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The streaming gate against its aggregate sibling.
+//
+// Every gate test above is two windows long, and at length two the two
+// magnitude definitions coincide — which is why none of them can see a gate
+// that carries only the current step's mass. These measure the two sides
+// against each other at every prefix length instead.
+// ---------------------------------------------------------------------------
+
+/// The direction [`EmaRenormalized`](crate::aggregate::EmaRenormalized) folds
+/// over `fixture[..=upto]`, or the error its own determinacy gate raised.
+///
+/// The oracle the streaming sibling is measured against: same windows, same
+/// coefficient, the aggregation shape.
+fn aggregate_prefix(
+  alpha: f64,
+  fixture: &[Vec<f64>],
+  upto: usize,
+) -> Result<Vec<f64>, WinditError> {
+  let prefix: Vec<Windowed<RawF64Emb>> = fixture[..=upto]
+    .iter()
+    .enumerate()
+    .map(|(j, v)| vec_window(v, j))
+    .collect();
+  crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+    .map(|e| e.captured)
+}
+
+/// The three candidate mass definitions after folding `xs`, by a local
+/// recurrence written independently of the smoother's own.
+///
+/// - `two_term` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}|`: this step's two
+///   products and nothing older.
+/// - `fold` is `alpha * |x_t| + (1 - alpha) * fold_{t-1}`, the recency-weighted
+///   sum of term magnitudes an IDEAL fold would accumulate over the whole
+///   prefix. It is *not* what `EmaRenormalized` computes — that rematerializes
+///   its weights and sums `|w_i * x_i|` in window order, which is
+///   [`aggregate_mass`]. Mistaking the two is what produced a threshold
+///   ordering that the shipped fold's roundings do not obey; this field is kept
+///   only to aim a residue at a band, never to assert one.
+/// - `propagated` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) *
+///   propagated_{t-1}` from `propagated_0 = 0`, which additionally carries the
+///   recurrence's own propagated rounding error — and starts at zero because
+///   the seed is a copy and rounds by nothing.
+///
+/// The shipped `ema_step` exempts a step that rounds nothing (`alpha` of `0` or
+/// `1`) from charging any mass; this replica does not model that, and asserts
+/// it is never asked to.
+struct Masses {
+  state: Vec<f64>,
+  two_term: Vec<f64>,
+  fold: Vec<f64>,
+  propagated: Vec<f64>,
+}
+
+fn masses(a: f64, xs: &[Vec<f64>]) -> Masses {
+  let c = 1.0 - a;
+  assert!(
+    a != 0.0 && a != 1.0 && c != 1.0,
+    "this replica does not model the exact-step exemption; alpha {a} needs it"
+  );
+  let mut state = xs[0].clone();
+  let mut two_term: Vec<f64> = xs[0].iter().map(|v| v.abs()).collect();
+  let mut fold = two_term.clone();
+  let mut propagated = vec![0.0; xs[0].len()];
+  for x in &xs[1..] {
+    for j in 0..state.len() {
+      let recent = a * x[j];
+      let carried = c * state[j];
+      state[j] = recent + carried;
+      two_term[j] = recent.abs() + carried.abs();
+      fold[j] = recent.abs() + (c * fold[j]).abs();
+      propagated[j] = recent.abs() + carried.abs() + c * propagated[j];
+    }
+  }
+  Masses {
+    state,
+    two_term,
+    fold,
+    propagated,
+  }
+}
+
+/// The gate threshold for a mass vector: the crate's own
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`, spelled here so a test can say
+/// where a residue must land.
+fn tau(mass: &[f64]) -> f64 {
+  16.0 * f64::EPSILON * l2(mass) + f64::from_bits(0x0170_0000_0000_0000)
+}
+
+/// The mass [`EmaRenormalized`](crate::aggregate::EmaRenormalized) **actually
+/// computes** over `xs`: its own rematerialized weights, its own index order,
+/// its own additions.
+///
+/// Not the recurrence `alpha * |x_t| + (1 - alpha) * M_{t-1}` that
+/// [`masses`]'s `fold` carries. The two agree in exact arithmetic and are not
+/// the same computation, and it is precisely that difference — the aggregate
+/// builds `weights[i]` by iterated multiplication and sums `|w_i * x_i|` in
+/// window order — that a differential against the aggregate's *output* has to
+/// read. Reading the recurrence instead is how an induction over the ideal fold
+/// came to be mistaken for a statement about the shipped one.
+fn aggregate_mass(a: f64, xs: &[Vec<f64>]) -> Vec<f64> {
+  let c = 1.0 - a;
+  let n = xs.len();
+  let mut weights = vec![0.0f64; n];
+  let mut power = 1.0f64;
+  for i in (1..n).rev() {
+    weights[i] = a * power;
+    power *= c;
+  }
+  weights[0] = power;
+  let mut mag = vec![0.0f64; xs[0].len()];
+  for (i, x) in xs.iter().enumerate() {
+    for (m, &e) in mag.iter_mut().zip(x) {
+      *m += (weights[i] * e).abs();
+    }
+  }
+  mag
+}
+
+#[test]
+fn vector_ema_and_the_aggregate_compute_the_same_mass_at_length_two() {
+  // The rebuilt length-two regression. What stood here before was a tautology:
+  // its fixture pushed ONE window, and the local `masses` helper then
+  // initialised `two_term` and `fold` identically from that seed, so the
+  // assertion compared a value with itself — invoking neither `M_1` nor either
+  // production implementation. The blind spot the test was written to pin was
+  // not pinned.
+  //
+  // This drives TWO real windows through the shipped smoother, reads the
+  // production `VectorEmaState.mag` back, and compares it against the mass
+  // `EmaRenormalized` actually computes over the same pair. At length two the
+  // two are bit-identical and provably so: `M_0` is zero because the seed is a
+  // copy, so `M_1` is `|alpha * x_1| + |(1 - alpha) * x_0| + (1 - alpha) * 0`,
+  // and the aggregate's `weights[1] = alpha`, `weights[0] = 1 - alpha` make its
+  // mass the same two products, summed in the other order. Past length two the
+  // agreement stops — see the two `can_*` witnesses below — which is exactly
+  // why this one is asserted here and nowhere else.
+  //
+  // ONE coefficient, both sides. `VectorEma` and `EmaRenormalized` now take the
+  // compute scalar itself, so `alpha` below is a single `f64` that reaches each
+  // side unconverted — asserted rather than assumed, because the equality is
+  // asserted BIT FOR BIT and a pass would otherwise be readable as agreement at
+  // a coefficient only one of them actually held. The sweep ends at
+  // `1 - 2^-30`, which no `f32` can express (its nearest is exactly `1.0`, at
+  // which the step is an exact pass-through and charges nothing): under the old
+  // `f32` fields this case could not be written, and the equality could not be
+  // exercised anywhere the two coefficient grids disagreed.
+  const DIM: usize = 3;
+  let mut rng = 0x0f1e_2d3c_4b5a_6978u64;
+  for alpha in [
+    1.0f64,
+    0.75,
+    0.5,
+    0.3,
+    0.1,
+    0.0,
+    1.0 - libm::ldexp(1.0, -30),
+  ] {
+    let xs: Vec<Vec<f64>> = (0..2)
+      .map(|_| {
+        (0..DIM)
+          .map(|_| f64::from(next_unit(&mut rng)) - 0.5)
+          .collect()
+      })
+      .collect();
+    assert_ne!(xs[0], xs[1], "the two windows must differ");
+
+    assert_eq!(
+      VectorEma::new(alpha).alpha(),
+      EmaRenormalized::new(alpha).alpha(),
+      "alpha {alpha}: the two sides must hold the same coefficient, not two \
+       roundings of one"
+    );
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    s.push(vec_window(&xs[0], 0)).expect("seed");
+    s.push(vec_window(&xs[1], 1)).expect("second window");
+
+    let want = aggregate_mass(alpha, &xs);
+    // The two coefficient ends are the deliberate exception, pinned rather than
+    // skipped: at `alpha = 1` the step is an exact pass-through and at
+    // `alpha = 0` an exact hold, so neither rounds and neither charges. The
+    // aggregate's mass is `|x_1|` and `|x_0|` there, so this is a real
+    // divergence — in the emitting direction, and sound, because the step it
+    // declines to charge for committed nothing to charge.
+    if alpha == 1.0 || alpha == 0.0 {
+      assert!(
+        l2(&want) > 0.1,
+        "alpha {alpha}: the aggregate does charge here"
+      );
+      assert_eq!(
+        s.mag,
+        vec![0.0; DIM],
+        "alpha {alpha}: an exact step charges nothing"
+      );
+      continue;
+    }
+    // Non-vacuity: a mass of zero would make every comparison below hold for
+    // the wrong reason.
+    assert!(l2(&want) > 0.1, "alpha {alpha}: fixture mass must be real");
+    assert_eq!(
+      s.mag, want,
+      "alpha {alpha}: the production mass after two windows must be the mass the \
+       aggregate computes over the same pair, bit for bit"
+    );
+    assert_eq!(
+      tau(&s.mag),
+      tau(&want),
+      "alpha {alpha}: and therefore the same threshold"
+    );
+  }
+}
+
+#[test]
+fn vector_ema_gate_agrees_with_the_aggregate_over_a_cancelling_three_window_prefix() {
+  // THE falsifier for "streaming sibling of `EmaRenormalized`". Three windows,
+  // not two: at length two the streaming gate's magnitude and the aggregate's
+  // coincide, so every existing gate test is blind to a gate that carries only
+  // the current step's two terms. At length three they part, and this prefix is
+  // built to land in the gap — both sides fold to a norm of ~3.43e-15, which is
+  // ABOVE a two-term threshold and BELOW the aggregate's.
+  //
+  // `x1` is chosen so that `||s_1||` is `alpha / (1 - alpha)`, which makes the
+  // unit vector `x2 = -s_1 / ||s_1||` cancel the accumulator exactly: the
+  // prefix has no direction, and the aggregate says so.
+  // Written as the `f64` nearest to `0.3f32`, not as `0.3`. The coefficient is
+  // now the compute domain itself, and the two are different numbers
+  // (`0.30000001192092896` against `0.29999999999999999`); the fixture below is
+  // tuned to make `||s_1||` exactly `alpha / (1 - alpha)` at the first, so
+  // taking the second would move the residue off the band this test aims at.
+  // Explicit rather than left to a literal, so nobody reads a later pass as
+  // evidence about `0.3f64`.
+  const ALPHA: f64 = 0.3_f32 as f64;
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-0.9436345029127625, 0.33098931238422735],
+    vec![-0.9727890720095563, -0.23169251472325642],
+  ];
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  for i in 0..fixture.len() {
+    let got = s.push(vec_window(&fixture[i], i));
+    let want = aggregate_prefix(ALPHA, &fixture, i);
+    match (got, want) {
+      (Ok(g), Ok(w)) => {
+        let g = emitted(&g);
+        assert_eq!(g.len(), w.len(), "prefix {i}");
+        for (a, b) in g.iter().zip(&w) {
+          assert!(
+            (a - b).abs() < 1e-12,
+            "prefix {i}: streaming {g:?} vs aggregate {w:?}"
+          );
+        }
+      }
+      (Err(g), Err(w)) => assert_eq!(g, w, "prefix {i}"),
+      (Ok(g), Err(w)) => panic!(
+        "prefix {i}: the streaming gate EMITTED {:?} from a prefix its aggregate sibling \
+         calls indeterminate ({w})",
+        emitted(&g)
+      ),
+      (Err(g), Ok(w)) => panic!("prefix {i}: streaming rejected ({g}) but aggregate emitted {w:?}"),
+    }
+  }
+}
+
+#[test]
+fn vector_ema_gate_and_the_aggregate_agree_at_every_prefix_length() {
+  // The single counterexample above, generalized: at every prefix length from
+  // three to ten, and at five smoothing factors, a final window is tuned so the
+  // accumulator's residue lands strictly between the two-term threshold and the
+  // aggregate's own. Every one of those is a prefix the aggregate calls
+  // indeterminate, and the streaming sibling calls it indeterminate too.
+  //
+  // CHARACTERIZATION of an observed agreement, not a guarantee. The residue is
+  // aimed at the GEOMETRIC MEAN of the two thresholds and the band is required
+  // to be at least 1.2 wide before the case counts, so every case here clears
+  // both edges by the same factor — deliberately away from the last-bit region
+  // where the two verdicts are known to split in either direction (the two
+  // `can_*` witnesses below).
+  //
+  // Length two is not in the sweep: it has its own test, which drives two real
+  // windows through the shipped smoother instead of computing both sides of an
+  // equality in this file. The version of this loop that carried a length-two
+  // arm asserted a tautology — its fixture pushed one window and compared two
+  // helper fields initialised identically from that seed.
+  const DIM: usize = 4;
+  let mut rng = 0x5eed_1234_9abc_def0u64;
+  for alpha in [0.75f64, 0.5, 0.3, 0.2, 0.1] {
+    let a = alpha;
+    let c = 1.0 - a;
+    for len in 3..=10usize {
+      // A prefix that cancels most of the way, so its collapsed accumulator
+      // carries far less magnitude than the mass that produced it — the regime
+      // in which the two definitions differ at all. Random windows, then one
+      // that cancels nine tenths of what they built.
+      let mut xs: Vec<Vec<f64>> = (0..len - 2)
+        .map(|_| {
+          (0..DIM)
+            .map(|_| 0.5 + f64::from(next_unit(&mut rng)))
+            .collect()
+        })
+        .collect();
+      let built = masses(alpha, &xs);
+      xs.push(
+        built
+          .state
+          .iter()
+          .map(|v| -(c / a) * v * 0.9)
+          .collect::<Vec<f64>>(),
+      );
+      let m = masses(alpha, &xs);
+      // The final window is `-((1 - alpha) / alpha) * s`, scaled just off exact
+      // cancellation, so the residue it leaves is `(1 - alpha) * scale * ||s||`
+      // — a dial. Its own term magnitude is `|(1 - alpha) * s|` per component,
+      // which makes the closing step's two-term mass twice that and the fold's
+      // that plus the damped history. The residue is aimed at the geometric
+      // mean of the two thresholds, so it clears both edges by the same factor
+      // however wide the band is at this alpha.
+      let closing_two: Vec<f64> = m.state.iter().map(|v| 2.0 * (c * v).abs()).collect();
+      let closing_fold: Vec<f64> = m
+        .state
+        .iter()
+        .zip(&m.fold)
+        .map(|(v, f)| (c * v).abs() + c * f)
+        .collect();
+      let (lo, hi) = (tau(&closing_two), tau(&closing_fold));
+      assert!(
+        hi > 1.2 * lo,
+        "alpha {alpha}, len {len}: the two thresholds must differ for this to test anything \
+         ({lo:e} vs {hi:e})"
+      );
+      let target = libm::sqrt(lo * hi);
+      let scale = target / (c * l2(&m.state));
+      let last: Vec<f64> = m
+        .state
+        .iter()
+        .map(|v| -(c / a) * v * (1.0 + scale))
+        .collect();
+      xs.push(last);
+
+      // Where the residue actually landed: above a two-term threshold, at or
+      // below the aggregate's. Asserted rather than assumed, so the fixture
+      // cannot quietly stop testing anything.
+      let fin = masses(alpha, &xs);
+      let residue = l2(&fin.state);
+      assert!(
+        tau(&fin.two_term) < residue && residue <= tau(&fin.fold),
+        "alpha {alpha}, len {len}: residue {residue:e} must sit between {:e} and {:e}",
+        tau(&fin.two_term),
+        tau(&fin.fold)
+      );
+
+      let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+      let mut got = None;
+      for (i, x) in xs.iter().enumerate() {
+        got = Some(s.push(vec_window(x, i)));
+      }
+      let got = got.unwrap();
+      let want = aggregate_prefix(alpha, &xs, len - 1);
+      assert!(
+        want.is_err(),
+        "alpha {alpha}, len {len}: fixture must be indeterminate for the aggregate too, got \
+         {want:?}"
+      );
+      assert_eq!(
+        got.map(|w| emitted(&w).to_vec()).err(),
+        Some(WinditError::NonFinite),
+        "alpha {alpha}, len {len}: the streaming gate emitted a direction from a prefix its \
+         aggregate sibling calls indeterminate"
+      );
+    }
+  }
+}
+
+#[test]
+fn vector_ema_and_the_aggregate_refuse_the_same_out_of_domain_component() {
+  // `[f64::MAX, f64::MAX]` is an ordinary diagonal — every component finite,
+  // direction plainly `[2^-0.5, 2^-0.5]` — but its NORM is not representable.
+  // The aggregate refuses it up front as outside the aggregation magnitude
+  // domain; the streaming gate must give the same answer rather than let its
+  // own `l2_norm` overflow to infinity and reject through `inf <= inf`.
+  let big = vec![f64::MAX, f64::MAX];
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&big, 0)).unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+  assert_eq!(
+    aggregate_prefix(0.5, &[big], 0).unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+
+  // Non-vacuity: the boundary itself is inside the domain, so the check rejects
+  // a domain violation rather than everything large. `2^400` is
+  // `Real::MAX_AGG_MAGNITUDE`, and a diagonal of it still normalizes.
+  let edge = libm::ldexp(1.0, 400);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let out = s.push(vec_window(&[edge, edge], 0)).unwrap();
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(emitted(&out), &[want, want]);
+
+  // And the lower edge, the other half of the same domain.
+  let tiny = libm::ldexp(1.0, -400);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert!(s.push(vec_window(&[tiny, tiny], 0)).is_ok());
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&[libm::ldexp(1.0, -401), 0.0], 0))
+      .unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+}
+
+#[test]
+fn vector_ema_gate_mass_carries_the_whole_prefix_not_one_step() {
+  // The three candidate definitions, separated by hand on one four-window
+  // fixture at alpha 0.5 over `[1, 0]`, `[-1, 0]`, `[1, 0]`, `[-1, 0]`, whose
+  // accumulator runs `1`, `0`, `0.5`, `-0.25`:
+  //
+  //   this step's two terms  ->  [0.75, 0]
+  //   the aggregate's fold   ->  [1.0,  0]
+  //   propagated error mass  ->  [1.25, 0]
+  //
+  // The gate must measure against the last: the accumulator is a recurrence, so
+  // the rounding it carries is the whole damped history of its own steps, not
+  // the two products of the current one.
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-1.0, 0.0],
+    vec![1.0, 0.0],
+    vec![-1.0, 0.0],
+  ];
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  for (i, x) in fixture.iter().enumerate() {
+    let _ = s.push(vec_window(x, i));
+  }
+  assert_eq!(s.mag, vec![1.25, 0.0]);
+
+  // The local recurrence agrees, so the fixture reads the same from both sides.
+  let m = masses(0.5, &fixture);
+  assert_eq!(m.two_term, vec![0.75, 0.0]);
+  assert_eq!(m.fold, vec![1.0, 0.0]);
+  assert_eq!(m.propagated, vec![1.25, 0.0]);
+}
+
+#[test]
+fn vector_ema_can_refuse_a_prefix_the_aggregate_emits() {
+  // One of the two directions a near-threshold verdict can run. CHARACTERIZATION
+  // of what is observed, not a promise: the crate no longer claims an ordering
+  // between the two thresholds, and the companion test below exhibits the other
+  // direction at exact bits.
+  //
+  // This prefix is the cancelling one above with its third window rotated by
+  // 4e-15, which lifts the residue to ~3.63e-15 — above an ideal fold's
+  // threshold (~3.52e-15) and below the streaming sibling's (~6.30e-15). Those
+  // two figures only POSITION the fixture; both verdicts below are read off the
+  // shipped implementations.
+  //
+  // The aggregate emits a direction; the recurrence refuses, because at this
+  // residue its own propagated rounding is not provably smaller than the
+  // result. A gate carrying only the fold's mass would emit here too, and would
+  // be claiming an error bound the recurrence does not have — which is the
+  // property this case still pins.
+  // The `f64` nearest to `0.3f32`, spelled out: the fixture is the cancelling
+  // one above rotated by 4e-15, and it lands in the band only at the
+  // coefficient it was tuned at. `0.3f64` is a different number.
+  const ALPHA: f64 = 0.3_f32 as f64;
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-0.9436345029127625, 0.33098931238422735],
+    vec![-0.9727890720095554, -0.2316925147232603],
+  ];
+  let m = masses(ALPHA, &fixture);
+  let residue = l2(&m.state);
+  assert!(
+    tau(&m.fold) < residue && residue <= tau(&m.propagated),
+    "fixture must sit in the band: {residue:e} against {:e} and {:e}",
+    tau(&m.fold),
+    tau(&m.propagated)
+  );
+
+  assert!(aggregate_prefix(ALPHA, &fixture, 2).is_ok());
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  for (i, x) in fixture.iter().enumerate().take(2) {
+    s.push(vec_window(x, i)).unwrap();
+  }
+  assert_eq!(
+    s.push(vec_window(&fixture[2], 2)).unwrap_err(),
+    WinditError::NonFinite
+  );
+}
+
+#[test]
+fn vector_ema_can_emit_a_prefix_the_aggregate_refuses() {
+  // The OTHER direction, at exact bits, and the case that killed the claim
+  // "this side's threshold is never below the aggregate's". The induction
+  // behind that claim compared the streaming mass against the recurrence
+  // `alpha * |x_t| + (1 - alpha) * M_{t-1}` — the mass an IDEAL fold would
+  // accumulate. `EmaRenormalized` does not evaluate that recurrence. It
+  // rematerializes `weights[i]` by iterated multiplication and sums
+  // `|w_i * x_i|` in window order, and those roundings do not have to land
+  // where the recurrence's do.
+  //
+  // Here they land one ulp apart in the wrong direction. Three one-dimensional
+  // windows at `alpha = 0.3f32`: both sides reach the same accumulator, bit for
+  // bit, and the streaming mass comes out one ulp BELOW the aggregate's — so
+  // the streaming threshold is one ulp below the aggregate's, the accumulator
+  // falls exactly in that one-ulp gap, and the streaming gate emits a direction
+  // its aggregate sibling calls indeterminate.
+  //
+  // Recorded as the witness that near-threshold verdicts differ in BOTH
+  // directions. There is nothing to fix here: each gate is sound against its
+  // own error bound, and neither bound was ever a statement about the other
+  // side's rounding.
+  // The exact-bit witness's coefficient, spelled as the `f64` it always widened
+  // to: `f32::from_bits(0x3e99_999a)` is `0.3f32`, and every hexadecimal
+  // accumulator below is what THIS number produces. `0.3f64` is a different
+  // coefficient and would not reproduce them.
+  const ALPHA: f64 = 0.3_f32 as f64;
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![f64::from_bits(0x3f0c_a8ca_2820_0000)],
+    vec![f64::from_bits(0xbf20_b7cb_3226_ac2d)],
+    vec![f64::from_bits(0xbc27_67b6_0c53_0643)],
+  ];
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  s.push(vec_window(&fixture[0], 0)).expect("the seed");
+  // The second window cancels the seed to EXACTLY zero, so both sides refuse it
+  // — and the streaming accumulator still advances through the refusal, which is
+  // what leaves the third window's residue in the gap.
+  assert_eq!(
+    s.push(vec_window(&fixture[1], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+  assert_eq!(s.state, vec![0.0], "the two-window prefix cancels exactly");
+  assert_eq!(
+    aggregate_prefix(ALPHA, &fixture, 1).unwrap_err(),
+    WinditError::NonFinite,
+    "and the aggregate agrees about that one"
+  );
+  let got = s.push(vec_window(&fixture[2], 2));
+
+  // The accumulators meet, bit for bit — so the disagreement is entirely in the
+  // two masses and not in the value being gated.
+  let ours = s.state[0];
+  assert_eq!(
+    ours.abs().to_bits(),
+    0x3c0c_160d_bb1c_ff8d,
+    "the streaming accumulator must land on the witness bits"
+  );
+
+  // The masses, and therefore the thresholds, differ by one ulp — the streaming
+  // one BELOW the aggregate's, which is the ordering the retired claim forbade.
+  let theirs = aggregate_mass(ALPHA, &fixture);
+  assert!(
+    s.mag[0] < theirs[0],
+    "the streaming mass must be the smaller here: {:e} against {:e}",
+    s.mag[0],
+    theirs[0]
+  );
+  assert_eq!(tau(&s.mag).to_bits(), 0x3c0c_160d_bb1c_ff8c);
+  assert_eq!(tau(&theirs).to_bits(), 0x3c0c_160d_bb1c_ff8d);
+
+  // And the verdicts split, in the direction the retired claim ruled out.
+  assert_eq!(
+    emitted(&got.expect("the streaming gate emits at this residue")),
+    &[-1.0],
+    "the accumulator is negative, so its unit direction is -1"
+  );
+  assert_eq!(
+    aggregate_prefix(ALPHA, &fixture, 2).unwrap_err(),
+    WinditError::NonFinite,
+    "the aggregate calls the same prefix indeterminate"
+  );
+}
+
+#[test]
+fn vector_ema_matches_the_aggregate_on_determinate_prefixes_at_both_storage_widths() {
+  // The other half of the relationship, and the one that has to hold
+  // everywhere: away from the gate's band the two siblings agree. Twelve
+  // windows, five smoothing factors, both storage widths — the `f64` verbatim
+  // double that reads the emitted value exactly, and the `f32` double that
+  // drives the widening projection and a narrowing reconstruction.
+  const DIM: usize = 5;
+  let mut rng = 0x1234_5678_9abc_def0u64;
+  let fixture: Vec<Vec<f64>> = (0..12)
+    .map(|_| {
+      (0..DIM)
+        .map(|_| f64::from(next_unit(&mut rng)) - 0.5)
+        .collect()
+    })
+    .collect();
+
+  for alpha in [1.0f64, 0.75, 0.5, 0.3, 0.1] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s.push(vec_window(&fixture[i], i)).expect("determinate");
+      let want = aggregate_prefix(alpha, &fixture, i).expect("determinate");
+      for (g, w) in emitted(&got).iter().zip(&want) {
+        assert!(
+          (g - w).abs() < 1e-12,
+          "alpha {alpha}, prefix {i}: {:?} vs {want:?}",
+          emitted(&got)
+        );
+      }
+    }
+
+    let mut s = SmoothPolicy::<TestVec>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s
+        .push(Windowed::new(
+          TestVec::from_unnormalized(&fixture[i]).unwrap(),
+          Span::new(i, 1, 1),
+        ))
+        .expect("determinate");
+      let prefix: Vec<Windowed<TestVec>> = fixture[..=i]
+        .iter()
+        .enumerate()
+        .map(|(j, v)| Windowed::new(TestVec::from_unnormalized(v).unwrap(), Span::new(j, 1, 1)))
+        .collect();
+      let want =
+        crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+          .expect("determinate");
+      for (g, w) in got.value.as_slice().iter().zip(want.as_slice()) {
+        assert!(
+          (g - w).abs() < 1e-6,
+          "f32 storage, alpha {alpha}, prefix {i}: {:?} vs {:?}",
+          got.value.as_slice(),
+          want.as_slice()
+        );
+      }
+    }
+  }
+}
+
+#[test]
+fn vector_ema_alpha_zero_holds_the_seed_and_accumulates_no_mass() {
+  // FALSIFIER for the branch's horizon argument. At `alpha = 0` the recurrence
+  // is exact — `1 - alpha` is `1`, so the carry is a rounding-free copy and the
+  // injection is exactly zero — yet the gate's mass still charged
+  // `|(1 - alpha) * s|` a push, so `M` grew LINEARLY by `|s_0|` per window.
+  // That is the growth the horizon argument assumed away: at `2^48` post-seed
+  // pushes the threshold reaches the held seed's own magnitude and the
+  // inclusive comparison refuses it from then on, forever.
+  //
+  // Measured through the internal mass rather than by running `2^48` pushes: a
+  // step that rounds nothing must charge nothing, so after any number of pushes
+  // the mass of an exact hold is exactly zero.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for i in 1..64usize {
+    let out = s.push(vec_window(&[0.25, -0.5], i)).unwrap();
+    assert_eq!(
+      emitted(&out),
+      &[1.0, 0.0],
+      "push {i}: alpha 0 holds the seed direction"
+    );
+  }
+  assert_eq!(
+    s.state,
+    vec![1.0, 0.0],
+    "the accumulator is the seed, bit for bit"
+  );
+  assert_eq!(
+    s.mag,
+    vec![0.0, 0.0],
+    "an exact hold commits no rounding, so it must charge no mass; linear growth \
+     here is what makes the 2^48 horizon reachable"
+  );
+}
+
+#[test]
+fn vector_ema_a_mass_at_the_horizon_refuses_a_held_seed() {
+  // Why a zero mass is the cure and not a detail. The consequence is reached by
+  // writing the mass the old linear growth left after `2^48` post-seed pushes
+  // rather than by running them: `16 * EPSILON * 2^48` is exactly `1`, the
+  // seed's own magnitude, and the gate's comparison is inclusive.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  s.push(vec_window(&[0.0, 0.0], 1)).unwrap();
+  s.mag = vec![libm::ldexp(1.0, 48), 0.0];
+  assert_eq!(
+    s.push(vec_window(&[0.0, 0.0], 2)).unwrap_err(),
+    WinditError::NonFinite,
+    "a mass of 2^48 seeds puts the threshold at the seed's own magnitude"
+  );
+}
+
+#[test]
+fn vector_ema_a_nonzero_alpha_below_the_complement_collapse_still_grows_its_mass() {
+  // The other half of the alpha-zero analysis, pinned so the cure cannot be
+  // widened into a lie. At `alpha = 2^-60` the complement rounds to exactly
+  // `1.0` just as it does at zero, so the carry is again a rounding-free copy —
+  // but the injection is NOT zero, and `recent + carried` genuinely rounds
+  // every push. That error really does accumulate undamped, so the mass really
+  // does grow linearly here, and the growth is a true bound rather than an
+  // artifact. Only the exact hold may charge nothing.
+  // `2^-54` is the FIRST alpha whose complement collapses — the tie that rounds
+  // to even — so this sits exactly on the documented edge rather than safely
+  // inside it, and the neighbour that does not collapse is pinned beside it.
+  const ALPHA: f64 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+  assert_eq!(1.0f64 - ALPHA, 1.0, "the complement must collapse");
+  assert_ne!(
+    1.0f64 - libm::ldexp(1.0, -53),
+    1.0,
+    "and 2^-53 must NOT: the doc's constant is 2^-54"
+  );
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for i in 1..64usize {
+    s.push(vec_window(&[0.25, 0.0], i)).unwrap();
+  }
+  assert!(
+    s.mag[0] > 62.0 && s.mag[0] < 64.0,
+    "a rounding step per push must still be charged: {:?}",
+    s.mag
+  );
+}
+
+#[test]
+fn vector_ema_error_bound_needs_an_absolute_term_in_the_subnormal_regime() {
+  // FALSIFIER for the published bound `|e_t| <= 2u * M_t`. At alpha 0.5 a seed
+  // of `2^-400` and a run of all-zero windows halves the accumulator every
+  // push, walking it through the normal range and down into the subnormals. At
+  // the 675th push the exact recurrence is `2^-1075` and the computed
+  // accumulator rounds it to zero — an error of `2^-1075`, half the smallest
+  // subnormal `eta = 2^-1074`.
+  //
+  // The mass by then is `337 * eta`, so the RELATIVE allowance `2u * M` is
+  // `337 * 2^-52` eta — about 42 binary orders too small to cover it. Subnormal
+  // rounding is ABSOLUTE, and a bound with only a relative term cannot see it.
+  //
+  // Everything below is stated in units of `eta`, because `2u * M` itself is
+  // `~2^-1126` and has no f64 to be stated in.
+  const SEED_EXP: i32 = -400; // exactly `Real::MIN_AGG_MAGNITUDE`
+  const STEPS: usize = 675;
+  let eta = f64::from_bits(1);
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[libm::ldexp(1.0, SEED_EXP)], 0))
+    .expect("the seed is in domain and determinate");
+  for i in 1..=STEPS {
+    // Refused from the moment the accumulator falls under the gate's absolute
+    // floor, and advancing the accumulator through every refusal — which is the
+    // documented behaviour and what carries the state into the subnormals.
+    let _ = s.push(vec_window(&[0.0], i));
+  }
+
+  assert_eq!(
+    s.state,
+    vec![0.0],
+    "the computed accumulator must have rounded to zero"
+  );
+  let error_in_eta = 0.5; // the exact recurrence is `2^-1075`, half of eta
+  let mass_in_eta = s.mag[0] / eta;
+  assert_eq!(mass_in_eta, 337.0, "the mass at the underflow step");
+
+  // The relative term alone does NOT cover it — that is the whole finding, and
+  // it is asserted rather than described so the published bound can never be
+  // narrowed back.
+  let relative_in_eta = mass_in_eta * f64::EPSILON;
+  assert!(
+    relative_in_eta < error_in_eta,
+    "`2u * M` must be the term that fails here: {relative_in_eta:e} eta"
+  );
+
+  // The absolute term covers it, with room to spare: each step's two products
+  // can each round by at most `eta / 2` when their result is subnormal (a
+  // floating-point ADDITION never underflows), and those contributions
+  // accumulate undamped in the worst case, so `E_t <= t * eta`.
+  let absolute_in_eta = STEPS as f64;
+  assert!(
+    relative_in_eta + absolute_in_eta >= error_in_eta,
+    "the mixed bound must cover the error"
+  );
+
+  // And the absolute term never reaches a verdict, because the gate's own
+  // absolute floor is `2^-1000` — 74 binary orders above `t * eta` at this
+  // epoch, and above it for every epoch shorter than `2^74` windows.
+  let floor = f64::from_bits(0x0170_0000_0000_0000);
+  assert!(
+    absolute_in_eta * eta < floor,
+    "MIN_GATE_THRESHOLD must dominate the accumulated absolute term"
+  );
+  assert_eq!(
+    s.push(vec_window(&[0.0], STEPS + 1)).unwrap_err(),
+    WinditError::NonFinite,
+    "the verdict is refusal, and correctly so: the exact value is under the floor too"
+  );
+}
+
+#[test]
+fn vector_ema_gate_floor_decides_below_two_pow_minus_1000() {
+  // The absolute floor's own boundary, and the one regime where it decides a
+  // verdict rather than sitting far under the relative term. Same walk as the
+  // subnormal case above: alpha 0.5, a seed of `2^-400`, all-zero windows, so
+  // the accumulator is `2^-(400 + t)` exactly and the mass is `t * 2^-(400 + t)`
+  // — which puts `16 * EPSILON * ||M||` around `2^-1039` while the accumulator
+  // is still around `2^-1000`. The relative term is 39 binary orders too small
+  // to reach anything here; `MIN_GATE_THRESHOLD` is the whole threshold.
+  //
+  // Non-vacuous from both sides: one push earlier the same gate emits.
+  const SEED_EXP: i32 = -400;
+  let floor_exp = -1000;
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[libm::ldexp(1.0, SEED_EXP)], 0))
+    .expect("the seed");
+  // 599 halvings leave the accumulator at `2^-999`, one binade ABOVE the floor.
+  for i in 1..=599usize {
+    s.push(vec_window(&[0.0], i))
+      .expect("still above the floor");
+  }
+  assert_eq!(s.state, vec![libm::ldexp(1.0, floor_exp + 1)]);
+  assert!(
+    16.0 * f64::EPSILON * s.mag[0] < libm::ldexp(1.0, floor_exp) / 1e9,
+    "the relative term must be irrelevant here: {:e}",
+    16.0 * f64::EPSILON * s.mag[0]
+  );
+
+  // One more halving puts it AT the floor, and the comparison is inclusive.
+  assert_eq!(
+    s.push(vec_window(&[0.0], 600)).unwrap_err(),
+    WinditError::NonFinite,
+    "at 2^-1000 the absolute floor refuses"
+  );
+  assert_eq!(s.state, vec![libm::ldexp(1.0, floor_exp)]);
+}
+
+// ---------------------------------------------------------------------------
+// The epoch horizon: `M` is itself a floating-point accumulation, and past a
+// proven number of charging steps it stops dominating the mass an exact
+// recurrence carries.
+// ---------------------------------------------------------------------------
+
+/// The `alpha` whose complement is the first to round to exactly `1.0`, and the
+/// coefficient the stagnation counterexample runs at.
+const COLLAPSING_ALPHA: f64 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+
+#[test]
+fn vector_ema_mass_stagnation_is_reachable_by_pushing() {
+  // The reachability argument for the fixture the two tests below start from,
+  // asserted rather than described: every claim here is an actual `f64`
+  // operation or an actual production push.
+  //
+  // At `alpha = 2^-54` the complement is exactly `1.0`, so with `x = 2^-24`:
+  //
+  //   recent    = alpha * x            = 2^-78
+  //   carried   = 1.0 * s              = s
+  //   s         = 2^-78 + 2^-24        = 2^-24        (absorbed, a quarter ulp)
+  //   committed = |2^-78| + |2^-24|    = 2^-24        (the sum rounds back too)
+  //   m         = 2^-24 + m
+  //
+  // so the accumulator is stationary and the mass walks the `2^-24` grid, which
+  // is exact for every partial sum of at most 53 significant bits — that is
+  // `k * 2^-24` for `k <= 2^53`, landing on exactly `2^29` at `k = 2^53`. From
+  // there each further charge is exactly half an ulp of `2^29` and ties back to
+  // even, so `(s, m) = (2^-24, 2^29)` is not a passing value but the epoch's
+  // fixed point, held for every step after the `2^53`rd.
+  let a = COLLAPSING_ALPHA;
+  assert_eq!(
+    1.0f64 - a,
+    1.0,
+    "the complement must collapse to exactly one"
+  );
+  let x = libm::ldexp(1.0, -24);
+  let recent = a * x;
+  assert_eq!(recent, libm::ldexp(1.0, -78), "the injection is 2^-78");
+  assert_eq!(recent + x, x, "and is absorbed whole by a state of 2^-24");
+  let committed = recent.abs() + x.abs();
+  assert_eq!(committed, x, "the charge rounds back to exactly 2^-24");
+
+  // The grid is exact right up to the stagnation point, and stagnant after it.
+  let m_before = (libm::ldexp(1.0, 53) - 1.0) * x; // k = 2^53 - 1
+  assert_eq!(
+    m_before / x,
+    libm::ldexp(1.0, 53) - 1.0,
+    "still on the grid"
+  );
+  let m_at = m_before + committed;
+  assert_eq!(m_at, libm::ldexp(1.0, 29), "k = 2^53 lands on exactly 2^29");
+  assert_eq!(
+    m_at + committed,
+    m_at,
+    "and every charge after it ties back: the mass STAGNATES while the exact \
+     mass keeps climbing"
+  );
+
+  // And the same walk on the production path, so the closed form above is not a
+  // second implementation but a description of what `push` does.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  for i in 1..=16usize {
+    s.push(vec_window(&[x], i)).expect("determinate throughout");
+    assert_eq!(s.state, vec![x], "push {i}: the accumulator is stationary");
+    assert_eq!(s.mag, vec![i as f64 * x], "push {i}: the mass is k * 2^-24");
+    assert_eq!(s.steps, i as u64, "push {i}: every one of these charges");
+  }
+}
+
+#[test]
+fn vector_ema_past_the_horizon_the_gate_emits_a_direction_from_an_exact_zero() {
+  // THE finding, on the production path. The fixture is the stagnated pair the
+  // test above proves reachable — `s = 2^-24`, `M = 2^29` — reached after `2^53`
+  // charging steps and held for every step after, so the exact recurrence has
+  // been climbing by `2^-78` a step while neither the accumulator nor the mass
+  // moved. After `2^60` steps the exact recurrence stands at `65 * 2^-24`.
+  //
+  // `steps` is set BELOW the shipped limit here on purpose: this test is the
+  // characterization of what the limit exists to prevent, so it must run the
+  // arithmetic the limit refuses. The companion test below starts from the same
+  // fixture with the step count the fixture actually implies, and gets a
+  // refusal.
+  let x = libm::ldexp(1.0, -24);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  s.state = vec![x];
+  s.mag = vec![libm::ldexp(1.0, 29)];
+  s.steps = 0;
+
+  // `2^60 * 2^-78` is `64 * 2^-24`, so the exact recurrence is at `65 * 2^-24`
+  // and `2_129_920` injections of `-2^-39` take it to exactly zero.
+  const PUSHES: usize = 2_129_920;
+  let injection = libm::ldexp(1.0, -39);
+  assert_eq!(
+    65.0 * x - PUSHES as f64 * injection,
+    0.0,
+    "the exact recurrence must land on zero"
+  );
+
+  let window = -libm::ldexp(1.0, 15); // alpha * -2^15 = -2^-39
+  let mut last = Err(WinditError::Empty);
+  for i in 0..PUSHES {
+    last = s.push(vec_window(&[window], i));
+  }
+
+  assert_eq!(
+    s.state,
+    vec![-libm::ldexp(1.0, -18)],
+    "the computed accumulator ends at -2^-18 where the exact one is zero"
+  );
+  assert_eq!(
+    s.mag[0].to_bits(),
+    0x41c0_0000_0200_0002,
+    "the mass barely moved off its stagnation point: 0x1.0000002000002p29"
+  );
+  let threshold = tau(&s.mag);
+  assert_eq!(
+    threshold.to_bits(),
+    0x3ec0_0000_0200_0002,
+    "which puts the gate's threshold at 0x1.0000002000002p-19"
+  );
+  assert!(
+    s.state[0].abs() > threshold,
+    "and the accumulator is ABOVE it: {:e} > {threshold:e}",
+    s.state[0].abs()
+  );
+  assert_eq!(
+    last.map(|w| emitted(&w).to_vec()),
+    Ok(vec![-1.0]),
+    "so the gate emits a direction for a prefix whose exact value is zero — the \
+     published `|e| <= 2u * M` bound broken by a factor of 32"
+  );
+  // `2u * M` is the bound this type publishes on its own error, and the gate
+  // reads it with a factor of sixteen of headroom. The error here is `2^-18`
+  // against a bound of `2^-23`: past both, which is what makes the emission a
+  // soundness failure rather than a tight call.
+  let bound = f64::EPSILON * s.mag[0];
+  assert!(
+    s.state[0].abs() > 16.0 * bound,
+    "the error {:e} must break the published `2u * M` bound {bound:e} by more \
+     than the gate's headroom",
+    s.state[0].abs()
+  );
+}
+
+#[test]
+fn vector_ema_refuses_the_step_that_would_leave_the_proven_epoch() {
+  // The cure, against the very same fixture. Reaching `(2^-24, 2^29)` takes
+  // `2^53` charging steps — every push of the walk charges — and `2^53` is past
+  // `MAX_EPOCH_STEPS`, so the epoch that produced this state is already over.
+  // Setting the count to the limit is therefore the honest completion of the
+  // fixture, not a second hypothesis: no smaller count can produce this pair.
+  let x = libm::ldexp(1.0, -24);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[x], 0)).expect("the seed");
+  s.state = vec![x];
+  s.mag = vec![libm::ldexp(1.0, 29)];
+  s.steps = VectorEma::MAX_EPOCH_STEPS;
+
+  let before = (s.state.clone(), s.mag.clone(), s.steps);
+  assert_eq!(
+    s.push(vec_window(&[-libm::ldexp(1.0, 15)], 1)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the step that would leave the proven range is refused"
+  );
+  assert_eq!(
+    (s.state.clone(), s.mag.clone(), s.steps),
+    before,
+    "and refused before any write: the accumulator, the mass and the count are \
+     exactly as they were"
+  );
+  // Permanent, not per-window: nothing a caller pushes re-enters the range.
+  for i in 2..6usize {
+    assert_eq!(
+      s.push(vec_window(&[0.0], i)).unwrap_err(),
+      WinditError::EpochTooLong,
+      "push {i} is refused too"
+    );
+  }
+  // A clone carries the exhausted epoch with it — a `Clone` that dropped the
+  // count would hand out a smoother that resumes fabricating.
+  let mut copy = s.clone();
+  assert_eq!(
+    copy.push(vec_window(&[0.0], 6)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the clone is exhausted too"
+  );
+}
+
+#[test]
+fn vector_ema_horizon_is_exactly_max_epoch_steps() {
+  // Non-vacuous from both sides, and pinned to the number rather than to the
+  // constant so that moving the constant is a test failure rather than a silent
+  // widening of the accepted regime.
+  assert_eq!(
+    VectorEma::MAX_EPOCH_STEPS,
+    1u64 << 50,
+    "the enforced limit is 2^50 charging steps — inside the ~2^53.4 the mass's \
+     own rounding is proven over, and inside the subnormal term's 2^74"
+  );
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  assert_eq!(s.steps, 0, "the seed rounds nothing, so it charges no step");
+  s.steps = VectorEma::MAX_EPOCH_STEPS - 1;
+  s.push(vec_window(&[0.0, 1.0], 1))
+    .expect("the last step inside the proven range still runs");
+  assert_eq!(s.steps, VectorEma::MAX_EPOCH_STEPS, "and it counted");
+  assert_eq!(
+    s.push(vec_window(&[0.0, 1.0], 2)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "the next one is refused"
+  );
+}
+
+#[test]
+fn vector_ema_reset_rearms_an_exhausted_epoch() {
+  // What the caller is expected to do about `EpochTooLong`, and the proof that
+  // the path works: a new epoch starts from a zero mass and a zero count.
+  for rearm in [0u8, 1] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+    s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+    s.steps = VectorEma::MAX_EPOCH_STEPS;
+    assert_eq!(
+      s.push(vec_window(&[0.0, 1.0], 1)).unwrap_err(),
+      WinditError::EpochTooLong
+    );
+
+    // `discontinuity` is the trait default and routes to `reset`; both are
+    // exercised so neither can regress alone.
+    if rearm == 0 {
+      s.reset();
+    } else {
+      s.discontinuity();
+    }
+    assert_eq!(s.steps, 0, "rearm {rearm}: the count is cleared");
+
+    let out = s
+      .push(vec_window(&[0.0, 1.0], 2))
+      .expect("the next window seeds a fresh epoch");
+    assert_eq!(
+      emitted(&out),
+      &[0.0, 1.0],
+      "rearm {rearm}: and it is a seed, not a continuation of the old prefix"
+    );
+    assert_eq!(s.mag, vec![0.0, 0.0], "rearm {rearm}: with a zero mass");
+    assert_eq!(s.steps, 0, "rearm {rearm}: and a zero count");
+  }
+}
+
+#[test]
+fn vector_ema_only_charging_steps_count_against_the_horizon() {
+  // The horizon counts the quantity the induction is stated over — steps that
+  // round `M` — and nothing else. That is what keeps the exact-step exemption's
+  // liveness: an `alpha` of `0` or `1` never spends any of the mass's relative
+  // precision, so its epoch stays unbounded. A count of pushes rather than of
+  // charges would make an exact hold terminal at `2^50` windows, reintroducing
+  // at a further horizon exactly the defect the exemption removed.
+  for alpha in [0.0f64, 1.0] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+    for i in 1..32usize {
+      s.push(vec_window(&[0.25, -0.5], i)).expect("determinate");
+    }
+    assert_eq!(
+      s.mag,
+      vec![0.0, 0.0],
+      "alpha {alpha}: an exact step charges nothing"
+    );
+    assert_eq!(s.steps, 0, "alpha {alpha}: so it advances no count either");
+  }
+
+  // The third exact case: a collapsed complement against an all-zero window.
+  // `recent` is exactly zero and the carry is a copy, so the step is exact even
+  // though `alpha` is neither end of the range.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(COLLAPSING_ALPHA));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  for i in 1..8usize {
+    s.push(vec_window(&[0.0, 0.0], i)).expect("determinate");
+  }
+  assert_eq!(
+    s.steps, 0,
+    "an all-zero window under a collapsed complement is exact"
+  );
+  // And the neighbouring inexact case does count, so the exemption is narrow.
+  s.push(vec_window(&[0.25, 0.0], 8)).expect("determinate");
+  assert_eq!(s.steps, 1, "a nonzero injection rounds, and is counted");
+}
+
+#[test]
+fn vector_ema_a_gate_refused_push_still_counts_against_the_horizon() {
+  // The accumulator advances through a determinacy refusal — that is documented
+  // behaviour — so the mass grew and the step must be charged to the epoch.
+  // Counting only emitted windows would let an epoch of refusals run past the
+  // range the bound is proven over and then start emitting again.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  assert_eq!(
+    s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite,
+    "exact cancellation is refused"
+  );
+  assert_eq!(s.steps, 1, "and still counts");
+}
+
+#[test]
+fn vector_ema_horizon_does_not_mask_a_malformed_window() {
+  // Ordering, pinned: the epoch check runs after the window's own validation, so
+  // a caller past the horizon is still told what is wrong with the window it
+  // pushed rather than being handed an epoch-level error for a dimension bug.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[1.0, 0.0], 0)).expect("the seed");
+  s.steps = VectorEma::MAX_EPOCH_STEPS;
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0, 0.0], 1)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 3,
+      expected: 2
+    },
+    "the window's own defect is reported first"
+  );
+  assert_eq!(
+    s.push(vec_window(&[f64::NAN, 0.0], 2)).unwrap_err(),
+    WinditError::NonFinite,
+    "and so is a non-finite component"
+  );
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0], 3)).unwrap_err(),
+    WinditError::EpochTooLong,
+    "a well-formed window is what reaches the epoch check"
+  );
+}
+
+#[test]
+fn epoch_too_long_names_the_limit_it_enforces() {
+  // The message reads the constant, so it cannot drift from the bound it
+  // reports. Spelled here as the formatted number rather than as the constant so
+  // that a message rewritten to a stale literal fails.
+  let rendered = std::format!("{}", WinditError::EpochTooLong);
+  assert!(
+    rendered.contains("1125899906842624"),
+    "the limit must appear in the message: {rendered}"
+  );
 }

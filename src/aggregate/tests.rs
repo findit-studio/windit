@@ -60,8 +60,9 @@ fn coverage_weighted_mean_f64_pinned() {
 
 #[test]
 fn ema_alpha_range_is_rejected_at_f64() {
-  // The alpha range check runs in f32 on the f32 configuration field, before
-  // widening, so it must fire identically at the f64 compute scalar.
+  // The alpha range check runs on the configuration field, which is now the
+  // compute scalar itself, so the bounds are `C::ZERO` and `C::ONE` and the
+  // rejection is the same at every `Real`.
   let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
   let coverages = [1.0, 1.0];
   assert!(matches!(
@@ -73,12 +74,92 @@ fn ema_alpha_range_is_rejected_at_f64() {
     Err(WinditError::AlphaOutOfRange)
   ));
   assert!(matches!(
-    EmaRenormalized::new(f32::NAN).aggregate_values(&embeddings, &coverages, 2),
+    EmaRenormalized::new(f64::NAN).aggregate_values(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   assert!(EmaRenormalized::new(0.5)
     .aggregate_values(&embeddings, &coverages, 2)
     .is_ok());
+}
+
+#[test]
+fn ema_renormalized_carries_a_coefficient_no_f32_can_hold() {
+  // FALSIFIER for the coefficient's precision, the aggregation twin of the
+  // vector smoother's. `aggregate_values` is `impl<C: Real>` and `Real` has one
+  // implementor, `f64`, so the weights, their products and the compensated sum
+  // are all `f64`; a coefficient on the `f32` grid was the one narrow value in
+  // the whole fold.
+  //
+  // `1 - 2^-30` is the witness. The `f32` grid immediately below `1` is spaced
+  // `2^-24`, so the nearest `f32` to it is exactly `1.0`, at which the recency
+  // weights collapse to `[0, 0, 1]` and the fold returns the last window
+  // verbatim — the entire prefix deleted rather than merely down-weighted.
+  let two_m30 = libm::ldexp(1.0, -30);
+  const ALPHA: f64 = 0.999_999_999_068_677_425_384_521_484_375; // 1 - 2^-30
+  assert_eq!(ALPHA, 1.0 - two_m30, "the literal is exactly 1 - 2^-30");
+  assert_eq!(
+    ALPHA as f32, 1.0,
+    "and no f32 is nearer to it than 1.0 itself"
+  );
+  assert_eq!(EmaRenormalized::new(ALPHA).alpha(), ALPHA, "and it is kept");
+
+  let embeddings: [&[f64]; 3] = [&[0.0, 1.0], &[0.0, 1.0], &[1.0, 0.0]];
+  let coverages = [1.0, 1.0, 1.0];
+  let got = EmaRenormalized::new(ALPHA)
+    .aggregate_values(&embeddings, &coverages, 2)
+    .expect("in-domain fold");
+
+  // With `c = 1 - alpha = 2^-30` the weights are `[c^2, alpha * c, alpha]`, so
+  // the unnormalized fold is `[alpha, c^2 + alpha * c]` and its second
+  // component is the whole of what an `f32` coefficient destroys.
+  assert!(got[1] > 0.0, "the recency tail must survive: {got:?}");
+  assert!(
+    (got[1] / two_m30 - 1.0).abs() < 1e-8,
+    "and it must be the coefficient's own 2^-30: {got:?}"
+  );
+
+  // Measured against the alpha an `f32` field would have rounded this to,
+  // rather than merely asserted.
+  let collapsed = EmaRenormalized::new(1.0)
+    .aggregate_values(&embeddings, &coverages, 2)
+    .expect("in-domain fold");
+  assert_eq!(
+    collapsed,
+    vec![1.0, 0.0],
+    "at alpha = 1 the whole prefix is gone"
+  );
+}
+
+#[test]
+fn ema_renormalized_resolves_two_coefficients_the_f32_grid_merges() {
+  // The re-measure hazard this release carries, pinned as behaviour rather than
+  // left to the changelog. `0.3` and the nearest `f32` to it are two distinct
+  // `f64` coefficients that an `f32` field stores identically. A `0.2.x` caller
+  // who wrote `EmaRenormalized::new(0.3)` folded with the second; the same
+  // source now folds with the first, and the two do not agree.
+  let exact = 0.3_f64;
+  let via_f32 = f64::from(0.3_f32);
+  assert_ne!(exact, via_f32, "the two coefficients differ in f64");
+  assert_eq!(exact as f32, via_f32 as f32, "and coincide in f32");
+
+  let embeddings: [&[f64]; 4] = [&[1.0, 0.0], &[0.0, 1.0], &[1.0, 0.0], &[0.0, 1.0]];
+  let coverages = [1.0; 4];
+  let fold = |alpha: f64| {
+    EmaRenormalized::new(alpha)
+      .aggregate_values(&embeddings, &coverages, 2)
+      .expect("in-domain fold")
+  };
+  let a = fold(exact);
+  let b = fold(via_f32);
+  assert_ne!(a, b, "two coefficients, two folds");
+  // Non-vacuity: the separation is the coefficients' own relative gap, about
+  // `1.2e-8` — far above `f64` noise and far below anything an eyeball tolerance
+  // would absorb.
+  let gap = (a[0] - b[0]).abs() / a[0];
+  assert!(
+    (1e-10..1e-7).contains(&gap),
+    "the separation must be the coefficient's own, got {gap:e}"
+  );
 }
 
 #[test]
@@ -215,7 +296,7 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
   ));
   // NaN alpha is out of range and is caught before it can yield a NaN vector.
   assert!(matches!(
-    EmaRenormalized::new(f32::NAN).aggregate_values(&embeddings, &coverages, 2),
+    EmaRenormalized::new(f64::NAN).aggregate_values(&embeddings, &coverages, 2),
     Err(WinditError::AlphaOutOfRange)
   ));
   // The closed-interval endpoints stay valid.
@@ -779,12 +860,13 @@ fn ema_subnormal_product_cancellation_family_a_is_gated() {
 
 #[test]
 fn ema_subnormal_product_cancellation_family_b_is_gated() {
-  // B1 family B: alpha = 255/256 (f32-exact), n = 84 — an ordinary window count,
+  // B1 family B: alpha = 255/256 (a dyadic, exact in every binary float), n = 84
+  // — an ordinary window count,
   // confirmed on the real crate to fabricate Ok([-1, 0]) before the floor. The
   // weights (w0 = 2^-664, w1 = 255*2^-664, w2 = 255*2^-656) push the products
   // subnormal; e0 = -255*(e1 + 256*e2) is exact, so the weighted sum is exactly
   // zero. Confirms the fix depends on neither a dyadic alpha nor a large n.
-  let alpha = f32::from_bits(0x3F7F_0000); // 255/256 = 0.996_093_75
+  let alpha = 255.0 / 256.0; // 0.996_093_75
   let two_m30 = libm::ldexp(1.0, -30);
   let e1 = libm::ldexp(1.0 + 7.0 * two_m30, -392);
   let e2 = libm::ldexp(1.0 + 9.0 * two_m30, -392);
@@ -1037,6 +1119,38 @@ fn kind_into_policy_matches_builtin() {
   // The selector is generic over the compute scalar. Both calls above infer `C`
   // from the embeddings (f64) with no turbofish; here nothing else pins it,
   // which is the one case that needs the annotation.
+  // A coefficient no `f32` can hold, carried from the wire value all the way to
+  // the fold. `into_policy` is the one place a configured `f64` still crosses
+  // into the compute scalar (through `Real::from_f64`), so it is the one place
+  // that crossing can silently narrow: at `1 - 2^-30` a narrowing widener
+  // delivers exactly `1.0`, whose weights are `[0, 0, 1]`.
+  //
+  // Read through `aggregate_values` on raw `f64` slices rather than through
+  // `aggregate`: `win` builds a `TestVec`, which stores `f32` and would narrow
+  // the very difference this is measuring.
+  let fine = 1.0 - libm::ldexp(1.0, -30);
+  assert_eq!(fine as f32, 1.0, "no f32 is nearer to this alpha than 1.0");
+  let raw: [&[f64]; 3] = [&[0.0, 1.0], &[0.0, 1.0], &[1.0, 0.0]];
+  let cov = [1.0f32; 3];
+  let via_kind = AggregatePolicyKind::Ema { alpha: fine }
+    .into_policy()
+    .aggregate_values(&raw, &cov, 2)
+    .unwrap();
+  let via_builtin = EmaRenormalized::new(fine)
+    .aggregate_values(&raw, &cov, 2)
+    .unwrap();
+  assert_eq!(
+    via_kind, via_builtin,
+    "the wire value must reach the fold unrounded"
+  );
+  let collapsed = EmaRenormalized::new(1.0)
+    .aggregate_values(&raw, &cov, 2)
+    .unwrap();
+  assert_ne!(
+    via_kind, collapsed,
+    "and it must not be the alpha an f32 field would have stored"
+  );
+
   let p64 = AggregatePolicyKind::CoverageWeightedMean.into_policy::<f64>();
   let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
   let out = p64.aggregate_values(&embeddings, &[1.0, 0.5], 2).unwrap();

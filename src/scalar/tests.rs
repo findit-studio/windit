@@ -22,6 +22,35 @@ fn from_f32_is_exact() {
 }
 
 #[test]
+fn from_f64_is_exact() {
+  // The widening a smoothing factor's *wire* value takes: `AggregatePolicyKind`
+  // is deserialized before any compute scalar exists, and `into_policy` widens
+  // its `f64` through here. Exact means exact — including at values no `f32`
+  // holds, which is the whole reason the policy configuration stopped being one.
+  let cases = [
+    0.0f64,
+    1.0,
+    0.5,
+    0.1,
+    1.0 - libm::ldexp(1.0, -30), // nearest f32 is exactly 1.0
+    0.3,                         // 0.3f32 is a different number
+    libm::ldexp(1.0, -54),       // the complement's collapse boundary
+    f64::MIN_POSITIVE,
+  ];
+  for x in cases {
+    assert_eq!(
+      <f64 as Real>::from_f64(x),
+      x,
+      "widening must be the identity"
+    );
+  }
+  // Non-vacuity: two of these are values a round trip through `f32` would move,
+  // so an implementation that narrowed on the way through would be caught.
+  assert_ne!(f64::from(cases[4] as f32), cases[4]);
+  assert_ne!(f64::from(cases[5] as f32), cases[5]);
+}
+
+#[test]
 fn sqrt_matches_known_values() {
   assert_eq!(<f64 as Real>::sqrt(0.0), 0.0);
   assert_eq!(<f64 as Real>::sqrt(1.0), 1.0);

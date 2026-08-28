@@ -3,18 +3,26 @@
 //! `AggregatePolicy` is the object-safe seam: its one method works on plain
 //! slices of a [`Real`] compute scalar (`aggregate_values`), so
 //! `&dyn AggregatePolicy` is usable. The scalar is a trait type parameter
-//! defaulting to `f32`, which is what keeps that bare `dyn` spelling valid; a
-//! non-`f32` embedding names it (`dyn AggregatePolicy<f64>`). The generic free
+//! defaulting to `f64` — the compute domain of every shipped storage scalar —
+//! which is what keeps that bare `dyn` spelling valid; another compute domain
+//! names it (`dyn AggregatePolicy<C>`). The generic free
 //! function `aggregate` extracts the compute slices and per-window coverages
 //! from a `&[WindowEmbedding<E>]`, runs the policy, and reconstructs the
 //! embedding type `E` through `Vector::from_unnormalized`. Keeping
 //! reconstruction out of the trait is what lets the trait stay object-safe while
 //! embedding reconstruction stays generic.
 //!
-//! Policy *configuration* stays `f32` — an EMA smoothing factor is a
-//! dimensionless constant, not an embedding value — and is widened where it is
-//! used, through [`Real::from_f32`]. That is what leaves `AggregatePolicyKind`
-//! and its serde representation untouched by the scalar generalization.
+//! Policy *configuration* is typed by what it multiplies. A coverage stays
+//! `f32` — it is a window-geometry fraction rather than an embedding value —
+//! and widens where it is used, through [`Real::from_f32`]; that is a choice of
+//! API shape, and [`EmaRenormalized`]'s own note says why it is still open. A
+//! smoothing factor multiplies the accumulator, so it is the compute scalar
+//! itself:
+//! [`EmaRenormalized`] carries a `C`, defaulted to `f64` exactly as the trait
+//! is, and a coefficient can no longer be resolved more coarsely than the
+//! arithmetic it drives. Only the serde selector [`AggregatePolicyKind`] keeps
+//! an `f64` there, being a wire type read before any compute scalar exists; it
+//! widens through [`Real::from_f64`].
 //!
 //! Built-in strategies weight the windows by different signals:
 //!
@@ -132,6 +140,7 @@
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f32`]: crate::scalar::Real::from_f32
+//! [`Real::from_f64`]: crate::scalar::Real::from_f64
 //! [`Span`]: crate::plan::Span
 //! [`Span::coverage`]: crate::plan::Span::coverage
 
@@ -334,12 +343,40 @@ pub struct MeanRenormalized;
 /// infallible and the range is checked where the value is used — here in
 /// [`aggregate_values`](AggregatePolicy::aggregate_values), which already returns a
 /// `Result`.
+///
+/// # The coefficient is the compute scalar
+///
+/// `C` is the [`Real`] the fold runs in, defaulted to `f64` exactly as
+/// [`AggregatePolicy`] is, so `EmaRenormalized::new(0.3)` needs no turbofish and
+/// inference takes `C` from the embeddings the policy is about to run over. The
+/// coefficient is that `C` rather than an `f32` widened into it, because it
+/// multiplies the accumulator: an `f32` field cannot hold `1 - 2^-30` (its
+/// nearest `f32` is exactly `1.0`, at which the weights collapse to
+/// `[0, .., 0, 1]` and the fold returns its last window), and its grid is
+/// `2^-24` apart relatively where the weights, the products and the compensated
+/// sum all round at `2^-53`. A coverage stays `f32` — it is a window-geometry
+/// fraction that [`Span::coverage`](crate::plan::Span::coverage) computes in
+/// `f32` from two `usize`s, and moving it would change the object-safe
+/// [`AggregatePolicy::aggregate_values`] signature every custom policy
+/// implements. It is a *weight* on the fold all the same, so it is on the `f32`
+/// grid inside an `f64` sum for a reason of API shape rather than of numerics;
+/// that is a live question, not one this note settles.
+///
+/// Carrying the domain as a type parameter rather than hardcoding `f64` is what
+/// keeps the policy honest if a second `Real` is ever sealed in: its
+/// coefficient would follow its own domain with no further signature change.
+/// The serde selector [`AggregatePolicyKind`] is the one place an `f64` remains,
+/// being a wire type that is read before any compute scalar exists.
+///
+/// The bound is on the type and not only on its impls, matching
+/// [`AggregatePolicy`] itself: `C` names a compute domain, and
+/// `EmaRenormalized<String>` is not a type this crate wants to be nameable.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EmaRenormalized {
-  alpha: f32,
+pub struct EmaRenormalized<C: Real = f64> {
+  alpha: C,
 }
 
-impl EmaRenormalized {
+impl<C: Real> EmaRenormalized<C> {
   /// An EMA aggregation with the given smoothing factor.
   ///
   /// `alpha` is not validated here: a value outside `[0, 1]` (or a NaN) is
@@ -347,15 +384,18 @@ impl EmaRenormalized {
   /// [`aggregate_values`](AggregatePolicy::aggregate_values). Deferring the check is
   /// what keeps this constructor usable from `AggregatePolicyKind::into_policy`,
   /// which builds a policy from deserialized configuration and has no error
-  /// channel of its own.
+  /// channel of its own — and, since no comparison runs here, what keeps this
+  /// constructor `const` at a generic `C` where [`VectorEma::new`] cannot be.
+  ///
+  /// [`VectorEma::new`]: crate::smooth::VectorEma::new
   #[must_use]
-  pub const fn new(alpha: f32) -> Self {
+  pub const fn new(alpha: C) -> Self {
     Self { alpha }
   }
 
   /// The smoothing factor: larger values track recent windows more.
   #[must_use]
-  pub const fn alpha(&self) -> f32 {
+  pub const fn alpha(&self) -> C {
     self.alpha
   }
 }
@@ -421,7 +461,7 @@ impl<C: Real> AggregatePolicy<C> for SaliencyWeighted {
   }
 }
 
-impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
+impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
   fn aggregate_values(
     &self,
     embeddings: &[&[C]],
@@ -429,10 +469,11 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     dim: usize,
   ) -> Result<Vec<C>, WinditError> {
     // A convex EMA needs alpha in [0, 1]; anything else (including NaN, which
-    // fails the range test) is a configuration error, checked first and on the
-    // f32 configuration field so the same range is enforced at every compute
-    // scalar.
-    if !(0.0..=1.0).contains(&self.alpha) {
+    // fails both comparisons) is a configuration error, checked first. Spelled
+    // as two comparisons rather than as a `RangeInclusive::contains`, which
+    // needs `PartialOrd<C>` on a *literal*: the coefficient is now the compute
+    // scalar itself, so the bounds are `C::ZERO` and `C::ONE`.
+    if !(self.alpha >= C::ZERO && self.alpha <= C::ONE) {
       return Err(WinditError::AlphaOutOfRange);
     }
     // The recurrence `s_i = alpha*e_i + (1-alpha)*s_{i-1}` from `s_0 = e_0` is
@@ -445,9 +486,10 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized {
     // count the oldest windows' products underflow toward a subnormal; the gate's
     // `MIN_GATE_THRESHOLD` floor is what keeps that regime sound (module Input
     // domain note). The dyadic case (`alpha = 0.5` over basis vectors) reproduces
-    // the old recurrence bit for bit. `1 - alpha` is formed in `C`, not folded in
-    // `f32` first, so the `f64` path keeps the precision its type promises.
-    let alpha = C::from_f32(self.alpha);
+    // the old recurrence bit for bit. The coefficient arrives already in `C` —
+    // it is configured in the compute domain rather than widened into it — so
+    // `1 - alpha` and every weight below carry the precision the type promises.
+    let alpha = self.alpha;
     let complement = C::ONE - alpha;
     let n = embeddings.len();
     let mut weights = try_zeroed::<C>(n)?;
@@ -479,8 +521,15 @@ pub enum AggregatePolicyKind {
   MeanRenormalized,
   /// Selects [`EmaRenormalized`] with the given smoothing factor.
   Ema {
-    /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
-    alpha: f32,
+    /// The EMA smoothing factor, widened into the compute scalar and forwarded
+    /// to [`EmaRenormalized::new`].
+    ///
+    /// `f64` rather than the compute scalar `C`: this enum is the *wire* type,
+    /// deserialized before any embedding — and so before `C` — is in sight, and
+    /// a decimal in a configuration file has no compute domain of its own.
+    /// [`into_policy`](AggregatePolicyKind::into_policy) widens it through
+    /// [`Real::from_f64`], which is exact for every implementor.
+    alpha: f64,
   },
   /// Selects [`SaliencyWeighted`].
   SaliencyWeighted,
@@ -501,7 +550,7 @@ impl AggregatePolicyKind {
     match self {
       Self::CoverageWeightedMean => Box::new(CoverageWeightedMean),
       Self::MeanRenormalized => Box::new(MeanRenormalized),
-      Self::Ema { alpha } => Box::new(EmaRenormalized::new(alpha)),
+      Self::Ema { alpha } => Box::new(EmaRenormalized::new(C::from_f64(alpha))),
       Self::SaliencyWeighted => Box::new(SaliencyWeighted),
     }
   }
@@ -714,7 +763,11 @@ fn scaled_sum_of_squares<C: Real>(v: &[C], exp: i32) -> C {
 /// A vector with no scale returns its own largest magnitude: zero when it is all
 /// zero, and the non-finite component itself when one is infinite. Each is
 /// already the weight — and then the accumulator — that the caller must reject.
-fn l2_norm<C: Real>(v: &[C]) -> C {
+///
+/// `pub(crate)` so [`VectorEma`](crate::smooth::VectorEma)'s streaming
+/// determinacy gate measures against the *same* scale-aware norm this module's
+/// gate does, rather than a second spelling that could drift from it.
+pub(crate) fn l2_norm<C: Real>(v: &[C]) -> C {
   let Some(exp) = scale_exponent(v) else {
     return max_magnitude(v);
   };
@@ -727,7 +780,12 @@ fn l2_norm<C: Real>(v: &[C]) -> C {
 ///
 /// [`WinditError::NonFinite`] if `v` cannot be normalized to a finite unit
 /// vector: it is all zero, or some component is not finite.
-fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
+///
+/// `pub(crate)` so [`VectorEma`](crate::smooth::VectorEma) renormalizes each
+/// emitted window through this exact routine — the streaming sibling's
+/// "renormalized" is the same arithmetic as the fold's, not a re-derivation of
+/// it.
+pub(crate) fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
   // The one rejection, and a property of the input rather than of some
   // intermediate leaving range: an all-zero vector has no direction to normalize
   // to, and neither has one with an infinite component.

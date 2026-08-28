@@ -127,6 +127,12 @@ pub trait Real:
   + core::ops::Mul<Output = Self>
   + core::ops::Div<Output = Self>
   + PartialOrd
+  // Every implementor is an owned, borrow-free arithmetic type, so this costs
+  // implementors nothing and spares every caller a bound: a policy configured
+  // in `C` is boxed as `Box<dyn AggregatePolicy<C>>`, whose implicit `'static`
+  // would otherwise have to be re-spelled at each such site (and by every
+  // downstream wrapper around one).
+  + 'static
 {
   /// The additive identity.
   const ZERO: Self;
@@ -189,11 +195,35 @@ pub trait Real:
   /// note.
   const MIN_GATE_THRESHOLD: Self;
 
-  /// Widen an `f32` configuration value — a [`Span::coverage`] or an EMA
-  /// smoothing factor — into this domain. Exact for every implementor.
+  /// Widen an `f32` configuration value — a [`Span::coverage`], or one of the
+  /// determinacy gate's own dimensionless constants — into this domain. Exact
+  /// for every implementor.
+  ///
+  /// A smoothing factor does **not** arrive this way. It multiplies an
+  /// accumulator, so it is configured at the accumulator's own width and widens
+  /// through [`from_f64`](Real::from_f64); a coverage is a geometric fraction of
+  /// a window, computed in `f32` and never accumulated in.
   ///
   /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f32(x: f32) -> Self;
+
+  /// Widen an `f64` configuration value — an EMA smoothing factor — into this
+  /// domain. Exact for every implementor, and the identity for `f64`.
+  ///
+  /// Every implementor of this trait *is* the compute domain (`Real` is
+  /// `Scalar<Compute = Self>`), and that domain is `f64` for every shipped
+  /// scalar. A coefficient narrower than the domain it multiplies cannot
+  /// express the filters that domain can carry: no `f32` holds `1 - 2^-30` —
+  /// the nearest one is exactly `1.0` — and the `f32` grid is `2^-24` where the
+  /// arithmetic rounds at `2^-53`, so a caller would be tuning on a grid coarser
+  /// than the recurrence it is tuning. So the two smoothing-factor
+  /// constructors — `aggregate::EmaRenormalized::new` and
+  /// `smooth::VectorEma::new`, named rather than linked because both sit behind
+  /// `alloc` and this tier is featureless — take the compute domain itself
+  /// rather than widening into it. What still reaches them through here is the
+  /// serde selector `AggregatePolicyKind`, a wire value read before any compute
+  /// scalar exists.
+  fn from_f64(x: f64) -> Self;
 
   /// The square root, for L2 norms.
   fn sqrt(self) -> Self;
@@ -280,6 +310,10 @@ impl Real for f64 {
 
   fn from_f32(x: f32) -> Self {
     f64::from(x)
+  }
+
+  fn from_f64(x: f64) -> Self {
+    x
   }
 
   fn sqrt(self) -> Self {

@@ -14,9 +14,18 @@
 //!   denominated in input elements rather than in pushes, so one configuration
 //!   yields the same smoothing at any cadence — regular or irregular — over
 //!   `f32`.
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "- [`VectorEma`] is that same exponential moving average over an *embedding*\n  — any [`Vector`] — run component-wise and\n  L2-renormalized at every window: the streaming, span-preserving sibling of\n  [`EmaRenormalized`](crate::aggregate::EmaRenormalized), which folds the same\n  recency weighting to one point instead."
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "- `VectorEma` — the same exponential moving average over an *embedding*, run\n  component-wise and L2-renormalized at every window — needs the heap for its\n  `dim`-sized state and so appears only under `alloc`."
+)]
 //!
-//! The state traits and states allocate nothing and live in the featureless core
-//! tier; only the `Vec`-returning batch driver gates on `alloc`.
+//! The scalar states allocate nothing and live in the featureless core tier
+//! alongside the traits; the `Vec`-returning batch driver and the vector
+//! smoother — whose state is `dim`-sized rather than O(1) — gate on `alloc`.
 //!
 #![cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -36,8 +45,25 @@ use crate::{error::WinditError, windowed::Windowed};
 #[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;
 
+// The vector smoother's arithmetic is the aggregation half's, reached rather
+// than re-derived: `VectorEma` gates and renormalizes through the very routines
+// `weighted_sum_renorm` ends with, so the streaming and folding siblings cannot
+// drift apart.
+#[cfg(any(feature = "std", feature = "alloc"))]
+use crate::{
+  aggregate::{l2_norm, l2_renorm},
+  scalar::Real,
+  windowed::{ComputeOf, Vector},
+};
+
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
+
+/// The value behind `VectorEma::MAX_EPOCH_STEPS`, kept in the featureless tier
+/// so [`WinditError::EpochTooLong`]'s message can read the limit it reports in
+/// every feature configuration — the vector smoother itself is `alloc`-gated,
+/// and the error type is not.
+pub(crate) const VECTOR_EMA_MAX_EPOCH_STEPS: u64 = 1 << 50;
 
 /// Stateful, span-preserving value rewriter: one window in, one window out.
 ///
@@ -74,6 +100,12 @@ pub trait Smoother<V> {
   /// [`Identity`] and [`Ema`] read no spans and are infallible, always returning
   /// `Ok` and carrying the `Result` only for uniformity with the composable
   /// stages.
+  ///
+  /// Reading no spans does not by itself make a stage infallible, though: the
+  /// vector EMA reads none either and is fallible for reasons of its own — a
+  /// width that changed mid-epoch, a non-finite component, an accumulator with
+  /// no determinate direction, an epoch past the range its determinacy gate is
+  /// proven over, a refused allocation. Its own documentation enumerates them.
   fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -90,7 +122,8 @@ pub trait Smoother<V> {
 /// [`Smoother`], and drives it as a batch convenience.
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
-/// `V = f32` ([`Ema`]) or any `V` ([`Identity`]). Implement the factory
+/// `V = f32` ([`Ema`], [`CadenceEma`]), for any `V` ([`Identity`]), and — under
+/// `alloc` — for any embedding (the vector EMA). Implement the factory
 /// [`smoother`](SmoothPolicy::smoother) to add a strategy — the batch
 #[cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -118,8 +151,10 @@ pub trait SmoothPolicy<V> {
   /// # Errors
   ///
   /// - [`WinditError::AllocFailed`] if the output cannot be allocated.
-  /// - Any error the underlying [`Smoother::push`] surfaces (none for the shipped
-  ///   built-ins).
+  /// - Any error the underlying [`Smoother::push`] surfaces. Of the three scalar
+  ///   built-ins only [`CadenceEma`] can raise one, and only
+  ///   [`WinditError::NonMonotonicSpan`]; [`VectorEma`] has an error set of its
+  ///   own, enumerated on its own documentation.
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   fn smooth(&self, seq: &[Windowed<V>]) -> Result<Vec<Windowed<V>>, WinditError>
@@ -730,6 +765,858 @@ impl SmoothPolicy<f32> for CadenceEma {
     CadenceEmaState {
       tau: self.tau,
       prev: None,
+    }
+  }
+}
+
+/// Component-wise exponential moving average over an embedding, L2-renormalized
+/// at every window: the streaming, span-preserving sibling of
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized).
+///
+/// One window in, one window out. The accumulator advances
+/// `s_t = alpha * x_t + (1 - alpha) * s_{t-1}` component-wise from `s_0 = x_0`,
+/// exactly as [`Ema`] does per scalar, and each window emits the *direction* of
+/// that accumulator — `s_t / ||s_t||` — reconstructed through
+/// [`Vector::from_unnormalized`]. Nothing is collapsed: every pushed window
+/// still produces one output, carrying its input
+/// [`Span`](crate::plan::Span) unchanged. That is the shape difference from
+/// [`aggregate`](crate::aggregate), which folds a finished slice to one point.
+///
+/// # Renormalized, not merely averaged
+///
+/// The renormalization is applied to an emitted *copy*; the accumulator itself
+/// stays raw. That is what makes this the streaming sibling of
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) rather than a
+/// spherical filter of its own: the recency
+/// weights `w_0 = (1 - alpha)^t`, `w_i = alpha * (1 - alpha)^(t - i)` that the
+/// aggregate builds explicitly are exactly the ones this recurrence carries, so
+/// the window at index `i` emits the direction the aggregate folds over the
+/// prefix `[0..=i]`. Renormalizing the accumulator in place instead would keep
+/// the state on the unit sphere and change every later weight — a different
+/// filter, and not one this crate's aggregation half has a fold for.
+///
+/// A component-wise EMA of unit vectors is *not* a unit vector: mix `[1, 0]`
+/// and `[0, 1]` at `alpha = 0.5` and the accumulator is `[0.5, 0.5]`, of norm
+/// `2^-0.5`. The renormalization is what turns that back into an embedding, and
+/// it runs through the same scale-aware routine the aggregation fold ends with,
+/// so a direction whose norm is not representable is still normalized rather
+/// than rejected.
+///
+/// # A recurrence, not a fold
+///
+/// That equivalence is exact in exact arithmetic, and neither side computes in
+/// exact arithmetic. **The two are not bit-identical and cannot be made so.**
+/// The aggregate materializes each weight by iterated multiplication and folds
+/// the whole prefix with Neumaier compensation; this carries a two-term
+/// recurrence and no compensation at all. Two different roundings of one exact
+/// quantity, each with its own error bound, and no amount of compensation here
+/// would close the gap: the aggregate's own weights are rounded, so even an
+/// exactly-evaluated recurrence would disagree with it. What holds is narrower
+/// and is what the tests pin:
+///
+/// - **Determinate prefixes agree.** Where the exact combination clears both
+///   thresholds the two emit the same direction, to within the sum of their
+///   error bounds — `1e-12` over a twelve-window sweep at five smoothing
+///   factors and both storage widths, against directions of order one.
+/// - **Indeterminate prefixes are refused by both.** Where the exact
+///   combination is zero, each side's result is inside its own error bound of
+///   zero and therefore at or below its own threshold. Neither fabricates a
+///   direction out of cancellation.
+/// - **Near the thresholds the verdicts can differ, in *either* direction.**
+///   Neither threshold bounds the other, and this crate promises no ordering
+///   between them. Two witnesses, both pinned as tests:
+///
+///   - at `alpha = 0.3` over a three-window prefix leaving a residue of about
+///     `3.63e-15`, the aggregate emits a direction and this side refuses;
+///   - at `alpha = 0.3f32` (`0x3e99999a`) over the one-dimensional windows
+///     `0x3f0ca8ca28200000`, `0xbf20b7cb3226ac2d`, `0xbc2767b60c530643`, both
+///     accumulators land on the same magnitude `0x3c0c160dbb1cff8d` and the two
+///     thresholds land one ulp apart the *other* way — `...ff8c` here and
+///     `...ff8d` there — so this side emits and the aggregate refuses.
+///
+///   An earlier revision claimed this side was never the less conservative of
+///   the two. That was derived by induction against
+///   `alpha * |x_t| + (1 - alpha) * M_{t-1}`, the mass an *ideal* fold would
+///   accumulate, and [`EmaRenormalized`](crate::aggregate::EmaRenormalized) does
+///   not evaluate that recurrence: it rematerializes each weight by iterated
+///   multiplication and sums `|w_i * x_i|` in window order. Those roundings need
+///   not land where the recurrence's do, and the second witness is a prefix
+///   where they do not. The one length at which the two masses provably
+///   coincide is two — where `M_1` is the one-window fold's mass exactly — and
+///   then only for an `alpha` strictly inside `(0, 1)`, the two ends being the
+///   exact steps that charge nothing at all.
+///
+/// Only the first of those is an accuracy claim. The second is each gate's own
+/// [self-contained contract](#determinacy-gate). The third is an *observation*
+/// about two independently sound gates — measured by the differential tests,
+/// recorded by them, and not promised by either type.
+///
+/// # Determinacy gate
+///
+/// **The contract is self-contained: this gate refuses when the accumulator is
+/// within its own error bound of zero.** That is a property of this type,
+/// provable from its own recurrence, and it says nothing about how any other
+/// code path rounds — in particular nothing about what
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) emits for the same
+/// windows, which is an empirical matter the tests characterize rather than a
+/// guarantee this type makes.
+///
+/// Before each renormalization the accumulator is measured against its own
+/// rounding floor, `16 * `[`EPSILON`](crate::scalar::Real::EPSILON)` * ||M|| + `[`MIN_GATE_THRESHOLD`](crate::scalar::Real::MIN_GATE_THRESHOLD).
+/// A result at or below it is reported as [`WinditError::NonFinite`] — "no
+/// direction determined at working precision" — rather than handed to a
+/// renormalization that would amplify rounding noise into a fabricated unit
+/// direction. The shape, the constant and the absolute floor are the
+/// aggregate's, unchanged, and so are the scale-aware norm and renormalization
+/// the comparison runs through; what is this type's own is `M`. The gate fires on
+/// exact cancellation (`[1, 0]` then `[-1, 0]` at `alpha = 0.5`) and on the
+/// near-miss residues an exact-zero test would let through.
+///
+/// `M` is where a recurrence differs from a fold, and it is not this step's two
+/// term magnitudes. Those measure the step just taken; what the accumulator
+/// actually carries is the rounding of *every* step, damped by the same
+/// `(1 - alpha)` the value is, because each step's error is multiplied into the
+/// next:
+///
+/// ```text
+/// M_t = |alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) * M_{t-1},   M_0 = 0
+/// ```
+///
+/// dominates the accumulator's distance from the exactly-evaluated recurrence
+/// (`2 * u * M_t` componentwise, `u = EPSILON / 2`), which the two-term
+/// magnitude does not once earlier windows have cancelled — a collapsed
+/// `|s_{t-1}|` no longer records the mass it collapsed from. `M_0` is zero
+/// because the seed is a copy: `s_0 = x_0` commits no rounding, so it needs no
+/// allowance, and an all-zero seed is caught by the threshold's absolute floor
+/// alone. The full induction, the two exact-step exemptions, and the absolute
+/// term the subnormal range needs are carried on this crate's `ema_step`.
+///
+/// A step that rounds nothing charges nothing, so `alpha = 0` — an exact hold —
+/// accumulates no mass at all and holds its seed direction for an unbounded
+/// epoch. Everywhere else the mass grows with the epoch: geometrically toward
+/// about `max|x| / alpha`, or linearly at a nonzero `alpha` so small that
+/// `1 - alpha` rounds to exactly `1`. Far enough out the threshold does overtake
+/// a determinate accumulator, and that horizon is **reachable in principle**
+/// rather than excluded: it needs `32 * u > alpha`, so `alpha < 2^-48`, and at
+/// such an `alpha` it takes upward of `2^48` pushes to arrive. An epoch that
+/// long at such an `alpha` ends with [`NonFinite`](WinditError::NonFinite) on
+/// every window until a [`reset`](Smoother::reset) — the honest cost of a bound
+/// that keeps allowing for error a recurrence really does propagate. (An
+/// earlier revision called the horizon unreachable. It is not, and at
+/// `alpha = 0` it was reachable through mass an exact hold never committed,
+/// which is the defect the exact-step rule removes.)
+///
+/// That horizon is the gate turning *over*-conservative, which costs liveness
+/// and nothing else. The one below is the opposite failure and is why this type
+/// counts its epoch.
+///
+/// # Epoch horizon
+///
+/// `M` bounds the accumulator's error only while `M` itself is accumulated
+/// faithfully, and `M` is carried in the same floating point everything else
+/// here is. Five roundings a charging step feed it — the two term products,
+/// their sum, the damped carry, and the final add — each to nearest, so the
+/// computed mass can sit *below* the mass an exactly-evaluated recurrence would
+/// carry. Writing
+/// `M^` for the computed mass, `M^ex` for the exact one, and `t` for the number
+/// of charging steps, this crate's `ema_step` gives by induction
+///
+/// ```text
+/// M^_t  >=  (1 - u)^(2t + 1) * M^ex_t
+/// ```
+///
+/// and the gate's constant of sixteen against a `2u` bound absorbs exactly that
+/// while `(1 - u)^(2t + 1) >= 1/16` — `t` up to about `2^53.4`. Past there the
+/// gate is no longer *proven* conservative, and the failure is not hypothetical.
+/// At `alpha = 2^-54` the complement rounds to exactly `1`, so an accumulator of
+/// `2^-24` absorbs every `2^-78` injection unchanged while `M`, charged exactly
+/// `2^-24` a step, reaches exactly `2^29` after `2^53` steps and then
+/// **stagnates**: each further `2^-24` is exactly half an ulp there and ties
+/// back to even. After `2^60` such steps the exact recurrence stands at
+/// `65 * 2^-24` and the accumulator still reads `2^-24`; `2_129_920` pushes of
+/// `-2^15` then take the exact recurrence to zero while the accumulator lands on
+/// `-2^-18` against a threshold of `2^-19`, and the gate emits a direction for a
+/// prefix whose exact value is zero. Every input there is finite, in domain, and
+/// exactly representable.
+///
+/// So [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) is enforced rather than
+/// described. The step that would carry an epoch past `2^50` charging steps is
+/// refused with [`EpochTooLong`](WinditError::EpochTooLong) — before the
+/// accumulator is touched, so the refusal is a no-op — and every push after it
+/// is refused the same way. The enforced limit sits three binary orders inside
+/// the proven one, so the regime the code accepts is strictly inside the regime
+/// the proof covers. It is inside the absolute term's own reach too: *Subnormals*
+/// on `ema_step` needs `t * sqrt(dim) <= 2^74` for the accumulated subnormal
+/// allowance to stay under the gate's `2^-1000` floor, which `2^50` satisfies for
+/// every `dim` an embedding has.
+///
+/// Only **charging** steps count, which is the same `t` the induction is stated
+/// over. A step that rounds nothing charges nothing and costs `M` no precision
+/// either — at `alpha = 1` the complement is exactly zero, and where the
+/// complement collapses to exactly `1` the carry is a rounding-free copy — so an
+/// exact hold still holds its seed direction, and an exact pass-through still
+/// tracks its input, for an unbounded epoch, as both did before this bound
+/// existed.
+///
+/// A caller that means to keep filtering past the horizon starts a new epoch:
+/// [`reset`](Smoother::reset), or the equivalent
+/// [`discontinuity`](Smoother::discontinuity), clears the accumulator, the mass
+/// and the count, and the next window seeds afresh. Nothing can be offered that
+/// keeps the old prefix — the point of the refusal is that the prefix's error is
+/// no longer bounded — so a typed refusal the caller can act on is the honest
+/// answer.
+///
+/// # Dimension
+///
+/// The first push after construction (or after a
+/// [`reset`](Smoother::reset)/[`discontinuity`](Smoother::discontinuity)) fixes
+/// the epoch's dimension. A later window of a different width is rejected with
+/// [`WinditError::DimMismatch`]; there is no defensible alternative, since a
+/// 512-wide state has no component to mix a 384-wide window into. The width is
+/// read off the *projected* slice
+/// ([`compute_components`](Vector::compute_components)) rather than
+/// [`dim`](Vector::dim), because that projection is the value surface the
+/// recurrence actually reads.
+///
+/// # Inputs are validated, not absorbed
+///
+/// Unlike the scalar [`Ema`], which documents a non-finite input poisoning its
+/// state until a reset, this smoother refuses one: a window carrying a `NaN` or
+/// an infinity is rejected with [`WinditError::NonFinite`] **before any
+/// component of the accumulator is written**, so the stream continues from the
+/// state the previous window left. Every rejection this type can raise is
+/// checked ahead of the recurrence, so a refused push is a no-op and a retry
+/// behaves as if it never happened — with one deliberate exception: a window
+/// whose *output* is rejected, by the determinacy gate or by the embedding's own
+/// reconstruction, has still advanced the accumulator. It was a real
+/// observation; only the direction read off it was unavailable, and the next
+/// window mixes against the state it produced. That matches the prefix the
+/// aggregate would fold, which is the property this type is defined by.
+///
+/// Rejecting rather than absorbing is also what the aggregate does — its
+/// input-domain check refuses a non-finite component with the same
+/// [`NonFinite`](WinditError::NonFinite) — so the two halves agree.
+///
+/// They agree on the *magnitude* domain too: a component that is neither zero
+/// nor between [`MIN_AGG_MAGNITUDE`](crate::scalar::Real::MIN_AGG_MAGNITUDE)
+/// and [`MAX_AGG_MAGNITUDE`](crate::scalar::Real::MAX_AGG_MAGNITUDE) is
+/// refused with [`MagnitudeOutOfRange`](WinditError::MagnitudeOutOfRange),
+/// the aggregation
+/// [input domain](crate::aggregate#input-domain) verbatim, before the
+/// accumulator is written. It would be tempting to argue that domain away —
+/// the recurrence itself is a two-term convex step, `alpha * x + (1 - alpha) * s`
+/// is bounded by `max(|x|, |s|)`, and the scale-aware renormalization handles a
+/// norm that is not representable — but the recurrence is not the only thing
+/// running. The determinacy gate below carries a *mass* that is an `n`-term
+/// geometric fold over the whole epoch, which is precisely the shape the
+/// aggregation domain exists to keep inside `f64`; and the gate reads that mass
+/// through an L2 norm that overflows for a diagonal of `f64::MAX` long
+/// before the renormalization it guards would have. Both are bounded by the
+/// domain and by nothing else, so it is this type's precondition as much as the
+/// fold's. Every value an `f32`-storage embedding can produce is more than 250
+/// binary orders inside it, so only an `f64`-storage embedding can reach the
+/// boundary at all.
+///
+/// # Alpha
+///
+/// **The coefficient is the compute scalar, not `f32`.** `VectorEma<C>` carries
+/// a `C: Real` — defaulted to `f64` exactly as
+/// [`AggregatePolicy`](crate::aggregate::AggregatePolicy) is, so
+/// `VectorEma::new(0.3)` needs no turbofish — and the
+/// [`SmoothPolicy`] impl ties that `C` to
+/// [`ComputeOf<E>`](crate::windowed::ComputeOf), the domain the recurrence
+/// actually runs in. A coefficient cannot be resolved more coarsely than the
+/// arithmetic it drives, which an `f32` field could not promise. Two
+/// consequences, both real:
+///
+/// - **The top of the range was a cliff, not a slope.** The only `f32` within
+///   `2^-24` of `1` is `1` itself, so every coefficient whose complement was
+///   below that — `1 - 2^-30`, say — arrived as exactly `1.0`. That is not a
+///   near-pass-through with a `2^-30` memory; it is an exact pass-through, which
+///   by *Exact steps* charges no mass and never advances the epoch. A whole
+///   family of filters was not approximated but deleted.
+/// - **The tuning grid did not match the arithmetic.** Adjacent `f32`
+///   coefficients are `2^-24` apart relatively, while the recurrence rounds at
+///   `2^-53` and its complement does not collapse until `2^-54`. A caller was
+///   tuning on a grid twenty-nine binary orders coarser than the regime the
+///   *Exact steps* rule is stated over, and two intended coefficients `2^-40`
+///   apart were the same filter.
+///
+/// [`new`](VectorEma::new) clamps `alpha` into `[0, 1]` exactly as
+/// [`Ema::new`] does, NaN included (it clamps to `0.0`, holding the seed
+/// direction). The smoothing path is therefore total in its coefficient, and
+/// `alpha` never reaches the error channel — the smoother idiom, not the
+/// aggregate's deferred [`AlphaOutOfRange`](WinditError::AlphaOutOfRange)
+/// check. Clamping costs `new` its `const`: the comparisons are
+/// [`Real`]'s `PartialOrd`, and a trait method cannot run in a `const fn`.
+///
+/// # Allocation
+///
+/// Three `dim`-length buffers — the accumulator, the gate's running mass vector,
+/// and the unit copy handed to
+/// [`from_unnormalized`](Vector::from_unnormalized) — are grown on the first
+/// push of an epoch and reused by every push after it, and
+/// [`reset`](Smoother::reset) keeps their capacity, so a discontinuity costs no
+/// allocation either. The filter itself therefore allocates nothing per window.
+/// Two allocations per window remain, and both belong to the embedding rather
+/// than to the filter: the reconstruction
+/// [`from_unnormalized`](Vector::from_unnormalized) performs, and — for storage
+/// narrower than its compute domain, which is every `f32` embedding — the
+/// widened buffer [`compute_components`](Vector::compute_components) returns.
+/// The second is the price of reading the embedding through its declared value
+/// surface instead of its raw storage, which is what keeps quantized storage
+/// from being smoothed as codes; `f64` storage borrows and pays neither.
+///
+/// Because the state is `dim`-sized rather than O(1), this is the one smoother
+/// that needs the heap, which is why it gates on `alloc` while [`Identity`],
+/// [`Ema`], and [`CadenceEma`] do not.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+///
+/// `C: Real` sits on the type and not only on its impls, matching
+/// [`AggregatePolicy<C: Real = f64>`](crate::aggregate::AggregatePolicy): `C`
+/// names a *compute domain*, and `VectorEma<String>` is not a type this crate
+/// wants to be nameable. It is not needed to name the field — the test
+/// [`VectorEmaState`]'s own `E: Vector` bound has to meet — so it is a contract
+/// bound, kept deliberately, rather than a structural one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorEma<C: Real = f64> {
+  alpha: C,
+}
+
+/// The `f64` compute domain's epoch limit.
+///
+/// On `VectorEma<f64>` rather than on the generic impl, and not because the
+/// concept is `f64`-specific: the *number* is. The horizon is derived from the
+/// compute domain's own unit roundoff — the gate stays conservative while
+/// `(1 - u)^(2t + 1) >= 1/16`, `u = EPSILON / 2` — so a second [`Real`] would
+/// carry a different one, computed from its own `EPSILON`, and there is no way
+/// to spell that as a `const` generic over `C` today. Stating it here keeps the
+/// bare path `VectorEma::MAX_EPOCH_STEPS` resolvable, which a `const` on the
+/// generic impl would not be: a type parameter's default does not apply to an
+/// associated-item path, so that spelling would demand
+/// `VectorEma::<f64>::MAX_EPOCH_STEPS` at every use site.
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl VectorEma<f64> {
+  /// The longest epoch the determinacy gate is proven over: `2^50` charging
+  /// steps.
+  ///
+  /// Counted in `ema_step` applications that charge mass, not in pushes: the
+  /// seed rounds nothing, and neither does an exact step, so an `alpha` of `0`
+  /// or `1` never advances the count at all. Once an epoch reaches this many,
+  /// every further push is refused with
+  /// [`EpochTooLong`](WinditError::EpochTooLong) until a
+  /// [`reset`](Smoother::reset).
+  ///
+  /// The value is the proof's, rounded inward. The gate is conservative while
+  /// the computed mass stays within a factor of sixteen of the exact one, which
+  /// *Epoch horizon* on [`VectorEma`] puts at about `2^53.4` charging steps;
+  /// `2^50` is three binary orders inside that and inside the subnormal term's
+  /// `2^74` reach as well. It is not a resource limit and not a guess about
+  /// workloads — at one window a millisecond an epoch would run for 35,700
+  /// years before reaching it — it is the edge of what this type can prove about
+  /// its own threshold.
+  ///
+  /// `f64` is the compute domain of every shipped storage scalar, so this is the
+  /// limit every embedding the crate can carry is held to; the enforcement in
+  /// [`Smoother::push`] reads the same value.
+  pub const MAX_EPOCH_STEPS: u64 = VECTOR_EMA_MAX_EPOCH_STEPS;
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<C: Real> VectorEma<C> {
+  /// A renormalizing vector EMA with the given smoothing factor, clamped into
+  /// `[0, 1]`.
+  ///
+  /// Clamping at construction is what keeps the coefficient out of the error
+  /// channel: above `1.0` clamps to `1.0`, below `0.0` clamps to `0.0`, and a
+  /// NaN becomes `0.0` (hold the seed direction). [`alpha`](VectorEma::alpha)
+  /// reports the clamped value the recurrence actually uses. This is
+  /// [`Ema::new`]'s rule verbatim, not the aggregate
+  /// [`EmaRenormalized`](crate::aggregate::EmaRenormalized)'s deferred
+  /// rejection: a smoother's `push` must stay total in its configuration.
+  #[must_use]
+  pub fn new(alpha: C) -> Self {
+    Self {
+      alpha: clamp_coefficient(alpha),
+    }
+  }
+
+  /// The smoothing factor, always in `[0, 1]`.
+  #[must_use]
+  pub const fn alpha(&self) -> C {
+    self.alpha
+  }
+}
+
+/// Clamp a smoothing factor into `[0, 1]`, NaN included.
+///
+/// Spelled as two comparisons rather than as `clamp`: a NaN fails both of
+/// them and falls through to `ZERO`, where `f64::clamp` would propagate it, and
+/// [`Real`] offers ordering but no `is_nan`. That makes the shape the *only*
+/// spelling available generically as well as the one [`Ema::new`] already uses,
+/// so the two smoothers cannot drift apart on the coefficient invariant the
+/// recurrence depends on.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn clamp_coefficient<C: Real>(alpha: C) -> C {
+  if alpha > C::ONE {
+    C::ONE
+  } else if alpha >= C::ZERO {
+    alpha
+  } else {
+    C::ZERO
+  }
+}
+
+/// The streaming state of a [`VectorEma`]: the clamped coefficient and the raw
+/// component-wise accumulator, unseeded until the first push.
+///
+/// The accumulator is carried in the embedding's compute domain
+/// ([`ComputeOf<E>`], `f64` for every shipped scalar) rather than in its
+/// storage scalar, the same widening [`CadenceEmaState`] applies to its scalar
+/// state and [`aggregate`](crate::aggregate) applies to its fold. Alongside it
+/// the state keeps two `dim`-length scratch buffers: the running mass vector the
+/// determinacy gate measures against, and the unit copy handed to
+/// [`Vector::from_unnormalized`] — so the accumulator itself is never
+/// renormalized.
+///
+/// An empty accumulator *is* the unseeded state: [`reset`](Smoother::reset)
+/// clears the buffers without releasing their capacity, so a new epoch re-seeds
+/// without allocating.
+///
+/// The `E: Vector` bound is structural, not behavioural: the buffers are
+/// `Vec<ComputeOf<E>>` — a projection through `E`'s associated `Scalar` — so the
+/// field types cannot be *named* without it, and it therefore cannot be narrowed
+/// onto the impls that call `E`'s methods. Nothing here stores an `E`.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub struct VectorEmaState<E: Vector> {
+  alpha: ComputeOf<E>,
+  /// The raw EMA accumulator, `s_t`. Empty until the first push seeds it.
+  state: Vec<ComputeOf<E>>,
+  /// `M`: the gate's running mass — this step's two term magnitudes plus the
+  /// damped mass of every step before it. See [`ema_step`] for why it
+  /// accumulates rather than being overwritten.
+  mag: Vec<ComputeOf<E>>,
+  /// The renormalized copy of `state` that each window emits.
+  unit: Vec<ComputeOf<E>>,
+  /// `t`: the epoch's charging steps, the quantity
+  /// [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) bounds. Advanced only by a
+  /// step that rounds `mag`, because only such a step costs the mass the
+  /// relative precision the gate's proof spends.
+  steps: u64,
+}
+
+/// Hand-written rather than derived: a derive would demand `E: Clone` for a
+/// parameter this state never stores a value of.
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> Clone for VectorEmaState<E> {
+  fn clone(&self) -> Self {
+    Self {
+      alpha: self.alpha,
+      state: self.state.clone(),
+      mag: self.mag.clone(),
+      unit: self.unit.clone(),
+      steps: self.steps,
+    }
+  }
+}
+
+/// Hand-written for the same reason as [`Clone`], and reporting the state's
+/// *shape* rather than its numbers: [`Real`] carries no [`Debug`] bound, so
+/// neither the accumulator nor the coefficient can be formatted from here at
+/// all. The coefficient joined them when it became `ComputeOf<E>`; bounding this
+/// impl on `ComputeOf<E>: Debug` would print it, at the cost of making the impl
+/// unprovable from a bare `E: Vector` — a worse trade for a shape report.
+/// [`VectorEma::alpha`] reads the configured value directly.
+///
+/// [`Debug`]: core::fmt::Debug
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("VectorEmaState")
+      .field("seeded", &!self.state.is_empty())
+      .field("dim", &self.state.len())
+      .field("steps", &self.steps)
+      .finish()
+  }
+}
+
+// `C: Real` on this helper and the two below it is the narrowest bound the crate
+// offers, not a convenience reach for the whole numeric surface: `ZERO`, `ONE`,
+// `EPSILON`, `MIN_GATE_THRESHOLD`, `abs`, `from_f32` (the gate's constant `16`)
+// and `from_f64` (the coefficient) are declared on `Real` and on nothing
+// narrower, and `l2_norm`/`l2_renorm` demand it in turn. The type parameter is
+// load-bearing too — `ComputeOf<E>` reaches these as an unnormalized projection,
+// so a monomorphic `f64` signature would not accept the buffers even though
+// `Real` is sealed to `f64` alone.
+
+/// Fit `buf` to exactly `dim` zeroed components, reusing whatever capacity a
+/// previous epoch left.
+///
+/// `try_reserve_exact` rather than `resize` alone: the dimension comes from a
+/// caller's embedding and need not correspond to memory that exists, so a
+/// refused allocation must surface as [`WinditError::AllocFailed`] rather than
+/// abort the process — the same typed-OOM discipline every `Result`-returning
+/// path in this crate keeps.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn refit<C: Real>(buf: &mut Vec<C>, dim: usize) -> Result<(), WinditError> {
+  buf.clear();
+  buf
+    .try_reserve_exact(dim)
+    .map_err(|_| WinditError::AllocFailed { elements: dim })?;
+  buf.resize(dim, C::ZERO);
+  Ok(())
+}
+
+/// Advance a seeded accumulator by one window, advancing alongside it the mass
+/// the determinacy gate measures the result against.
+///
+/// The two products are formed once and used twice — summed into the
+/// accumulator and, by magnitude, into `mag` — so the mass charged for this step
+/// is exactly the mass the step folded, not a re-derivation that could disagree
+/// with it. `mag` then *accumulates* rather than being overwritten:
+///
+/// ```text
+/// M_t = |alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) * M_{t-1}
+/// ```
+///
+/// — the same recurrence, damped by the same coefficient, as the accumulator
+/// itself, for every step that rounds at all (*Exact steps* below is the
+/// exception, and the only one). That third term is the whole difference
+/// between a mass that measures one *step* and one that measures a
+/// *recurrence*. An overwrite —
+/// `|alpha * x_t| + |(1 - alpha) * s_{t-1}|` alone — takes the measure of the
+/// step just taken, and when earlier windows cancelled that is far below the
+/// rounding they left behind: the collapsed `|s_{t-1}|` no longer knows what it
+/// collapsed from.
+///
+/// # What `M` bounds
+///
+/// Write `c` for the complement as this function actually holds it (the rounded
+/// `fl(1 - alpha)`, which is what the recurrence runs on), and `s^ex` for that
+/// same recurrence — same `alpha`, same `c`, same seed, same inputs — evaluated
+/// in exact arithmetic. Then `e_t = s_t - s^ex_t` is this accumulator's own
+/// error, and one step gives
+///
+/// ```text
+/// e_t = c * e_{t-1} + eta_t,   |eta_t| <= 2u * (|alpha * x_t| + |c * s_{t-1}|)
+/// ```
+///
+/// (`u = EPSILON / 2`, over the two products and their sum). The rounding a step
+/// commits is therefore *carried forward* under the same decay the value is, and
+/// `M` is exactly the accumulator that dominates it: `|e_t| <= 2u * M_t`
+/// follows by induction, componentwise, because the same `c` damps both. `M_0`
+/// is zero — [`Smoother::push`] seeds `s_0 = x_0` by copy, which commits no
+/// rounding.
+///
+/// That is a statement about *this* recurrence and about nothing else. It is
+/// not, and no longer claims to be, a statement about the mass
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) computes over the same
+/// windows: see [`VectorEma`]'s *A recurrence, not a fold* for why an induction
+/// over the ideal fold does not transfer to the shipped one.
+///
+/// # Exact steps
+///
+/// A step that rounds nothing charges nothing, and both ends of the coefficient
+/// range reach that:
+///
+/// - `alpha == 1` makes `c` exactly zero, so `carried` is zero, `recent` is a
+///   copy of `x_t`, and their sum is exact.
+/// - `c == ONE` — every `alpha` at or below `2^-54`, zero included (`2^-54` is
+///   the tie that rounds to even; `1 - 2^-53` is still exactly representable) —
+///   makes
+///   `carried` a rounding-free copy of `s_{t-1}`. When `recent` is zero as well
+///   (`alpha == 0`, or a zero component of `x_t`; the input domain rules out an
+///   underflow to zero) the sum adds an exact zero and the whole step is exact.
+///
+/// Charging for those steps was a liveness defect rather than a conservatism.
+/// At `alpha = 0` the accumulator is a held seed forever, yet `|c * s_{t-1}|`
+/// put `|s_0|` into the mass every push, so `M` grew *linearly* — not
+/// geometrically, since `c` is `1` and damps nothing. After `2^48` pushes
+/// `16 * EPSILON * M` reaches `|s_0|` itself, and the gate's inclusive
+/// comparison then refuses the held seed from that push on, forever. With the
+/// rule above the mass of an exact hold stays exactly zero and the horizon is
+/// never approached.
+///
+/// A *nonzero* `alpha` at or below `2^-54` keeps the linear growth, and keeps it
+/// legitimately: `recent + carried` genuinely rounds every push and, with `c`
+/// equal to one, those roundings accumulate undamped. There a growing threshold
+/// is a true statement about a state whose error really has grown, so only the
+/// exact step is exempted.
+///
+/// # Subnormals
+///
+/// `|e_t| <= 2u * M_t` is purely *relative*, and subnormal rounding is
+/// *absolute*, so the complete bound carries a second term:
+///
+/// ```text
+/// |e_t| <= 2u * M_t + E_t,   E_t <= c * E_{t-1} + eta,   eta = 2^-1074
+/// ```
+///
+/// one `eta / 2` for each of the step's two products, which are the only
+/// operations here whose result can be subnormal — floating-point addition never
+/// underflows, the exact sum of two representable numbers being itself
+/// representable whenever it is subnormal. So `E_t <= t * eta` in the worst
+/// case (`c = 1`, no damping), and `||E_t|| <= sqrt(dim) * t * eta` over the
+/// whole vector.
+///
+/// The absolute term never decides a verdict, because the threshold carries the
+/// absolute floor [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) = `2^-1000`,
+/// and `sqrt(dim) * t * eta <= 2^-1000` for every epoch with
+/// `t * sqrt(dim) <= 2^74` — far past the `2^48` horizon the relative term
+/// already sets, and past any `dim` an embedding has. The regime is real, not
+/// hypothetical: at `alpha = 0.5` a seed of `2^-400` and 675 all-zero windows
+/// leave the computed accumulator at zero where the exact recurrence is
+/// `2^-1075`, against a `2u * M` of about `2^-1118`. The floor had already
+/// refused that accumulator 75 windows earlier.
+///
+/// # `M`'s own rounding, and the horizon it sets
+///
+/// `M` is itself computed in floating point, and every rounding a charging step
+/// feeds it is to nearest, so they can leave it *below* the exact mass rather
+/// than above it. Write `A_t = |alpha * x_t|` and `B_t = |c * s_{t-1}|` for the
+/// two exact products, `M^ex_t = A_t + B_t + c * M^ex_{t-1}` for the
+/// exactly-evaluated mass, and `M^` for the one this function writes. Each of
+/// the two products lands within a relative `u` of its exact value, their sum
+/// within another, the damped carry within another, and the final add within a
+/// fifth:
+///
+/// ```text
+/// M^_t  >=  (1 - u)^3 * (A_t + B_t)  +  (1 - u)^2 * c * M^_{t-1}
+/// ```
+///
+/// so `M^_t >= (1 - u)^(2t + 1) * M^ex_t` by induction over the charging steps
+/// `t` (base `M^_0 = M^ex_0 = 0`; the step uses `(1 - u)^3 >= (1 - u)^(2t + 1)`).
+/// The gate needs `M^ex <= 16 * M^` to stay conservative — a `2u` bound read
+/// against a `32u` threshold — so the guarantee holds while
+/// `(1 - u)^(2t + 1) >= 1/16`, which is `t` up to about `2^53.4`.
+///
+/// It is not an asymptotic caveat. The bound genuinely fails past there, by
+/// `M^` **stagnating**: once a step's charge falls to half an ulp of `M^` and
+/// ties to even, `M^` stops moving while `M^ex` keeps climbing. *Epoch horizon*
+/// on [`VectorEma`] carries the worked counterexample and the enforced limit
+/// this returns the count for. Only a step that rounds `M^` costs that relative
+/// precision, which is why the return value is the charge flag rather than a
+/// plain "a step happened": an exact step leaves `M^` bit-identical
+/// (`c` is exactly `1`, so `c * M^` is a copy) or exactly zero (`c` is exactly
+/// `0`), and neither spends anything the horizon is counting.
+///
+/// The absolute contribution to `M^`'s own rounding — an operand or a result in
+/// the subnormal range, where `(1 - u)` says nothing — is at most `3 * 2^-1075`
+/// a step and so at most `3t * 2^-1075` over the epoch, which reaches the
+/// verdict only through `2u`, at `3t * 2^-1127`. That is under the gate's
+/// `MIN_GATE_THRESHOLD` floor by the same margin the *Subnormals* note above
+/// computes for the accumulator itself.
+///
+/// # Returns
+///
+/// Whether this step **charged**: `true` if any component took the rounding
+/// branch, `false` for an exact step, which leaves `M` unrounded and so does not
+/// advance the epoch count.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[must_use]
+fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) -> bool {
+  let complement = C::ONE - alpha;
+  // Hoisted coefficient facts, read once per window rather than per component:
+  // a coefficient of `ONE` makes its product a rounding-free copy, and a
+  // coefficient of `ZERO` annihilates. At the two ends of the range that is
+  // enough to make the whole step exact — see the *Exact steps* note above.
+  let carry_is_a_copy = complement == C::ONE;
+  let injection_is_everything = alpha == C::ONE;
+  let mut charged = false;
+  for ((s, m), &xj) in state.iter_mut().zip(mag.iter_mut()).zip(x.iter()) {
+    let recent = alpha * xj;
+    let carried = complement * *s;
+    *s = recent + carried;
+    // A step that rounds nothing charges nothing. Everywhere else the two term
+    // magnitudes bound all three roundings at `2u`.
+    let committed = if injection_is_everything || (carry_is_a_copy && recent == C::ZERO) {
+      C::ZERO
+    } else {
+      // The one place the epoch count can advance, and it is the branch itself
+      // that decides: taking it is exactly the condition under which `*m` below
+      // CAN round, since the exempt branch leaves `complement` at `ONE` or
+      // `ZERO`, either of which makes `complement * *m` and its zero-addend sum
+      // exact. So the count and the induction's `t` are the same quantity by
+      // construction rather than by agreement between two spellings, and it
+      // over-counts (a charging step whose three operations happen to be exact
+      // still counts) in the only direction that is safe.
+      charged = true;
+      recent.abs() + carried.abs()
+    };
+    *m = committed + complement * *m;
+  }
+  charged
+}
+
+/// Gate `state` against its own rounding floor and write its unit direction
+/// into `unit`.
+///
+/// The threshold's shape and constant are the aggregation half's, and so are the
+/// [`l2_norm`]/[`l2_renorm`] it is computed and applied with, so "renormalized"
+/// means the same arithmetic on both sides of the shape boundary. What differs
+/// is the mass: `M` here is [`ema_step`]'s propagated one, which measures the
+/// error *this recurrence* carries — see there for why a recurrence needs its
+/// own, and for what that bound does and does not say about the fold's.
+///
+/// Neither norm can overflow, because `push` confines every input component to
+/// the aggregation magnitude domain before the accumulator is written: `state`
+/// is a convex combination of in-domain components and so is bounded by
+/// [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) (`2^400`), and `M` by the
+/// **epoch**, which is the only bound available and is the tighter one anyway.
+///
+/// A charging step adds `|alpha * x_t| + |c * s_{t-1}| <= 2^401` and carries the
+/// previous mass at `c <= 1`; a step that does not charge leaves `M` a copy
+/// (`c` is exactly `1`) or zeroes it (`c` is exactly `0`). So `M_t <= t * 2^401`
+/// over the epoch's `t` charging steps, and with
+/// [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) that is `M <= 2^451` and
+/// `||M|| <= sqrt(dim) * 2^451 <= 2^467` for any `dim <= 2^32` — far inside
+/// `f64`, and independent of the coefficient.
+///
+/// It has to be. The geometric bound `2 * MAX / alpha` this comment used to
+/// quote was read off `f32`'s smallest subnormal (`2^400 / 2^-149`), and the
+/// coefficient is no longer an `f32`: a nonzero `alpha` now reaches `2^-1074`,
+/// where `2 * 2^400 / alpha` is not representable at all. Its companion clause —
+/// `(t + 1) * 2^400` at `alpha = 0` — had already been overtaken by the
+/// exact-step rule, which charges an exact hold nothing.
+///
+/// # Errors
+///
+/// [`WinditError::NonFinite`] when the accumulator is at or below
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD` — no direction determined at
+/// working precision — or when it cannot be normalized to a finite unit vector.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn gate_and_renorm<C: Real>(state: &[C], mag: &[C], unit: &mut [C]) -> Result<(), WinditError> {
+  let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(mag) + C::MIN_GATE_THRESHOLD;
+  if l2_norm(state) <= tau {
+    return Err(WinditError::NonFinite);
+  }
+  unit.copy_from_slice(state);
+  l2_renorm(unit)
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> Smoother<E> for VectorEmaState<E> {
+  fn push(&mut self, w: Windowed<E>) -> Result<Windowed<E>, WinditError> {
+    let span = w.span();
+    // Projected through the embedding's own value surface, exactly as
+    // `aggregate` does: a zero-copy borrow for `f64` storage, an exact widening
+    // for `f32`/`f16`/`bf16`, the implementor's dequantization for quantized
+    // storage — and a refusal (`MissingDequantization`) for raw codes. Reading
+    // `as_slice` directly would be one line shorter and would silently fold
+    // quantization codes as if they were values.
+    let projected = w.value().compute_components()?;
+    let x = projected.as_ref();
+
+    // Every rejection below runs before a single component is written, so a
+    // refused push leaves the epoch exactly as it found it.
+    if x.is_empty() {
+      return Err(WinditError::Empty);
+    }
+    if !self.state.is_empty() && x.len() != self.state.len() {
+      return Err(WinditError::DimMismatch {
+        got: x.len(),
+        expected: self.state.len(),
+      });
+    }
+    if x.iter().any(|&c| !c.is_finite()) {
+      return Err(WinditError::NonFinite);
+    }
+    // The aggregation input domain, enforced here for the same reason it exists
+    // there: the determinacy gate's mass is an `n`-term geometric fold over the
+    // whole epoch, and an unbounded one leaves `f64` (module note *Input
+    // domain*). `window` is always `0` — a smoother's push carries exactly one
+    // window — which is also the index the one-window fold reports.
+    for (component, &c) in x.iter().enumerate() {
+      if c != <ComputeOf<E> as Real>::ZERO
+        && (c.abs() < <ComputeOf<E> as Real>::MIN_AGG_MAGNITUDE
+          || c.abs() > <ComputeOf<E> as Real>::MAX_AGG_MAGNITUDE)
+      {
+        return Err(WinditError::MagnitudeOutOfRange {
+          window: 0,
+          component,
+        });
+      }
+    }
+
+    // The epoch's own precondition, and the last rejection before the recurrence.
+    // It is checked after the window's — a malformed window is still malformed
+    // past the horizon, and reporting the epoch instead would mask it — and
+    // before any write, so this refusal is a no-op like the rest. `steps` counts
+    // charging steps, so an unseeded state (or an epoch of exact holds) never
+    // reaches it. *Epoch horizon* on `VectorEma` says why the limit exists and
+    // what a caller does about it.
+    if self.steps >= VECTOR_EMA_MAX_EPOCH_STEPS {
+      return Err(WinditError::EpochTooLong);
+    }
+
+    if self.state.is_empty() {
+      // First push of an epoch seeds `s_0 = x_0` — a copy, not arithmetic, so it
+      // rounds by nothing and the gate's mass starts at zero rather than at
+      // `|x_0|`. `refit` zeroes, so that seed is the absence of a write. Being
+      // exact is also the reason length two is the one prefix at which this
+      // mass and the aggregate's provably coincide (for an `alpha` strictly
+      // inside `(0, 1)`): `M_1` works out to
+      // `|alpha * x_1| + |(1 - alpha) * x_0|`, the same two products the
+      // one-window fold weights, summed in the other order. The seed is still
+      // gated — an all-zero window has no direction — through the absolute
+      // `MIN_GATE_THRESHOLD` floor alone, which is the whole of a threshold with
+      // no rounding to allow for.
+      //
+      // Scratch buffers first and the accumulator last: an empty accumulator is
+      // what "unseeded" means, so a refused allocation leaves the smoother
+      // unseeded rather than half-armed.
+      refit(&mut self.mag, x.len())?;
+      refit(&mut self.unit, x.len())?;
+      refit(&mut self.state, x.len())?;
+      self.state.copy_from_slice(x);
+    } else if ema_step(&mut self.state, &mut self.mag, x, self.alpha) {
+      // Counted here rather than at the top of `push`, and only when the step
+      // charged: the epoch's budget is the mass's relative precision, and a step
+      // that left `mag` unrounded spent none of it. A push the gate then refuses
+      // still counts — the accumulator advanced and the mass grew, which is the
+      // whole reason the refusal is not a no-op.
+      self.steps += 1;
+    }
+
+    gate_and_renorm(&self.state, &self.mag, &mut self.unit)?;
+    Ok(Windowed::new(E::from_unnormalized(&self.unit)?, span))
+  }
+
+  fn reset(&mut self) {
+    // Clearing rather than dropping restores the unseeded state — an empty
+    // accumulator is exactly that — while keeping the buffers a previous epoch
+    // grew, so re-seeding after a `discontinuity` allocates nothing. Capacity
+    // is not observable through the public API, so this is the
+    // freshly-constructed state. `discontinuity` is the trait default (=
+    // `reset`): a 1-in/1-out filter holds no pending output.
+    self.state.clear();
+    self.mag.clear();
+    self.unit.clear();
+    self.steps = 0;
+  }
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> SmoothPolicy<E> for VectorEma<ComputeOf<E>> {
+  type Smoother = VectorEmaState<E>;
+
+  fn smoother(&self) -> VectorEmaState<E> {
+    // `VectorEma::new` is the only way to set `alpha` and clamps it there, so
+    // this re-clamp is currently unreachable — kept, exactly as `Ema`'s is, as
+    // the last line of defence for the recurrence's coefficient invariant
+    // (`alpha` in `[0, 1]` and never NaN) against any future construction path
+    // that bypasses `new`.
+    let alpha = clamp_coefficient(self.alpha);
+    // No allocation here: the trait's factory is infallible, so the buffers are
+    // grown on the first push, which is not.
+    VectorEmaState {
+      alpha,
+      state: Vec::new(),
+      mag: Vec::new(),
+      unit: Vec::new(),
+      steps: 0,
     }
   }
 }

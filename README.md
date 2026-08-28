@@ -36,7 +36,7 @@ crate's contract, enforced by an acceptance suite.
 
 ```toml
 [dependencies]
-windit = "0.2"
+windit = "0.3"
 ```
 
 ## The unifying idea: one geometry drives both ends
@@ -88,7 +88,13 @@ own by implementing the trait.
   bar its accuracy guarantees rest on, so the domain it accepts is exactly the
   domain those guarantees hold over. That is an accuracy boundary, not a liveness
   one — the first rejected `tau` still moves the state, it just lands on the bar
-  instead of above it.
+  instead of above it. [`VectorEma`] is the same low-pass over an *embedding*
+  rather than a score: the EMA runs component-wise and every window is
+  L2-renormalized, so a per-window embedding stream is denoised **without** being
+  collapsed to one point — the streaming, span-preserving sibling of
+  [`EmaRenormalized`]. It is generic over [`Vector`], so a downstream embedding
+  type flows through with no conversion at any window, and it needs `alloc`
+  because its state is one accumulator component per dimension.
 - **segment** — gate a windowed score sequence into a binary decision, then reduce
   it to continuous element [`Range`]s. Gate built-ins [`Threshold`] (fixed cutoff),
   [`Hysteresis`] (latching two-threshold), and [`Vote`] (N-of-M over recent
@@ -251,14 +257,16 @@ breaking change. See the [`scalar`] module docs.
 `windit` is `no_std + alloc`. `default = ["alloc"]`, because every operation that
 returns a `Vec` needs it — but the whole streaming surface does not: the value,
 geometry, and scalar types, the smoothing / gating / segmentation traits with
-their configs and states, [`Segmenter`], and [`Decoder`] all compile with
-`--no-default-features` and allocate nothing. `WinditError` implements
+their scalar configs and states, [`Segmenter`], and [`Decoder`] all compile with
+`--no-default-features` and allocate nothing. The one smoother outside that tier
+is [`VectorEma`], whose state is one accumulator component per embedding
+dimension rather than O(1). `WinditError` implements
 `core::error::Error` on every tier, `std` included. The optional features are
 additive:
 
 | Feature   | Adds                                                              |
 |-----------|------------------------------------------------------------------|
-| `alloc`   | (default) the `Vec`-returning planner, batch drivers, and strategy families |
+| `alloc`   | (default) the `Vec`-returning planner, batch drivers, and strategy families, plus the vector smoother `VectorEma` (its state is embedding-dimension-sized) |
 | `std`     | links `std`; adds no API of its own                              |
 | `text`    | content-aware string chunking (`unicode-segmentation`)           |
 | `serde`   | `Serialize` / `Deserialize` for the configuration and policy enums |
@@ -299,6 +307,7 @@ dual licensed as above, without any additional terms or conditions.
 [`Identity`]: https://docs.rs/windit/latest/windit/smooth/struct.Identity.html
 [`Ema`]: https://docs.rs/windit/latest/windit/smooth/struct.Ema.html
 [`CadenceEma`]: https://docs.rs/windit/latest/windit/smooth/struct.CadenceEma.html
+[`VectorEma`]: https://docs.rs/windit/latest/windit/smooth/struct.VectorEma.html
 [`Hysteresis`]: https://docs.rs/windit/latest/windit/segment/struct.Hysteresis.html
 [`Range`]: https://docs.rs/windit/latest/windit/segment/struct.Range.html
 [`Threshold`]: https://docs.rs/windit/latest/windit/segment/struct.Threshold.html
