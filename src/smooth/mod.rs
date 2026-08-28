@@ -14,9 +14,18 @@
 //!   denominated in input elements rather than in pushes, so one configuration
 //!   yields the same smoothing at any cadence — regular or irregular — over
 //!   `f32`.
+#![cfg_attr(
+  any(feature = "std", feature = "alloc"),
+  doc = "- [`VectorEma`] is that same exponential moving average over an *embedding*\n  — any [`Vector`] — run component-wise and\n  L2-renormalized at every window: the streaming, span-preserving sibling of\n  [`EmaRenormalized`](crate::aggregate::EmaRenormalized), which folds the same\n  recency weighting to one point instead."
+)]
+#![cfg_attr(
+  not(any(feature = "std", feature = "alloc")),
+  doc = "- `VectorEma` — the same exponential moving average over an *embedding*, run\n  component-wise and L2-renormalized at every window — needs the heap for its\n  `dim`-sized state and so appears only under `alloc`."
+)]
 //!
-//! The state traits and states allocate nothing and live in the featureless core
-//! tier; only the `Vec`-returning batch driver gates on `alloc`.
+//! The scalar states allocate nothing and live in the featureless core tier
+//! alongside the traits; the `Vec`-returning batch driver and the vector
+//! smoother — whose state is `dim`-sized rather than O(1) — gate on `alloc`.
 //!
 #![cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -35,6 +44,17 @@ use crate::{error::WinditError, windowed::Windowed};
 
 #[cfg(any(feature = "std", feature = "alloc"))]
 use std::vec::Vec;
+
+// The vector smoother's arithmetic is the aggregation half's, reached rather
+// than re-derived: `VectorEma` gates and renormalizes through the very routines
+// `weighted_sum_renorm` ends with, so the streaming and folding siblings cannot
+// drift apart.
+#[cfg(any(feature = "std", feature = "alloc"))]
+use crate::{
+  aggregate::{l2_norm, l2_renorm},
+  scalar::Real,
+  windowed::{ComputeOf, Vector},
+};
 
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod tests;
@@ -74,6 +94,12 @@ pub trait Smoother<V> {
   /// [`Identity`] and [`Ema`] read no spans and are infallible, always returning
   /// `Ok` and carrying the `Result` only for uniformity with the composable
   /// stages.
+  ///
+  /// Reading no spans does not by itself make a stage infallible, though: the
+  /// vector EMA reads none either and is fallible for reasons of its own — a
+  /// width that changed mid-epoch, a non-finite component, an accumulator with
+  /// no determinate direction, a refused allocation. Its own documentation
+  /// enumerates them.
   fn push(&mut self, w: Windowed<V>) -> Result<Windowed<V>, WinditError>;
 
   /// Return to the freshly-constructed state.
@@ -90,7 +116,8 @@ pub trait Smoother<V> {
 /// [`Smoother`], and drives it as a batch convenience.
 ///
 /// Generic over the value type `V`; the shipped built-ins implement it for
-/// `V = f32` ([`Ema`]) or any `V` ([`Identity`]). Implement the factory
+/// `V = f32` ([`Ema`], [`CadenceEma`]), for any `V` ([`Identity`]), and — under
+/// `alloc` — for any embedding (the vector EMA). Implement the factory
 /// [`smoother`](SmoothPolicy::smoother) to add a strategy — the batch
 #[cfg_attr(
   any(feature = "std", feature = "alloc"),
@@ -118,8 +145,10 @@ pub trait SmoothPolicy<V> {
   /// # Errors
   ///
   /// - [`WinditError::AllocFailed`] if the output cannot be allocated.
-  /// - Any error the underlying [`Smoother::push`] surfaces (none for the shipped
-  ///   built-ins).
+  /// - Any error the underlying [`Smoother::push`] surfaces. Of the three scalar
+  ///   built-ins only [`CadenceEma`] can raise one, and only
+  ///   [`WinditError::NonMonotonicSpan`]; [`VectorEma`] has an error set of its
+  ///   own, enumerated on its own documentation.
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   fn smooth(&self, seq: &[Windowed<V>]) -> Result<Vec<Windowed<V>>, WinditError>
@@ -730,6 +759,370 @@ impl SmoothPolicy<f32> for CadenceEma {
     CadenceEmaState {
       tau: self.tau,
       prev: None,
+    }
+  }
+}
+
+/// Component-wise exponential moving average over an embedding, L2-renormalized
+/// at every window: the streaming, span-preserving sibling of
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized).
+///
+/// One window in, one window out. The accumulator advances
+/// `s_t = alpha * x_t + (1 - alpha) * s_{t-1}` component-wise from `s_0 = x_0`,
+/// exactly as [`Ema`] does per scalar, and each window emits the *direction* of
+/// that accumulator — `s_t / ||s_t||` — reconstructed through
+/// [`Vector::from_unnormalized`]. Nothing is collapsed: every pushed window
+/// still produces one output, carrying its input
+/// [`Span`](crate::plan::Span) unchanged. That is the shape difference from
+/// [`aggregate`](crate::aggregate), which folds a finished slice to one point.
+///
+/// # Renormalized, not merely averaged
+///
+/// The renormalization is applied to an emitted *copy*; the accumulator itself
+/// stays raw. That is what makes this the streaming sibling of
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) rather than a
+/// spherical filter of its own: the recency
+/// weights `w_0 = (1 - alpha)^t`, `w_i = alpha * (1 - alpha)^(t - i)` that the
+/// aggregate builds explicitly are exactly the ones this recurrence carries, so
+/// the window at index `i` emits the direction the aggregate folds over the
+/// prefix `[0..=i]`. Renormalizing the accumulator in place instead would keep
+/// the state on the unit sphere and change every later weight — a different
+/// filter, and not one this crate's aggregation half has a fold for.
+///
+/// A component-wise EMA of unit vectors is *not* a unit vector: mix `[1, 0]`
+/// and `[0, 1]` at `alpha = 0.5` and the accumulator is `[0.5, 0.5]`, of norm
+/// `2^-0.5`. The renormalization is what turns that back into an embedding, and
+/// it runs through the same scale-aware routine the aggregation fold ends with,
+/// so a direction whose norm is not representable is still normalized rather
+/// than rejected.
+///
+/// # Determinacy gate
+///
+/// Before each renormalization the accumulator is measured against its own
+/// rounding floor, `16 * `[`EPSILON`](crate::scalar::Real::EPSILON)` * ||M|| + `[`MIN_GATE_THRESHOLD`](crate::scalar::Real::MIN_GATE_THRESHOLD),
+/// where `M` is the componentwise sum of this step's two term magnitudes
+/// (`|alpha * x_t|` and `|(1 - alpha) * s_{t-1}|`). A result at or below it is
+/// reported as [`WinditError::NonFinite`] — "no direction determined at working
+/// precision" — rather than handed to a renormalization that would amplify
+/// rounding noise into a fabricated unit direction. The constant is the
+/// aggregate's, unchanged: a two-term step rounds by at most
+/// `EPSILON * ||M||`, well inside the `4 * EPSILON * ||M||` bound the fold
+/// publishes, so the same `16` is conservative here too. The gate fires on exact
+/// cancellation (`[1, 0]` then `[-1, 0]` at `alpha = 0.5`) and on the near-miss
+/// residues an exact-zero test would let through.
+///
+/// # Dimension
+///
+/// The first push after construction (or after a
+/// [`reset`](Smoother::reset)/[`discontinuity`](Smoother::discontinuity)) fixes
+/// the epoch's dimension. A later window of a different width is rejected with
+/// [`WinditError::DimMismatch`]; there is no defensible alternative, since a
+/// 512-wide state has no component to mix a 384-wide window into. The width is
+/// read off the *projected* slice
+/// ([`compute_components`](Vector::compute_components)) rather than
+/// [`dim`](Vector::dim), because that projection is the value surface the
+/// recurrence actually reads.
+///
+/// # Inputs are validated, not absorbed
+///
+/// Unlike the scalar [`Ema`], which documents a non-finite input poisoning its
+/// state until a reset, this smoother refuses one: a window carrying a `NaN` or
+/// an infinity is rejected with [`WinditError::NonFinite`] **before any
+/// component of the accumulator is written**, so the stream continues from the
+/// state the previous window left. Every rejection this type can raise is
+/// checked ahead of the recurrence, so a refused push is a no-op and a retry
+/// behaves as if it never happened — with one deliberate exception: a window
+/// whose *output* is rejected, by the determinacy gate or by the embedding's own
+/// reconstruction, has still advanced the accumulator. It was a real
+/// observation; only the direction read off it was unavailable, and the next
+/// window mixes against the state it produced. That matches the prefix the
+/// aggregate would fold, which is the property this type is defined by.
+///
+/// Rejecting rather than absorbing is also what the aggregate does — its
+/// input-domain check refuses a non-finite component with the same
+/// [`NonFinite`](WinditError::NonFinite) — so the two halves agree.
+/// The aggregation *magnitude* domain is deliberately not imposed here: it
+/// exists so an `n`-term fold — and the square a norm weight forms — cannot
+/// overflow, and a two-term convex step has neither. `alpha * x + (1 - alpha) * s`
+/// is bounded by `max(|x|, |s|)` for any finite operands, and the scale-aware
+/// renormalization handles a norm that is not representable, so no realizable
+/// input needs the narrower window.
+///
+/// # Alpha
+///
+/// [`new`](VectorEma::new) clamps `alpha` into `[0, 1]` exactly as
+/// [`Ema::new`] does, NaN included (it clamps to `0.0`, holding the seed
+/// direction). The smoothing path is therefore total in its coefficient, and
+/// `alpha` never reaches the error channel — the smoother idiom, not the
+/// aggregate's deferred [`AlphaOutOfRange`](WinditError::AlphaOutOfRange)
+/// check.
+///
+/// # Allocation
+///
+/// Three `dim`-length buffers — the accumulator, the term-magnitude vector the
+/// gate reads, and the unit copy handed to
+/// [`from_unnormalized`](Vector::from_unnormalized) — are grown on the first
+/// push of an epoch and reused by every push after it, and
+/// [`reset`](Smoother::reset) keeps their capacity, so a discontinuity costs no
+/// allocation either. The filter itself therefore allocates nothing per window.
+/// Two allocations per window remain, and both belong to the embedding rather
+/// than to the filter: the reconstruction
+/// [`from_unnormalized`](Vector::from_unnormalized) performs, and — for storage
+/// narrower than its compute domain, which is every `f32` embedding — the
+/// widened buffer [`compute_components`](Vector::compute_components) returns.
+/// The second is the price of reading the embedding through its declared value
+/// surface instead of its raw storage, which is what keeps quantized storage
+/// from being smoothed as codes; `f64` storage borrows and pays neither.
+///
+/// Because the state is `dim`-sized rather than O(1), this is the one smoother
+/// that needs the heap, which is why it gates on `alloc` while [`Identity`],
+/// [`Ema`], and [`CadenceEma`] do not.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorEma {
+  alpha: f32,
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl VectorEma {
+  /// A renormalizing vector EMA with the given smoothing factor, clamped into
+  /// `[0, 1]`.
+  ///
+  /// Clamping at construction is what keeps the coefficient out of the error
+  /// channel: above `1.0` clamps to `1.0`, below `0.0` clamps to `0.0`, and a
+  /// NaN becomes `0.0` (hold the seed direction). [`alpha`](VectorEma::alpha)
+  /// reports the clamped value the recurrence actually uses. This is
+  /// [`Ema::new`]'s rule verbatim, not the aggregate
+  /// [`EmaRenormalized`](crate::aggregate::EmaRenormalized)'s deferred
+  /// rejection: a smoother's `push` must stay total in its configuration.
+  #[must_use]
+  pub const fn new(alpha: f32) -> Self {
+    // A NaN fails both comparisons and falls through to `0.0`; `f32::clamp`
+    // would propagate it instead, and is not const.
+    let alpha = if alpha > 1.0 {
+      1.0
+    } else if alpha >= 0.0 {
+      alpha
+    } else {
+      0.0
+    };
+    Self { alpha }
+  }
+
+  /// The smoothing factor, always in `[0, 1]`.
+  #[must_use]
+  pub const fn alpha(&self) -> f32 {
+    self.alpha
+  }
+}
+
+/// The streaming state of a [`VectorEma`]: the clamped coefficient and the raw
+/// component-wise accumulator, unseeded until the first push.
+///
+/// The accumulator is carried in the embedding's compute domain
+/// ([`ComputeOf<E>`], `f64` for every shipped scalar) rather than in its
+/// storage scalar, the same widening [`CadenceEmaState`] applies to its scalar
+/// state and [`aggregate`](crate::aggregate) applies to its fold. Alongside it
+/// the state keeps two `dim`-length scratch buffers: the term-magnitude vector
+/// the determinacy gate measures against, and the unit copy handed to
+/// [`Vector::from_unnormalized`] — so the accumulator itself is never
+/// renormalized.
+///
+/// An empty accumulator *is* the unseeded state: [`reset`](Smoother::reset)
+/// clears the buffers without releasing their capacity, so a new epoch re-seeds
+/// without allocating.
+#[cfg(any(feature = "std", feature = "alloc"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+pub struct VectorEmaState<E: Vector> {
+  alpha: f32,
+  /// The raw EMA accumulator, `s_t`. Empty until the first push seeds it.
+  state: Vec<ComputeOf<E>>,
+  /// `M`: this step's componentwise sum of term magnitudes, for the gate.
+  mag: Vec<ComputeOf<E>>,
+  /// The renormalized copy of `state` that each window emits.
+  unit: Vec<ComputeOf<E>>,
+}
+
+/// Hand-written rather than derived: a derive would demand `E: Clone` for a
+/// parameter this state never stores a value of.
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> Clone for VectorEmaState<E> {
+  fn clone(&self) -> Self {
+    Self {
+      alpha: self.alpha,
+      state: self.state.clone(),
+      mag: self.mag.clone(),
+      unit: self.unit.clone(),
+    }
+  }
+}
+
+/// Hand-written for the same reason as [`Clone`], and reporting the state's
+/// *shape* rather than its components: [`Real`] carries no [`Debug`] bound, so
+/// the accumulator's values cannot be formatted from here at all.
+///
+/// [`Debug`]: core::fmt::Debug
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("VectorEmaState")
+      .field("alpha", &self.alpha)
+      .field("seeded", &!self.state.is_empty())
+      .field("dim", &self.state.len())
+      .finish()
+  }
+}
+
+/// Fit `buf` to exactly `dim` zeroed components, reusing whatever capacity a
+/// previous epoch left.
+///
+/// `try_reserve_exact` rather than `resize` alone: the dimension comes from a
+/// caller's embedding and need not correspond to memory that exists, so a
+/// refused allocation must surface as [`WinditError::AllocFailed`] rather than
+/// abort the process — the same typed-OOM discipline every `Result`-returning
+/// path in this crate keeps.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn refit<C: Real>(buf: &mut Vec<C>, dim: usize) -> Result<(), WinditError> {
+  buf.clear();
+  buf
+    .try_reserve_exact(dim)
+    .map_err(|_| WinditError::AllocFailed { elements: dim })?;
+  buf.resize(dim, C::ZERO);
+  Ok(())
+}
+
+/// Advance a seeded accumulator by one window, rebuilding the term-magnitude
+/// vector the determinacy gate reads alongside it.
+///
+/// The two products are formed once and used twice — summed into the
+/// accumulator and, by magnitude, into `mag` — so the mass the gate measures is
+/// exactly the mass the step folded, not a re-derivation that could disagree
+/// with it.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
+  let complement = C::ONE - alpha;
+  for ((s, m), &xj) in state.iter_mut().zip(mag.iter_mut()).zip(x.iter()) {
+    let recent = alpha * xj;
+    let carried = complement * *s;
+    *s = recent + carried;
+    *m = recent.abs() + carried.abs();
+  }
+}
+
+/// Gate `state` against its own rounding floor and write its unit direction
+/// into `unit`.
+///
+/// The gate and the renormalization are both the aggregation half's, reached
+/// through the same [`l2_norm`]/[`l2_renorm`] this crate folds with, so
+/// "renormalized" means the same arithmetic on both sides of the shape
+/// boundary.
+///
+/// # Errors
+///
+/// [`WinditError::NonFinite`] when the accumulator is at or below
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD` — no direction determined at
+/// working precision — or when it cannot be normalized to a finite unit vector.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn gate_and_renorm<C: Real>(state: &[C], mag: &[C], unit: &mut [C]) -> Result<(), WinditError> {
+  let tau = C::from_f32(16.0) * C::EPSILON * l2_norm(mag) + C::MIN_GATE_THRESHOLD;
+  if l2_norm(state) <= tau {
+    return Err(WinditError::NonFinite);
+  }
+  unit.copy_from_slice(state);
+  l2_renorm(unit)
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> Smoother<E> for VectorEmaState<E> {
+  fn push(&mut self, w: Windowed<E>) -> Result<Windowed<E>, WinditError> {
+    let span = w.span();
+    // Projected through the embedding's own value surface, exactly as
+    // `aggregate` does: a zero-copy borrow for `f64` storage, an exact widening
+    // for `f32`/`f16`/`bf16`, the implementor's dequantization for quantized
+    // storage — and a refusal (`MissingDequantization`) for raw codes. Reading
+    // `as_slice` directly would be one line shorter and would silently fold
+    // quantization codes as if they were values.
+    let projected = w.value().compute_components()?;
+    let x = projected.as_ref();
+
+    // Every rejection below runs before a single component is written, so a
+    // refused push leaves the epoch exactly as it found it.
+    if x.is_empty() {
+      return Err(WinditError::Empty);
+    }
+    if !self.state.is_empty() && x.len() != self.state.len() {
+      return Err(WinditError::DimMismatch {
+        got: x.len(),
+        expected: self.state.len(),
+      });
+    }
+    if x.iter().any(|&c| !c.is_finite()) {
+      return Err(WinditError::NonFinite);
+    }
+
+    if self.state.is_empty() {
+      // First push of an epoch seeds `s_0 = x_0`, whose single term carries
+      // weight one — so `mag` is `|x_0|`, the same mass the aggregate's
+      // one-window fold accumulates. Scratch buffers first and the accumulator
+      // last: an empty accumulator is what "unseeded" means, so a refused
+      // allocation leaves the smoother unseeded rather than half-armed.
+      refit(&mut self.mag, x.len())?;
+      refit(&mut self.unit, x.len())?;
+      refit(&mut self.state, x.len())?;
+      self.state.copy_from_slice(x);
+      for (m, &xj) in self.mag.iter_mut().zip(x.iter()) {
+        *m = xj.abs();
+      }
+    } else {
+      ema_step(
+        &mut self.state,
+        &mut self.mag,
+        x,
+        <ComputeOf<E> as Real>::from_f32(self.alpha),
+      );
+    }
+
+    gate_and_renorm(&self.state, &self.mag, &mut self.unit)?;
+    Ok(Windowed::new(E::from_unnormalized(&self.unit)?, span))
+  }
+
+  fn reset(&mut self) {
+    // Clearing rather than dropping restores the unseeded state — an empty
+    // accumulator is exactly that — while keeping the buffers a previous epoch
+    // grew, so re-seeding after a `discontinuity` allocates nothing. Capacity
+    // is not observable through the public API, so this is the
+    // freshly-constructed state. `discontinuity` is the trait default (=
+    // `reset`): a 1-in/1-out filter holds no pending output.
+    self.state.clear();
+    self.mag.clear();
+    self.unit.clear();
+  }
+}
+
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<E: Vector> SmoothPolicy<E> for VectorEma {
+  type Smoother = VectorEmaState<E>;
+
+  fn smoother(&self) -> VectorEmaState<E> {
+    // `VectorEma::new` is the only way to set `alpha` and clamps it there, so
+    // this re-clamp is currently unreachable — kept, exactly as `Ema`'s is, as
+    // the last line of defence for the recurrence's coefficient invariant
+    // (`alpha` in `[0, 1]` and never NaN) against any future construction path
+    // that bypasses `new`. NaN is handled explicitly since `f32::clamp` would
+    // propagate it.
+    let alpha = if self.alpha.is_nan() {
+      0.0
+    } else {
+      self.alpha.clamp(0.0, 1.0)
+    };
+    // No allocation here: the trait's factory is infallible, so the buffers are
+    // grown on the first push, which is not.
+    VectorEmaState {
+      alpha,
+      state: Vec::new(),
+      mag: Vec::new(),
+      unit: Vec::new(),
     }
   }
 }

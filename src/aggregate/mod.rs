@@ -714,7 +714,11 @@ fn scaled_sum_of_squares<C: Real>(v: &[C], exp: i32) -> C {
 /// A vector with no scale returns its own largest magnitude: zero when it is all
 /// zero, and the non-finite component itself when one is infinite. Each is
 /// already the weight — and then the accumulator — that the caller must reject.
-fn l2_norm<C: Real>(v: &[C]) -> C {
+///
+/// `pub(crate)` so [`VectorEma`](crate::smooth::VectorEma)'s streaming
+/// determinacy gate measures against the *same* scale-aware norm this module's
+/// gate does, rather than a second spelling that could drift from it.
+pub(crate) fn l2_norm<C: Real>(v: &[C]) -> C {
   let Some(exp) = scale_exponent(v) else {
     return max_magnitude(v);
   };
@@ -727,7 +731,12 @@ fn l2_norm<C: Real>(v: &[C]) -> C {
 ///
 /// [`WinditError::NonFinite`] if `v` cannot be normalized to a finite unit
 /// vector: it is all zero, or some component is not finite.
-fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
+///
+/// `pub(crate)` so [`VectorEma`](crate::smooth::VectorEma) renormalizes each
+/// emitted window through this exact routine — the streaming sibling's
+/// "renormalized" is the same arithmetic as the fold's, not a re-derivation of
+/// it.
+pub(crate) fn l2_renorm<C: Real>(v: &mut [C]) -> Result<(), WinditError> {
   // The one rejection, and a property of the input rather than of some
   // intermediate leaving range: an all-zero vector has no direction to normalize
   // to, and neither has one with an infinite component.

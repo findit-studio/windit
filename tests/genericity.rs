@@ -20,6 +20,10 @@ use windit::prelude::*;
 ///
 /// It stores `f32` but computes in `f64` (`f32`'s compute type), so
 /// `from_unnormalized` takes `&[f64]` and narrows into storage.
+///
+/// `Clone` because the batch `SmoothPolicy::smooth` convenience clones each
+/// window at its method bound.
+#[derive(Clone)]
 struct TestEmbedding(Vec<f32>);
 
 impl Vector for TestEmbedding {
@@ -44,6 +48,7 @@ impl Vector for TestEmbedding {
 /// The same double at f64 storage, so the acceptance cases below drive the SAME
 /// generic helpers over a second, genuinely different scalar. A genericity claim
 /// exercised at one scalar proves nothing.
+#[derive(Clone)]
 struct TestEmbedding64(Vec<f64>);
 
 impl Vector for TestEmbedding64 {
@@ -621,4 +626,113 @@ fn value_free_stages_carry_a_non_f32_payload() {
     marker_flags, expected,
     "the value-free pipeline shaped the script wrong"
   );
+}
+
+#[test]
+fn clap_per_window_embedding_stream_stays_per_window() {
+  // The shape the CLAP audio-embedding consumer needs and that
+  // `aggregate` cannot give it: one 512-wide unit-norm embedding per sliding
+  // window, denoised against the windows before it, with EVERY window still
+  // emitting. `VectorEma` is `Smoother<E>` for any `Vector` `E`, so the
+  // consumer's own embedding type flows through `Windowed<E>` with no
+  // conversion at any window — the property that makes this smoother's home
+  // this crate rather than the consumer's (a downstream
+  // `impl Smoother<TheirEmbedding>` would be an orphan impl).
+  const DIM: usize = 512;
+  let opts = WindowOptions::new(480_000).with_overlap(240_000);
+  let spans = WindowPlan::spans(&opts, 1_200_000).expect("plan spans");
+  assert!(spans.len() >= 4, "need a real stream, got {}", spans.len());
+
+  // A 512-wide embedding per span whose direction rotates window to window, so
+  // the smoothed stream is genuinely different from the raw one.
+  let windows: Vec<Windowed<TestEmbedding>> = spans
+    .iter()
+    .enumerate()
+    .map(|(i, span)| {
+      let raw: Vec<f64> = (0..DIM)
+        .map(|d| ((d + i) % 17) as f64 - 8.0 + (i as f64) * 0.25)
+        .collect();
+      Windowed::new(
+        TestEmbedding::from_unnormalized(&raw).expect("valid embedding"),
+        *span,
+      )
+    })
+    .collect();
+
+  let smoothed = VectorEma::new(0.3).smooth(&windows).expect("smooth");
+
+  // Span-preserving: one window in, one window out, geometry untouched. This is
+  // the whole difference from `aggregate`, which returns a single embedding.
+  assert_eq!(smoothed.len(), windows.len());
+  for (out, inp) in smoothed.iter().zip(&windows) {
+    assert_eq!(out.span(), inp.span());
+    assert_eq!(out.value().dim(), DIM);
+    assert_unit_norm(out.value());
+  }
+
+  // Denoised, not passed through: after the seed, each window differs from its
+  // own input because it carries the ones before it.
+  assert_eq!(
+    smoothed[0].value().as_slice(),
+    windows[0].value().as_slice()
+  );
+  assert_ne!(
+    smoothed[1].value().as_slice(),
+    windows[1].value().as_slice()
+  );
+
+  // And smoothing genuinely reduces window-to-window movement: the mean squared
+  // step across the smoothed stream is smaller than across the raw one.
+  fn mean_sq_step(seq: &[Windowed<TestEmbedding>]) -> f64 {
+    let mut total = 0.0;
+    for pair in seq.windows(2) {
+      total += pair[0]
+        .value()
+        .as_slice()
+        .iter()
+        .zip(pair[1].value().as_slice())
+        .map(|(a, b)| f64::from(a - b) * f64::from(a - b))
+        .sum::<f64>();
+    }
+    total / (seq.len() - 1) as f64
+  }
+  let raw_step = mean_sq_step(&windows);
+  let smooth_step = mean_sq_step(&smoothed);
+  assert!(
+    smooth_step < raw_step,
+    "smoothing must reduce window-to-window movement: {smooth_step} vs {raw_step}"
+  );
+
+  // The same public smoother over a genuinely different scalar: `f64` storage,
+  // config unchanged. Genericity, not an f32 special case.
+  let windows64: Vec<Windowed<TestEmbedding64>> = spans
+    .iter()
+    .enumerate()
+    .map(|(i, span)| {
+      let raw: Vec<f64> = (0..DIM)
+        .map(|d| ((d + i) % 17) as f64 - 8.0 + (i as f64) * 0.25)
+        .collect();
+      Windowed::new(
+        TestEmbedding64::from_unnormalized(&raw).expect("valid embedding"),
+        *span,
+      )
+    })
+    .collect();
+  let smoothed64 = VectorEma::new(0.3).smooth(&windows64).expect("smooth");
+  assert_eq!(smoothed64.len(), windows64.len());
+  for out in &smoothed64 {
+    assert_unit_norm_64(out.value());
+  }
+
+  // Run-time selection: the vector smoother is a `Box<dyn Smoother<E>>` too, so
+  // a manifest can pick it the way one picks a `dyn AggregatePolicy`.
+  let mut boxed: Box<dyn Smoother<TestEmbedding64>> = Box::new(VectorEma::new(0.3).smoother());
+  let first = boxed
+    .push(Windowed::new(
+      TestEmbedding64::from_unnormalized(&[3.0, 4.0]).unwrap(),
+      Span::new(0, 1, 1),
+    ))
+    .unwrap();
+  assert_eq!(first.value().as_slice(), &[0.6, 0.8]);
+  boxed.reset();
 }

@@ -1,7 +1,15 @@
 use std::{boxed::Box, vec, vec::Vec};
 
-use super::{cadence_alpha, CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother};
-use crate::{error::WinditError, plan::Span, windowed::Windowed};
+use super::{
+  cadence_alpha, CadenceEma, CadenceEmaState, Ema, Identity, SmoothPolicy, Smoother, VectorEma,
+  VectorEmaState,
+};
+use crate::{
+  error::WinditError,
+  plan::Span,
+  test_support::{BareI8Emb, RawF64Emb, TestVec},
+  windowed::{Vector, Windowed},
+};
 
 /// The coefficient floor the accepted `tau` domain is built around: every
 /// accepted `tau` derives an `alpha` strictly above this at every `delta >= 1`.
@@ -2252,4 +2260,439 @@ fn boxed_smoother_forwards_discontinuity_not_reset() {
     "Box must forward discontinuity explicitly, not via its own reset"
   );
   assert_eq!(boxed.resets, 1, "Box must forward reset");
+}
+
+// ---------------------------------------------------------------------------
+// VectorEma: the renormalizing, span-preserving sibling of the aggregation
+// half's `EmaRenormalized`.
+// ---------------------------------------------------------------------------
+
+/// One `Windowed<RawF64Emb>` covering a single element at `start`.
+///
+/// [`RawF64Emb`] rather than [`TestVec`] on purpose. Its `from_unnormalized`
+/// captures the compute-domain slice **verbatim** instead of normalizing it, so
+/// these tests read exactly what the smoother emitted. An embedding double that
+/// normalized in its own `from_unnormalized` would return a unit vector whether
+/// or not the smoother renormalized, and could not falsify the renormalization
+/// at all — the property that separates this type from a plain component-wise
+/// vector EMA would be untestable through it.
+fn vec_window(values: &[f64], start: usize) -> Windowed<RawF64Emb> {
+  Windowed::new(
+    RawF64Emb {
+      data: values.to_vec(),
+      captured: Vec::new(),
+    },
+    Span::new(start, 1, 1),
+  )
+}
+
+/// What a pushed window emitted, at full `f64` precision.
+fn emitted(w: &Windowed<RawF64Emb>) -> &[f64] {
+  &w.value.captured
+}
+
+/// The L2 norm, spelled independently of the crate's own scale-aware routine so
+/// a unit-norm assertion is not checked by the code it is checking.
+fn l2(v: &[f64]) -> f64 {
+  libm::sqrt(v.iter().map(|x| x * x).sum::<f64>())
+}
+
+#[test]
+fn vector_ema_renormalizes_every_window() {
+  // THE falsifier for "renormalized", the one property that separates this from
+  // a plain component-wise vector EMA. `[1, 0]` then `[0, 1]` at alpha 0.5
+  // leaves the accumulator at exactly `[0.5, 0.5]` — norm 2^-0.5, emphatically
+  // not 1 — so an emit that skipped the renormalization reads back as
+  // `[0.5, 0.5]` here and both assertions below fail. Non-vacuous by
+  // construction: the seed at index 0 is already unit-norm, so only the second
+  // window can distinguish the two implementations, and it is the one asserted.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let first = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let second = s.push(vec_window(&[0.0, 1.0], 1)).unwrap();
+
+  // One ulp below `core::f64::consts::FRAC_1_SQRT_2`, and pinned as the
+  // division rather than as the constant because that is what the arithmetic
+  // is: renormalization divides by the norm, and `1.0 / sqrt(2)` is not the
+  // correctly rounded `1/sqrt(2)`.
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(
+    emitted(&first),
+    &[1.0, 0.0],
+    "the seed emits its own unit direction"
+  );
+  assert_eq!(
+    emitted(&second),
+    &[want, want],
+    "the accumulator is [0.5, 0.5]; the emitted window must be its direction"
+  );
+  // Restated as the norm, so a failure names the property rather than only the
+  // golden: an unrenormalized emit has norm 2^-0.5.
+  let norm = l2(emitted(&second));
+  assert!(
+    (norm - 1.0).abs() <= f64::EPSILON,
+    "emitted window must be unit-norm, got {norm}"
+  );
+}
+
+#[test]
+fn vector_ema_seeds_the_accumulator_with_the_first_window() {
+  // `s_0 = x_0`, not `alpha * x_0` and not a zero start. At `alpha = 0` the
+  // accumulator can never move, so every later window must still emit the FIRST
+  // window's direction however far the input has travelled — and an
+  // accumulator that started at zero would stay at zero and be gated as
+  // indeterminate instead of emitting anything at all.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  for (i, x) in [[3.0, 4.0], [0.0, -1.0], [-5.0, 12.0]].iter().enumerate() {
+    let out = s.push(vec_window(x, i)).unwrap();
+    assert_eq!(
+      emitted(&out),
+      &[0.6, 0.8],
+      "alpha 0 holds the seed direction at window {i}"
+    );
+  }
+
+  // The other endpoint: at `alpha = 1` the accumulator IS the input, so every
+  // window emits its own direction. Together the two pin the clamp's ends
+  // behaviourally rather than only through the `alpha()` accessor.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(1.0));
+  assert_eq!(
+    emitted(&s.push(vec_window(&[3.0, 4.0], 0)).unwrap()),
+    &[0.6, 0.8]
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, -2.0], 1)).unwrap()),
+    &[0.0, -1.0]
+  );
+}
+
+#[test]
+fn vector_ema_reset_and_discontinuity_reseed_the_accumulator() {
+  // Both return the smoother to `s_0 = x_0`: the window after the break emits
+  // its own direction, not the recurrence against the pre-break accumulator.
+  // Without the re-seed the third push would mix `[0, 1]` into the retained
+  // `[0.5, 0.5]`, giving `[0.25, 0.75]` — direction `[0.316…, 0.948…]`, which
+  // is neither `[0, 1]` nor within any tolerance of it.
+  for reseed in [Smoother::reset, Smoother::discontinuity] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+    let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+    let _ = s.push(vec_window(&[0.0, 1.0], 1)).unwrap();
+    reseed(&mut s);
+    let after = s.push(vec_window(&[0.0, 4.0], 2)).unwrap();
+    assert_eq!(
+      emitted(&after),
+      &[0.0, 1.0],
+      "a re-seed must restore s_0 = x_0"
+    );
+  }
+}
+
+#[test]
+fn vector_ema_preserves_spans_and_batch_equals_streaming() {
+  // Deliberately irregular spans (0, 5, 11) with a window wider than one
+  // element: a stage that regenerated spans instead of carrying the input's
+  // would have to reproduce this exact sequence by accident.
+  let input = vec![
+    Windowed::new(
+      RawF64Emb {
+        data: vec![1.0, 0.0, 0.0],
+        captured: Vec::new(),
+      },
+      Span::new(0, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: vec![0.0, 1.0, 0.0],
+        captured: Vec::new(),
+      },
+      Span::new(5, 4, 4),
+    ),
+    Windowed::new(
+      RawF64Emb {
+        data: vec![0.0, 0.0, 1.0],
+        captured: Vec::new(),
+      },
+      Span::new(11, 2, 4),
+    ),
+  ];
+  let batch = VectorEma::new(0.4).smooth(&input).unwrap();
+  assert_eq!(
+    batch.iter().map(|w| w.span).collect::<Vec<_>>(),
+    input.iter().map(|w| w.span).collect::<Vec<_>>(),
+    "spans must survive the rewrite untouched"
+  );
+
+  // The batch method IS a fresh smoother driven over the slice, so the two must
+  // agree component for component.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.4));
+  let streamed: Vec<Windowed<RawF64Emb>> =
+    input.iter().map(|w| s.push(w.clone()).unwrap()).collect();
+  for (b, t) in batch.iter().zip(&streamed) {
+    assert_eq!(emitted(b), emitted(t));
+    assert_eq!(b.span, t.span);
+  }
+  // Non-vacuity: the sequence genuinely mixes, so the three outputs differ from
+  // each other and from the inputs.
+  assert_ne!(emitted(&batch[1]), &[0.0, 1.0, 0.0]);
+  assert_ne!(emitted(&batch[1]), emitted(&batch[2]));
+}
+
+#[test]
+fn vector_ema_rejects_a_width_change_and_leaves_the_accumulator_unchanged() {
+  // The first push fixes the epoch's dimension; a later window of another width
+  // has no component to mix into and is refused.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[1.0, 0.0, 0.0], 1)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 3,
+      expected: 2
+    }
+  );
+  assert_eq!(
+    s.push(vec_window(&[1.0], 2)).unwrap_err(),
+    WinditError::DimMismatch {
+      got: 1,
+      expected: 2
+    }
+  );
+
+  // Checked BEFORE any component is written, so the two refused pushes are
+  // no-ops: the next in-width window emits exactly what it would have emitted
+  // had they never happened. Without this assertion a guard that rejected only
+  // after mutating the accumulator would still pass.
+  let want = 1.0 / libm::sqrt(2.0);
+  let after = s.push(vec_window(&[0.0, 1.0], 3)).unwrap();
+  assert_eq!(emitted(&after), &[want, want]);
+}
+
+#[test]
+fn vector_ema_rejects_a_zero_width_window() {
+  // A zero-dimension embedding is structurally empty rather than
+  // direction-less, so it reports `Empty` — and refusing it is what keeps an
+  // epoch from "seeding" with an accumulator that is still empty, which is
+  // exactly the unseeded state.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(s.push(vec_window(&[], 0)).unwrap_err(), WinditError::Empty);
+  // Still unseeded: the next window seeds the epoch itself.
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 3.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_new_clamps_alpha_into_range() {
+  assert_eq!(VectorEma::new(2.0).alpha(), 1.0);
+  assert_eq!(VectorEma::new(f32::INFINITY).alpha(), 1.0);
+  assert_eq!(VectorEma::new(-1.0).alpha(), 0.0);
+  assert_eq!(VectorEma::new(f32::NEG_INFINITY).alpha(), 0.0);
+  assert_eq!(VectorEma::new(f32::NAN).alpha(), 0.0);
+  assert_eq!(VectorEma::new(0.25).alpha(), 0.25);
+
+  // The re-clamp inside `smoother()` is unreachable through `new`, exactly as
+  // `Ema`'s is, so it is exercised the only way it can be: by building the
+  // config through its private field, which this module can do and downstream
+  // cannot. Without it a future construction path that bypassed `new` (a serde
+  // derive, say) would hand the recurrence a NaN coefficient.
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: f32::NAN }.smoother();
+  assert_eq!(bypassed.alpha, 0.0);
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: 4.0 }.smoother();
+  assert_eq!(bypassed.alpha, 1.0);
+  let bypassed: VectorEmaState<RawF64Emb> = VectorEma { alpha: -4.0 }.smoother();
+  assert_eq!(bypassed.alpha, 0.0);
+}
+
+#[test]
+fn vector_ema_nan_alpha_holds_the_seed_rather_than_poisoning_the_stream() {
+  // A NaN `alpha` clamps to 0.0 — hold the seed — rather than propagating. It
+  // matters that this is asserted through a *second* push: a NaN coefficient
+  // would make the accumulator all-NaN, whose largest magnitude is zero, so the
+  // determinacy gate would reject it and this would be `Err(NonFinite)` rather
+  // than a wrong value.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(f32::NAN));
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 2.0], 0)).unwrap()),
+    &[0.0, 1.0]
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[7.0, 0.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_rejects_a_non_finite_window_and_leaves_the_accumulator_unchanged() {
+  // Unlike the scalar `Ema`, which documents a non-finite input poisoning its
+  // state until a reset, a non-finite component is refused here before the
+  // accumulator is touched.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for bad in [
+    [f64::NAN, 0.0],
+    [0.0, f64::INFINITY],
+    [f64::NEG_INFINITY, 1.0],
+  ] {
+    assert_eq!(
+      s.push(vec_window(&bad, 1)).unwrap_err(),
+      WinditError::NonFinite
+    );
+  }
+  // The epoch is intact: the next finite window sees the seed, not a poisoned
+  // accumulator. Drop the finiteness guard and the accumulator is NaN here, the
+  // gate rejects it, and this `unwrap` panics.
+  let want = 1.0 / libm::sqrt(2.0);
+  let after = s.push(vec_window(&[0.0, 1.0], 2)).unwrap();
+  assert_eq!(emitted(&after), &[want, want]);
+
+  // A non-finite *seed* is refused the same way, leaving the smoother unseeded
+  // so the next window seeds the epoch itself.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&[f64::NAN, 1.0], 0)).unwrap_err(),
+    WinditError::NonFinite
+  );
+  assert_eq!(
+    emitted(&s.push(vec_window(&[0.0, 2.0], 1)).unwrap()),
+    &[0.0, 1.0]
+  );
+}
+
+#[test]
+fn vector_ema_gate_rejects_an_indeterminate_direction() {
+  // Exact cancellation: `[1, 0]` then `[-1, 0]` at alpha 0.5 leaves the
+  // accumulator at exactly zero, which has no direction to emit.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+
+  // And the case an exact-zero test could never catch: a residue that is
+  // NONZERO but below the fold's own rounding floor. The accumulator here is
+  // ~5.0e-16 while the gate stands at 16 * EPSILON * ||M|| ~= 3.55e-15, so
+  // without the gate `l2_renorm` would amplify it into the fabricated unit
+  // direction `[1, 0]` and the push would succeed.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  assert_eq!(
+    s.push(vec_window(&[-1.0 + 1e-15, 0.0], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+
+  // Non-vacuity: the gate has a real boundary rather than rejecting everything
+  // small. One decimal order out — an accumulator of ~5.0e-15 against the same
+  // ~3.55e-15 threshold — the residue is determinate and the direction is
+  // emitted.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let out = s.push(vec_window(&[-1.0 + 1e-14, 0.0], 1)).unwrap();
+  assert_eq!(emitted(&out), &[1.0, 0.0]);
+}
+
+#[test]
+fn vector_ema_gate_failure_still_advances_the_accumulator() {
+  // The one push that is NOT a no-op on failure, and deliberately so: a window
+  // whose output was gated was still a real observation, and the epoch the
+  // aggregate would fold over includes it. After the exact cancellation above,
+  // the accumulator is zero, so the next window's direction is its own —
+  // whereas a rolled-back accumulator would still hold `[1, 0]` and mix into
+  // `[0.5, 0.5]`.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let _ = s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  let _ = s.push(vec_window(&[-1.0, 0.0], 1)).unwrap_err();
+  let out = s.push(vec_window(&[0.0, 1.0], 2)).unwrap();
+  assert_eq!(emitted(&out), &[0.0, 1.0]);
+}
+
+#[test]
+fn vector_ema_refuses_raw_quantization_codes() {
+  // The projection is `compute_components`, the same value surface `aggregate`
+  // reads, so quantized storage with no dequantization override fails closed
+  // here too. Reading `as_slice` and widening it directly would be one line
+  // shorter and would silently smooth raw codes as if they were values.
+  let mut s = SmoothPolicy::<BareI8Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(Windowed::new(BareI8Emb(vec![1, 2, 3]), Span::new(0, 1, 1)))
+      .unwrap_err(),
+    WinditError::MissingDequantization
+  );
+}
+
+#[test]
+fn vector_ema_drives_an_f32_storage_embedding_through_the_widening_projection() {
+  // `TestVec` stores `f32` and normalizes inside its own `from_unnormalized`,
+  // which is the shape of every real embedding (a 512-wide CLAP vector, say):
+  // it drives the `Cow::Owned` elementwise-widening branch of
+  // `compute_components` rather than the `f64` zero-copy borrow the other
+  // vector tests take, and it proves the emitted value survives a narrowing
+  // reconstruction.
+  let mut s = SmoothPolicy::<TestVec>::smoother(&VectorEma::new(0.5));
+  let first = s
+    .push(Windowed::new(
+      TestVec::from_unnormalized(&[1.0, 0.0]).unwrap(),
+      Span::new(0, 1, 1),
+    ))
+    .unwrap();
+  let second = s
+    .push(Windowed::new(
+      TestVec::from_unnormalized(&[0.0, 1.0]).unwrap(),
+      Span::new(1, 1, 1),
+    ))
+    .unwrap();
+  assert_eq!(first.value.as_slice(), &[1.0f32, 0.0]);
+  let want = (1.0 / libm::sqrt(2.0)) as f32;
+  assert_eq!(second.value.as_slice(), &[want, want]);
+}
+
+#[test]
+fn vector_ema_emits_the_aggregate_ema_of_every_prefix() {
+  // The defining equivalence, and the reason the renormalization is applied to
+  // an emitted COPY rather than to the accumulator: the recurrence this
+  // smoother carries is exactly the recency weighting
+  // `w_0 = (1 - alpha)^t`, `w_i = alpha * (1 - alpha)^(t - i)` that
+  // `EmaRenormalized` builds explicitly, so window `i` must emit the direction
+  // the aggregate folds over the prefix `[0..=i]`.
+  //
+  // A genuine differential: the two sides share no code below `l2_renorm` —
+  // the aggregate materializes the weights and runs a Neumaier-compensated
+  // sum over the whole prefix, this one runs a two-term recurrence — so
+  // agreement is evidence rather than a tautology. Renormalizing the
+  // accumulator in place instead (the "spherical EMA" this type deliberately
+  // is not) breaks it in the second decimal place, thousands of times the
+  // tolerance below.
+  let fixture: [[f64; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.5, 0.5, 0.0],
+    [-0.25, 0.75, 0.5],
+    [0.125, -0.625, 0.25],
+  ];
+
+  for alpha in [0.5f32, 0.3, 0.75, 1.0] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s.push(vec_window(&fixture[i], i)).unwrap();
+      let prefix: Vec<Windowed<RawF64Emb>> = fixture[..=i]
+        .iter()
+        .enumerate()
+        .map(|(j, v)| vec_window(v, j))
+        .collect();
+      let want =
+        crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+          .unwrap();
+      let got = emitted(&got);
+      assert_eq!(got.len(), want.captured.len());
+      for (g, w) in got.iter().zip(&want.captured) {
+        let diff = if g > w { g - w } else { w - g };
+        assert!(
+          diff < 1e-15,
+          "alpha {alpha}, prefix {i}: {got:?} vs {:?}",
+          want.captured
+        );
+      }
+    }
+  }
 }

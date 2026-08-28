@@ -134,6 +134,12 @@ impl Vector for QuantEmb {
 /// (the zero-copy `Cow::Borrowed` path), capturing the aggregation result
 /// verbatim like [`QuantEmb`]. The reference side of the quantized differential:
 /// the same aggregation over hand-dequantized `f64` values.
+///
+/// `Clone` so it can be pushed through the batch
+/// [`SmoothPolicy::smooth`](crate::smooth::SmoothPolicy::smooth) convenience,
+/// whose method bound clones each window, and `Debug` so a
+/// `Result<Windowed<Self>, _>` can be `unwrap_err`'d.
+#[derive(Clone, Debug)]
 pub(crate) struct RawF64Emb {
   pub(crate) data: Vec<f64>,
   pub(crate) captured: Vec<f64>,
@@ -157,6 +163,9 @@ impl Vector for RawF64Emb {
 /// An `i8`-storage double with **no** `compute_components` override, so the
 /// default projection refuses it with [`WinditError::MissingDequantization`].
 /// Exists only to pin that fail-closed guard.
+///
+/// `Debug` so a `Result<Windowed<Self>, _>` can be `unwrap_err`'d.
+#[derive(Debug)]
 pub(crate) struct BareI8Emb(pub(crate) Vec<i8>);
 
 impl Vector for BareI8Emb {
