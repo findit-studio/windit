@@ -122,6 +122,11 @@ pub trait Scalar: private::Sealed + Copy {
 /// This trait is sealed; see the [module documentation](self).
 pub trait Real:
   Scalar<Compute = Self>
+  // Every implementor is a core float, so this costs implementors nothing and
+  // buys the generic code its only way to *show* a compute value: without it a
+  // `C: Real` is unformattable, and `VectorEmaState` had to report its shape
+  // while withholding the coefficient it was configured with.
+  + core::fmt::Debug
   + core::ops::Add<Output = Self>
   + core::ops::Sub<Output = Self>
   + core::ops::Mul<Output = Self>

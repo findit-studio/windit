@@ -2509,6 +2509,33 @@ fn vector_ema_new_clamps_alpha_into_range() {
 }
 
 #[test]
+fn vector_ema_state_debug_reports_the_coefficient_it_was_configured_with() {
+  // The coefficient is the one number that distinguishes two states of the same
+  // shape, and it was missing from this report until `Real` gained its `Debug`
+  // supertrait: with no way to format a `ComputeOf<E>`, the impl could only
+  // describe buffers. The buffers are still described rather than dumped — one
+  // component per embedding dimension is not a line anybody reads.
+  let mut st: VectorEmaState<RawF64Emb> = VectorEma::new(0.25).smoother();
+  assert_eq!(
+    std::format!("{st:?}"),
+    "VectorEmaState { alpha: 0.25, seeded: false, dim: 0, steps: 0 }"
+  );
+
+  st.push(Windowed::new(
+    RawF64Emb {
+      data: vec![3.0, 4.0],
+      captured: Vec::new(),
+    },
+    Span::new(0, 2, 2),
+  ))
+  .unwrap();
+  assert_eq!(
+    std::format!("{st:?}"),
+    "VectorEmaState { alpha: 0.25, seeded: true, dim: 2, steps: 0 }"
+  );
+}
+
+#[test]
 fn vector_ema_carries_a_coefficient_no_f32_can_hold() {
   // FALSIFIER for the coefficient's precision. Everything this recurrence
   // multiplies is `ComputeOf<E>` — `f64` for every shipped scalar, `f32` not
