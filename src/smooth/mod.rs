@@ -816,21 +816,44 @@ impl SmoothPolicy<f32> for CadenceEma {
 ///   combination is zero, each side's result is inside its own error bound of
 ///   zero and therefore at or below its own threshold. Neither fabricates a
 ///   direction out of cancellation.
-/// - **Between the two there is a band where the verdicts may differ, and only
-///   in one direction: this side is the more conservative.** From the second
-///   window on, its threshold is never below the aggregate's (the
-///   [determinacy gate](#determinacy-gate) below), because a recurrence carries
-///   rounding the fold does not; over the first two windows the two thresholds
-///   are equal. A prefix whose residue lands between them is emitted by the
-///   aggregate and refused here. The band is narrow — the ratio of thresholds tends to
-///   `1 / alpha`, over residues already at the `EPSILON` scale of the mass — and
-///   an aggregate result inside it is itself within a small multiple of its own
-///   error bound.
+/// - **Near the thresholds the verdicts can differ, in *either* direction.**
+///   Neither threshold bounds the other, and this crate promises no ordering
+///   between them. Two witnesses, both pinned as tests:
 ///
-/// Only the first of those is an accuracy claim; the other two are what
-/// "sibling" is allowed to mean across a fold and a recurrence.
+///   - at `alpha = 0.3` over a three-window prefix leaving a residue of about
+///     `3.63e-15`, the aggregate emits a direction and this side refuses;
+///   - at `alpha = 0.3f32` (`0x3e99999a`) over the one-dimensional windows
+///     `0x3f0ca8ca28200000`, `0xbf20b7cb3226ac2d`, `0xbc2767b60c530643`, both
+///     accumulators land on the same magnitude `0x3c0c160dbb1cff8d` and the two
+///     thresholds land one ulp apart the *other* way — `...ff8c` here and
+///     `...ff8d` there — so this side emits and the aggregate refuses.
+///
+///   An earlier revision claimed this side was never the less conservative of
+///   the two. That was derived by induction against
+///   `alpha * |x_t| + (1 - alpha) * M_{t-1}`, the mass an *ideal* fold would
+///   accumulate, and [`EmaRenormalized`](crate::aggregate::EmaRenormalized) does
+///   not evaluate that recurrence: it rematerializes each weight by iterated
+///   multiplication and sums `|w_i * x_i|` in window order. Those roundings need
+///   not land where the recurrence's do, and the second witness is a prefix
+///   where they do not. The one length at which the two masses provably
+///   coincide is two — where `M_1` is the one-window fold's mass exactly — and
+///   then only for an `alpha` strictly inside `(0, 1)`, the two ends being the
+///   exact steps that charge nothing at all.
+///
+/// Only the first of those is an accuracy claim. The second is each gate's own
+/// [self-contained contract](#determinacy-gate). The third is an *observation*
+/// about two independently sound gates — measured by the differential tests,
+/// recorded by them, and not promised by either type.
 ///
 /// # Determinacy gate
+///
+/// **The contract is self-contained: this gate refuses when the accumulator is
+/// within its own error bound of zero.** That is a property of this type,
+/// provable from its own recurrence, and it says nothing about how any other
+/// code path rounds — in particular nothing about what
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) emits for the same
+/// windows, which is an empirical matter the tests characterize rather than a
+/// guarantee this type makes.
 ///
 /// Before each renormalization the accumulator is measured against its own
 /// rounding floor, `16 * `[`EPSILON`](crate::scalar::Real::EPSILON)` * ||M|| + `[`MIN_GATE_THRESHOLD`](crate::scalar::Real::MIN_GATE_THRESHOLD).
@@ -838,9 +861,10 @@ impl SmoothPolicy<f32> for CadenceEma {
 /// direction determined at working precision" — rather than handed to a
 /// renormalization that would amplify rounding noise into a fabricated unit
 /// direction. The shape, the constant and the absolute floor are the
-/// aggregate's, unchanged. The gate fires on exact cancellation (`[1, 0]` then
-/// `[-1, 0]` at `alpha = 0.5`) and on the near-miss residues an exact-zero test
-/// would let through.
+/// aggregate's, unchanged, and so are the scale-aware norm and renormalization
+/// the comparison runs through; what is this type's own is `M`. The gate fires on
+/// exact cancellation (`[1, 0]` then `[-1, 0]` at `alpha = 0.5`) and on the
+/// near-miss residues an exact-zero test would let through.
 ///
 /// `M` is where a recurrence differs from a fold, and it is not this step's two
 /// term magnitudes. Those measure the step just taken; what the accumulator
@@ -852,29 +876,29 @@ impl SmoothPolicy<f32> for CadenceEma {
 /// M_t = |alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) * M_{t-1},   M_0 = 0
 /// ```
 ///
-/// dominates the accumulator's distance from the exact combination
+/// dominates the accumulator's distance from the exactly-evaluated recurrence
 /// (`2 * u * M_t` componentwise, `u = EPSILON / 2`), which the two-term
 /// magnitude does not once earlier windows have cancelled — a collapsed
 /// `|s_{t-1}|` no longer records the mass it collapsed from. `M_0` is zero
 /// because the seed is a copy: `s_0 = x_0` commits no rounding, so it needs no
 /// allowance, and an all-zero seed is caught by the threshold's absolute floor
-/// alone. From `M_1 = |alpha * x_1| + |(1 - alpha) * x_0|` — which is exactly
-/// the one-window fold's mass carried forward, so the two thresholds are
-/// identical over the first two windows — `M_t` dominates the mass the aggregate
-/// accumulates over the same prefix
-/// (`alpha * |x_t| + (1 - alpha) * M^agg_{t-1}`) at every later window, so from
-/// there on this threshold is never the smaller of the two: see
-/// *A recurrence, not a fold* above for what that buys and what it costs.
+/// alone. The full induction, the two exact-step exemptions, and the absolute
+/// term the subnormal range needs are carried on this crate's `ema_step`.
 ///
-/// The mass grows with the epoch — geometrically toward `max|x| / alpha`, or
-/// linearly at an `alpha` so small that `1 - alpha` rounds to exactly `1` — so
-/// far enough out the threshold would in principle overtake a determinate
-/// accumulator. It cannot be reached. That needs `32 * u > alpha`, so
-/// `alpha < 2^-48`, and at such an `alpha` the mass takes more than `2^48`
-/// pushes to grow that far; `alpha = 0`, where the accumulator is a held seed
-/// and the mass grows by `|x_0|` a push, meets the same `2^48` bound. The
-/// error a recurrence propagates really does accumulate, and this is the
-/// horizon at which allowing for it would start to cost something.
+/// A step that rounds nothing charges nothing, so `alpha = 0` — an exact hold —
+/// accumulates no mass at all and holds its seed direction for an unbounded
+/// epoch. Everywhere else the mass grows with the epoch: geometrically toward
+/// about `max|x| / alpha`, or linearly at a nonzero `alpha` so small that
+/// `1 - alpha` rounds to exactly `1`. Far enough out the threshold does overtake
+/// a determinate accumulator, and that horizon is **reachable in principle**
+/// rather than excluded: it needs `32 * u > alpha`, so `alpha < 2^-48`, and at
+/// such an `alpha` it takes upward of `2^48` pushes to arrive. An epoch that
+/// long at such an `alpha` ends with [`NonFinite`](WinditError::NonFinite) on
+/// every window until a [`reset`](Smoother::reset) — the honest cost of a bound
+/// that keeps allowing for error a recurrence really does propagate. (An
+/// earlier revision called the horizon unreachable. It is not, and at
+/// `alpha = 0` it was reachable through mass an exact hold never committed,
+/// which is the defect the exact-step rule removes.)
 ///
 /// # Dimension
 ///
@@ -1099,38 +1123,121 @@ fn refit<C: Real>(buf: &mut Vec<C>, dim: usize) -> Result<(), WinditError> {
 /// ```
 ///
 /// — the same recurrence, damped by the same coefficient, as the accumulator
-/// itself. That third term is the whole difference between a mass that measures
-/// one *step* and one that measures a *recurrence*. Writing `e_t` for the
-/// accumulator's distance from the exact combination of the prefix, one step
-/// gives
+/// itself, for every step that rounds at all (*Exact steps* below is the
+/// exception, and the only one). That third term is the whole difference
+/// between a mass that measures one *step* and one that measures a
+/// *recurrence*. An overwrite —
+/// `|alpha * x_t| + |(1 - alpha) * s_{t-1}|` alone — takes the measure of the
+/// step just taken, and when earlier windows cancelled that is far below the
+/// rounding they left behind: the collapsed `|s_{t-1}|` no longer knows what it
+/// collapsed from.
+///
+/// # What `M` bounds
+///
+/// Write `c` for the complement as this function actually holds it (the rounded
+/// `fl(1 - alpha)`, which is what the recurrence runs on), and `s^ex` for that
+/// same recurrence — same `alpha`, same `c`, same seed, same inputs — evaluated
+/// in exact arithmetic. Then `e_t = s_t - s^ex_t` is this accumulator's own
+/// error, and one step gives
 ///
 /// ```text
-/// e_t = (1 - alpha) * e_{t-1} + eta_t,  |eta_t| <= 2u * (|alpha * x_t| + |(1 - alpha) * s_{t-1}|)
+/// e_t = c * e_{t-1} + eta_t,   |eta_t| <= 2u * (|alpha * x_t| + |c * s_{t-1}|)
 /// ```
 ///
 /// (`u = EPSILON / 2`, over the two products and their sum). The rounding a step
 /// commits is therefore *carried forward* under the same decay the value is, and
 /// `M` is exactly the accumulator that dominates it: `|e_t| <= 2u * M_t`
-/// follows by induction, componentwise, because the same `(1 - alpha)` damps
-/// both. An overwrite — `|alpha * x_t| + |(1 - alpha) * s_{t-1}|` alone — takes
-/// the measure of the step just taken, and when earlier windows cancelled that
-/// is far below the rounding they left behind: the collapsed `|s_{t-1}|` no
-/// longer knows what it collapsed from.
+/// follows by induction, componentwise, because the same `c` damps both. `M_0`
+/// is zero — [`Smoother::push`] seeds `s_0 = x_0` by copy, which commits no
+/// rounding.
 ///
-/// `M_0` is zero — [`Smoother::push`] seeds `s_0 = x_0` by copy, which commits no
-/// rounding — and from `M_1` on, `M_t` also dominates componentwise the mass
-/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) accumulates over the
-/// same prefix (`alpha * |x_t| + (1 - alpha) * M^agg_{t-1}`), by the same
-/// induction from an `M_1` the two share exactly — so of the two siblings'
-/// thresholds this one is never the smaller.
+/// That is a statement about *this* recurrence and about nothing else. It is
+/// not, and no longer claims to be, a statement about the mass
+/// [`EmaRenormalized`](crate::aggregate::EmaRenormalized) computes over the same
+/// windows: see [`VectorEma`]'s *A recurrence, not a fold* for why an induction
+/// over the ideal fold does not transfer to the shipped one.
+///
+/// # Exact steps
+///
+/// A step that rounds nothing charges nothing, and both ends of the coefficient
+/// range reach that:
+///
+/// - `alpha == 1` makes `c` exactly zero, so `carried` is zero, `recent` is a
+///   copy of `x_t`, and their sum is exact.
+/// - `c == ONE` — every `alpha` at or below `2^-54`, zero included (`2^-54` is
+///   the tie that rounds to even; `1 - 2^-53` is still exactly representable) —
+///   makes
+///   `carried` a rounding-free copy of `s_{t-1}`. When `recent` is zero as well
+///   (`alpha == 0`, or a zero component of `x_t`; the input domain rules out an
+///   underflow to zero) the sum adds an exact zero and the whole step is exact.
+///
+/// Charging for those steps was a liveness defect rather than a conservatism.
+/// At `alpha = 0` the accumulator is a held seed forever, yet `|c * s_{t-1}|`
+/// put `|s_0|` into the mass every push, so `M` grew *linearly* — not
+/// geometrically, since `c` is `1` and damps nothing. After `2^48` pushes
+/// `16 * EPSILON * M` reaches `|s_0|` itself, and the gate's inclusive
+/// comparison then refuses the held seed from that push on, forever. With the
+/// rule above the mass of an exact hold stays exactly zero and the horizon is
+/// never approached.
+///
+/// A *nonzero* `alpha` at or below `2^-54` keeps the linear growth, and keeps it
+/// legitimately: `recent + carried` genuinely rounds every push and, with `c`
+/// equal to one, those roundings accumulate undamped. There a growing threshold
+/// is a true statement about a state whose error really has grown, so only the
+/// exact step is exempted.
+///
+/// # Subnormals
+///
+/// `|e_t| <= 2u * M_t` is purely *relative*, and subnormal rounding is
+/// *absolute*, so the complete bound carries a second term:
+///
+/// ```text
+/// |e_t| <= 2u * M_t + E_t,   E_t <= c * E_{t-1} + eta,   eta = 2^-1074
+/// ```
+///
+/// one `eta / 2` for each of the step's two products, which are the only
+/// operations here whose result can be subnormal — floating-point addition never
+/// underflows, the exact sum of two representable numbers being itself
+/// representable whenever it is subnormal. So `E_t <= t * eta` in the worst
+/// case (`c = 1`, no damping), and `||E_t|| <= sqrt(dim) * t * eta` over the
+/// whole vector.
+///
+/// The absolute term never decides a verdict, because the threshold carries the
+/// absolute floor [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) = `2^-1000`,
+/// and `sqrt(dim) * t * eta <= 2^-1000` for every epoch with
+/// `t * sqrt(dim) <= 2^74` — far past the `2^48` horizon the relative term
+/// already sets, and past any `dim` an embedding has. The regime is real, not
+/// hypothetical: at `alpha = 0.5` a seed of `2^-400` and 675 all-zero windows
+/// leave the computed accumulator at zero where the exact recurrence is
+/// `2^-1075`, against a `2u * M` of about `2^-1118`. The floor had already
+/// refused that accumulator 75 windows earlier.
+///
+/// `M` is itself computed in floating point, and its three roundings a step are
+/// monotone adds that can leave it *below* the exact mass by a relative `3tu`.
+/// The gate's constant is sixteen against a `2u` bound — a factor of sixteen of
+/// headroom — which absorbs that for every epoch below `2^50` pushes, again past
+/// the horizon.
 #[cfg(any(feature = "std", feature = "alloc"))]
 fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
   let complement = C::ONE - alpha;
+  // Hoisted coefficient facts, read once per window rather than per component:
+  // a coefficient of `ONE` makes its product a rounding-free copy, and a
+  // coefficient of `ZERO` annihilates. At the two ends of the range that is
+  // enough to make the whole step exact — see the *Exact steps* note above.
+  let carry_is_a_copy = complement == C::ONE;
+  let injection_is_everything = alpha == C::ONE;
   for ((s, m), &xj) in state.iter_mut().zip(mag.iter_mut()).zip(x.iter()) {
     let recent = alpha * xj;
     let carried = complement * *s;
     *s = recent + carried;
-    *m = recent.abs() + carried.abs() + complement * *m;
+    // A step that rounds nothing charges nothing. Everywhere else the two term
+    // magnitudes bound all three roundings at `2u`.
+    let committed = if injection_is_everything || (carry_is_a_copy && recent == C::ZERO) {
+      C::ZERO
+    } else {
+      recent.abs() + carried.abs()
+    };
+    *m = committed + complement * *m;
   }
 }
 
@@ -1140,8 +1247,9 @@ fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) {
 /// The threshold's shape and constant are the aggregation half's, and so are the
 /// [`l2_norm`]/[`l2_renorm`] it is computed and applied with, so "renormalized"
 /// means the same arithmetic on both sides of the shape boundary. What differs
-/// is the mass: `M` here is [`ema_step`]'s propagated one, which dominates the
-/// fold's — see there for why a recurrence needs it.
+/// is the mass: `M` here is [`ema_step`]'s propagated one, which measures the
+/// error *this recurrence* carries — see there for why a recurrence needs its
+/// own, and for what that bound does and does not say about the fold's.
 ///
 /// Neither norm can overflow, because `push` confines every input component to
 /// the aggregation magnitude domain before the accumulator is written: `state`
@@ -1213,9 +1321,11 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
       // First push of an epoch seeds `s_0 = x_0` — a copy, not arithmetic, so it
       // rounds by nothing and the gate's mass starts at zero rather than at
       // `|x_0|`. `refit` zeroes, so that seed is the absence of a write. Being
-      // exact is also what makes the first two windows' thresholds identical to
-      // the aggregate's: `M_1` works out to `|alpha * x_1| + |(1 - alpha) * x_0|`,
-      // which is the one-window fold's mass carried forward. The seed is still
+      // exact is also the reason length two is the one prefix at which this
+      // mass and the aggregate's provably coincide (for an `alpha` strictly
+      // inside `(0, 1)`): `M_1` works out to
+      // `|alpha * x_1| + |(1 - alpha) * x_0|`, the same two products the
+      // one-window fold weights, summed in the other order. The seed is still
       // gated — an all-zero window has no direction — through the absolute
       // `MIN_GATE_THRESHOLD` floor alone, which is the whole of a threshold with
       // no rounding to allow for.

@@ -2731,11 +2731,20 @@ fn aggregate_prefix(
 /// - `two_term` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}|`: this step's two
 ///   products and nothing older.
 /// - `fold` is `alpha * |x_t| + (1 - alpha) * fold_{t-1}`, the recency-weighted
-///   sum of term magnitudes the aggregate accumulates over the whole prefix.
+///   sum of term magnitudes an IDEAL fold would accumulate over the whole
+///   prefix. It is *not* what `EmaRenormalized` computes — that rematerializes
+///   its weights and sums `|w_i * x_i|` in window order, which is
+///   [`aggregate_mass`]. Mistaking the two is what produced a threshold
+///   ordering that the shipped fold's roundings do not obey; this field is kept
+///   only to aim a residue at a band, never to assert one.
 /// - `propagated` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) *
 ///   propagated_{t-1}` from `propagated_0 = 0`, which additionally carries the
 ///   recurrence's own propagated rounding error — and starts at zero because
 ///   the seed is a copy and rounds by nothing.
+///
+/// The shipped `ema_step` exempts a step that rounds nothing (`alpha` of `0` or
+/// `1`) from charging any mass; this replica does not model that, and asserts
+/// it is never asked to.
 struct Masses {
   state: Vec<f64>,
   two_term: Vec<f64>,
@@ -2746,6 +2755,10 @@ struct Masses {
 fn masses(alpha: f32, xs: &[Vec<f64>]) -> Masses {
   let a = f64::from(alpha);
   let c = 1.0 - a;
+  assert!(
+    a != 0.0 && a != 1.0 && c != 1.0,
+    "this replica does not model the exact-step exemption; alpha {alpha} needs it"
+  );
   let mut state = xs[0].clone();
   let mut two_term: Vec<f64> = xs[0].iter().map(|v| v.abs()).collect();
   let mut fold = two_term.clone();
@@ -2773,6 +2786,106 @@ fn masses(alpha: f32, xs: &[Vec<f64>]) -> Masses {
 /// where a residue must land.
 fn tau(mass: &[f64]) -> f64 {
   16.0 * f64::EPSILON * l2(mass) + f64::from_bits(0x0170_0000_0000_0000)
+}
+
+/// The mass [`EmaRenormalized`](crate::aggregate::EmaRenormalized) **actually
+/// computes** over `xs`: its own rematerialized weights, its own index order,
+/// its own additions.
+///
+/// Not the recurrence `alpha * |x_t| + (1 - alpha) * M_{t-1}` that
+/// [`masses`]'s `fold` carries. The two agree in exact arithmetic and are not
+/// the same computation, and it is precisely that difference — the aggregate
+/// builds `weights[i]` by iterated multiplication and sums `|w_i * x_i|` in
+/// window order — that a differential against the aggregate's *output* has to
+/// read. Reading the recurrence instead is how an induction over the ideal fold
+/// came to be mistaken for a statement about the shipped one.
+fn aggregate_mass(alpha: f32, xs: &[Vec<f64>]) -> Vec<f64> {
+  let a = f64::from(alpha);
+  let c = 1.0 - a;
+  let n = xs.len();
+  let mut weights = vec![0.0f64; n];
+  let mut power = 1.0f64;
+  for i in (1..n).rev() {
+    weights[i] = a * power;
+    power *= c;
+  }
+  weights[0] = power;
+  let mut mag = vec![0.0f64; xs[0].len()];
+  for (i, x) in xs.iter().enumerate() {
+    for (m, &e) in mag.iter_mut().zip(x) {
+      *m += (weights[i] * e).abs();
+    }
+  }
+  mag
+}
+
+#[test]
+fn vector_ema_and_the_aggregate_compute_the_same_mass_at_length_two() {
+  // The rebuilt length-two regression. What stood here before was a tautology:
+  // its fixture pushed ONE window, and the local `masses` helper then
+  // initialised `two_term` and `fold` identically from that seed, so the
+  // assertion compared a value with itself — invoking neither `M_1` nor either
+  // production implementation. The blind spot the test was written to pin was
+  // not pinned.
+  //
+  // This drives TWO real windows through the shipped smoother, reads the
+  // production `VectorEmaState.mag` back, and compares it against the mass
+  // `EmaRenormalized` actually computes over the same pair. At length two the
+  // two are bit-identical and provably so: `M_0` is zero because the seed is a
+  // copy, so `M_1` is `|alpha * x_1| + |(1 - alpha) * x_0| + (1 - alpha) * 0`,
+  // and the aggregate's `weights[1] = alpha`, `weights[0] = 1 - alpha` make its
+  // mass the same two products, summed in the other order. Past length two the
+  // agreement stops — see the two `can_*` witnesses below — which is exactly
+  // why this one is asserted here and nowhere else.
+  const DIM: usize = 3;
+  let mut rng = 0x0f1e_2d3c_4b5a_6978u64;
+  for alpha in [1.0f32, 0.75, 0.5, 0.3, 0.1, 0.0] {
+    let xs: Vec<Vec<f64>> = (0..2)
+      .map(|_| {
+        (0..DIM)
+          .map(|_| f64::from(next_unit(&mut rng)) - 0.5)
+          .collect()
+      })
+      .collect();
+    assert_ne!(xs[0], xs[1], "the two windows must differ");
+
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    s.push(vec_window(&xs[0], 0)).expect("seed");
+    s.push(vec_window(&xs[1], 1)).expect("second window");
+
+    let want = aggregate_mass(alpha, &xs);
+    // The two coefficient ends are the deliberate exception, pinned rather than
+    // skipped: at `alpha = 1` the step is an exact pass-through and at
+    // `alpha = 0` an exact hold, so neither rounds and neither charges. The
+    // aggregate's mass is `|x_1|` and `|x_0|` there, so this is a real
+    // divergence — in the emitting direction, and sound, because the step it
+    // declines to charge for committed nothing to charge.
+    if alpha == 1.0 || alpha == 0.0 {
+      assert!(
+        l2(&want) > 0.1,
+        "alpha {alpha}: the aggregate does charge here"
+      );
+      assert_eq!(
+        s.mag,
+        vec![0.0; DIM],
+        "alpha {alpha}: an exact step charges nothing"
+      );
+      continue;
+    }
+    // Non-vacuity: a mass of zero would make every comparison below hold for
+    // the wrong reason.
+    assert!(l2(&want) > 0.1, "alpha {alpha}: fixture mass must be real");
+    assert_eq!(
+      s.mag, want,
+      "alpha {alpha}: the production mass after two windows must be the mass the \
+       aggregate computes over the same pair, bit for bit"
+    );
+    assert_eq!(
+      tau(&s.mag),
+      tau(&want),
+      "alpha {alpha}: and therefore the same threshold"
+    );
+  }
 }
 
 #[test]
@@ -2823,62 +2936,49 @@ fn vector_ema_gate_agrees_with_the_aggregate_over_a_cancelling_three_window_pref
 #[test]
 fn vector_ema_gate_and_the_aggregate_agree_at_every_prefix_length() {
   // The single counterexample above, generalized: at every prefix length from
-  // two to ten, and at five smoothing factors, a final window is tuned so the
+  // three to ten, and at five smoothing factors, a final window is tuned so the
   // accumulator's residue lands strictly between the two-term threshold and the
   // aggregate's own. Every one of those is a prefix the aggregate calls
-  // indeterminate, so the streaming sibling must call it indeterminate too.
+  // indeterminate, and the streaming sibling calls it indeterminate too.
   //
-  // The residue is aimed at the GEOMETRIC MEAN of the two thresholds, and the
-  // band is required to be at least 1.2 wide before the case counts, so it
-  // clears both edges by the same factor and no verdict here turns on a
-  // last-bit rounding difference between the two folds.
+  // CHARACTERIZATION of an observed agreement, not a guarantee. The residue is
+  // aimed at the GEOMETRIC MEAN of the two thresholds and the band is required
+  // to be at least 1.2 wide before the case counts, so every case here clears
+  // both edges by the same factor — deliberately away from the last-bit region
+  // where the two verdicts are known to split in either direction (the two
+  // `can_*` witnesses below).
+  //
+  // Length two is not in the sweep: it has its own test, which drives two real
+  // windows through the shipped smoother instead of computing both sides of an
+  // equality in this file. The version of this loop that carried a length-two
+  // arm asserted a tautology — its fixture pushed one window and compared two
+  // helper fields initialised identically from that seed.
   const DIM: usize = 4;
   let mut rng = 0x5eed_1234_9abc_def0u64;
   for alpha in [0.75f32, 0.5, 0.3, 0.2, 0.1] {
     let a = f64::from(alpha);
     let c = 1.0 - a;
-    for len in 2..=10usize {
+    for len in 3..=10usize {
       // A prefix that cancels most of the way, so its collapsed accumulator
       // carries far less magnitude than the mass that produced it — the regime
       // in which the two definitions differ at all. Random windows, then one
       // that cancels nine tenths of what they built.
-      let mut xs: Vec<Vec<f64>> = (0..len.saturating_sub(2))
+      let mut xs: Vec<Vec<f64>> = (0..len - 2)
         .map(|_| {
           (0..DIM)
             .map(|_| 0.5 + f64::from(next_unit(&mut rng)))
             .collect()
         })
         .collect();
-      if len > 2 {
-        let built = masses(alpha, &xs);
-        xs.push(
-          built
-            .state
-            .iter()
-            .map(|v| -(c / a) * v * 0.9)
-            .collect::<Vec<f64>>(),
-        );
-      } else {
-        xs.push(
-          (0..DIM)
-            .map(|_| 0.5 + f64::from(next_unit(&mut rng)))
-            .collect(),
-        );
-      }
+      let built = masses(alpha, &xs);
+      xs.push(
+        built
+          .state
+          .iter()
+          .map(|v| -(c / a) * v * 0.9)
+          .collect::<Vec<f64>>(),
+      );
       let m = masses(alpha, &xs);
-      if len == 2 {
-        // Why no existing test could see this. At one step past the seed the
-        // accumulator IS the seed, so `|(1 - alpha) * s_0|` and
-        // `(1 - alpha) * |x_0|` are the same number: the two definitions are
-        // bit-identical and there is no band to land in. Pinned rather than
-        // skipped, so the blind spot is stated where it was.
-        assert_eq!(
-          tau(&m.two_term),
-          tau(&m.fold),
-          "alpha {alpha}: the two thresholds coincide at length two"
-        );
-        continue;
-      }
       // The final window is `-((1 - alpha) / alpha) * s`, scaled just off exact
       // cancellation, so the residue it leaves is `(1 - alpha) * scale * ||s||`
       // — a dial. Its own term magnitude is `|(1 - alpha) * s|` per component,
@@ -3023,17 +3123,23 @@ fn vector_ema_gate_mass_carries_the_whole_prefix_not_one_step() {
 }
 
 #[test]
-fn vector_ema_is_the_more_conservative_sibling_inside_the_band() {
-  // Where the two siblings are ALLOWED to disagree, and the only direction the
-  // disagreement may run. This prefix is the cancelling one above with its
-  // third window rotated by 4e-15, which lifts the residue to ~3.63e-15 —
-  // above the aggregate's threshold (~3.52e-15) and below the streaming
-  // sibling's (~6.30e-15).
+fn vector_ema_can_refuse_a_prefix_the_aggregate_emits() {
+  // One of the two directions a near-threshold verdict can run. CHARACTERIZATION
+  // of what is observed, not a promise: the crate no longer claims an ordering
+  // between the two thresholds, and the companion test below exhibits the other
+  // direction at exact bits.
+  //
+  // This prefix is the cancelling one above with its third window rotated by
+  // 4e-15, which lifts the residue to ~3.63e-15 — above an ideal fold's
+  // threshold (~3.52e-15) and below the streaming sibling's (~6.30e-15). Those
+  // two figures only POSITION the fixture; both verdicts below are read off the
+  // shipped implementations.
   //
   // The aggregate emits a direction; the recurrence refuses, because at this
   // residue its own propagated rounding is not provably smaller than the
   // result. A gate carrying only the fold's mass would emit here too, and would
-  // be claiming an error bound the recurrence does not have.
+  // be claiming an error bound the recurrence does not have — which is the
+  // property this case still pins.
   const ALPHA: f32 = 0.3;
   let fixture: Vec<Vec<f64>> = vec![
     vec![1.0, 0.0],
@@ -3057,6 +3163,86 @@ fn vector_ema_is_the_more_conservative_sibling_inside_the_band() {
   assert_eq!(
     s.push(vec_window(&fixture[2], 2)).unwrap_err(),
     WinditError::NonFinite
+  );
+}
+
+#[test]
+fn vector_ema_can_emit_a_prefix_the_aggregate_refuses() {
+  // The OTHER direction, at exact bits, and the case that killed the claim
+  // "this side's threshold is never below the aggregate's". The induction
+  // behind that claim compared the streaming mass against the recurrence
+  // `alpha * |x_t| + (1 - alpha) * M_{t-1}` — the mass an IDEAL fold would
+  // accumulate. `EmaRenormalized` does not evaluate that recurrence. It
+  // rematerializes `weights[i]` by iterated multiplication and sums
+  // `|w_i * x_i|` in window order, and those roundings do not have to land
+  // where the recurrence's do.
+  //
+  // Here they land one ulp apart in the wrong direction. Three one-dimensional
+  // windows at `alpha = 0.3f32`: both sides reach the same accumulator, bit for
+  // bit, and the streaming mass comes out one ulp BELOW the aggregate's — so
+  // the streaming threshold is one ulp below the aggregate's, the accumulator
+  // falls exactly in that one-ulp gap, and the streaming gate emits a direction
+  // its aggregate sibling calls indeterminate.
+  //
+  // Recorded as the witness that near-threshold verdicts differ in BOTH
+  // directions. There is nothing to fix here: each gate is sound against its
+  // own error bound, and neither bound was ever a statement about the other
+  // side's rounding.
+  const ALPHA: f32 = f32::from_bits(0x3e99_999a);
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![f64::from_bits(0x3f0c_a8ca_2820_0000)],
+    vec![f64::from_bits(0xbf20_b7cb_3226_ac2d)],
+    vec![f64::from_bits(0xbc27_67b6_0c53_0643)],
+  ];
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  s.push(vec_window(&fixture[0], 0)).expect("the seed");
+  // The second window cancels the seed to EXACTLY zero, so both sides refuse it
+  // — and the streaming accumulator still advances through the refusal, which is
+  // what leaves the third window's residue in the gap.
+  assert_eq!(
+    s.push(vec_window(&fixture[1], 1)).unwrap_err(),
+    WinditError::NonFinite
+  );
+  assert_eq!(s.state, vec![0.0], "the two-window prefix cancels exactly");
+  assert_eq!(
+    aggregate_prefix(ALPHA, &fixture, 1).unwrap_err(),
+    WinditError::NonFinite,
+    "and the aggregate agrees about that one"
+  );
+  let got = s.push(vec_window(&fixture[2], 2));
+
+  // The accumulators meet, bit for bit — so the disagreement is entirely in the
+  // two masses and not in the value being gated.
+  let ours = s.state[0];
+  assert_eq!(
+    ours.abs().to_bits(),
+    0x3c0c_160d_bb1c_ff8d,
+    "the streaming accumulator must land on the witness bits"
+  );
+
+  // The masses, and therefore the thresholds, differ by one ulp — the streaming
+  // one BELOW the aggregate's, which is the ordering the retired claim forbade.
+  let theirs = aggregate_mass(ALPHA, &fixture);
+  assert!(
+    s.mag[0] < theirs[0],
+    "the streaming mass must be the smaller here: {:e} against {:e}",
+    s.mag[0],
+    theirs[0]
+  );
+  assert_eq!(tau(&s.mag).to_bits(), 0x3c0c_160d_bb1c_ff8c);
+  assert_eq!(tau(&theirs).to_bits(), 0x3c0c_160d_bb1c_ff8d);
+
+  // And the verdicts split, in the direction the retired claim ruled out.
+  assert_eq!(
+    emitted(&got.expect("the streaming gate emits at this residue")),
+    &[-1.0],
+    "the accumulator is negative, so its unit direction is -1"
+  );
+  assert_eq!(
+    aggregate_prefix(ALPHA, &fixture, 2).unwrap_err(),
+    WinditError::NonFinite,
+    "the aggregate calls the same prefix indeterminate"
   );
 }
 
@@ -3117,4 +3303,202 @@ fn vector_ema_matches_the_aggregate_on_determinate_prefixes_at_both_storage_widt
       }
     }
   }
+}
+
+#[test]
+fn vector_ema_alpha_zero_holds_the_seed_and_accumulates_no_mass() {
+  // FALSIFIER for the branch's horizon argument. At `alpha = 0` the recurrence
+  // is exact — `1 - alpha` is `1`, so the carry is a rounding-free copy and the
+  // injection is exactly zero — yet the gate's mass still charged
+  // `|(1 - alpha) * s|` a push, so `M` grew LINEARLY by `|s_0|` per window.
+  // That is the growth the horizon argument assumed away: at `2^48` post-seed
+  // pushes the threshold reaches the held seed's own magnitude and the
+  // inclusive comparison refuses it from then on, forever.
+  //
+  // Measured through the internal mass rather than by running `2^48` pushes: a
+  // step that rounds nothing must charge nothing, so after any number of pushes
+  // the mass of an exact hold is exactly zero.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for i in 1..64usize {
+    let out = s.push(vec_window(&[0.25, -0.5], i)).unwrap();
+    assert_eq!(
+      emitted(&out),
+      &[1.0, 0.0],
+      "push {i}: alpha 0 holds the seed direction"
+    );
+  }
+  assert_eq!(
+    s.state,
+    vec![1.0, 0.0],
+    "the accumulator is the seed, bit for bit"
+  );
+  assert_eq!(
+    s.mag,
+    vec![0.0, 0.0],
+    "an exact hold commits no rounding, so it must charge no mass; linear growth \
+     here is what makes the 2^48 horizon reachable"
+  );
+}
+
+#[test]
+fn vector_ema_a_mass_at_the_horizon_refuses_a_held_seed() {
+  // Why a zero mass is the cure and not a detail. The consequence is reached by
+  // writing the mass the old linear growth left after `2^48` post-seed pushes
+  // rather than by running them: `16 * EPSILON * 2^48` is exactly `1`, the
+  // seed's own magnitude, and the gate's comparison is inclusive.
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.0));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  s.push(vec_window(&[0.0, 0.0], 1)).unwrap();
+  s.mag = vec![libm::ldexp(1.0, 48), 0.0];
+  assert_eq!(
+    s.push(vec_window(&[0.0, 0.0], 2)).unwrap_err(),
+    WinditError::NonFinite,
+    "a mass of 2^48 seeds puts the threshold at the seed's own magnitude"
+  );
+}
+
+#[test]
+fn vector_ema_a_nonzero_alpha_below_the_complement_collapse_still_grows_its_mass() {
+  // The other half of the alpha-zero analysis, pinned so the cure cannot be
+  // widened into a lie. At `alpha = 2^-60` the complement rounds to exactly
+  // `1.0` just as it does at zero, so the carry is again a rounding-free copy —
+  // but the injection is NOT zero, and `recent + carried` genuinely rounds
+  // every push. That error really does accumulate undamped, so the mass really
+  // does grow linearly here, and the growth is a true bound rather than an
+  // artifact. Only the exact hold may charge nothing.
+  // `2^-54` is the FIRST alpha whose complement collapses — the tie that rounds
+  // to even — so this sits exactly on the documented edge rather than safely
+  // inside it, and the neighbour that does not collapse is pinned beside it.
+  const ALPHA: f32 = 1.0 / 18_014_398_509_481_984.0; // 2^-54
+  assert_eq!(
+    1.0f64 - f64::from(ALPHA),
+    1.0,
+    "the complement must collapse"
+  );
+  assert_ne!(
+    1.0f64 - libm::ldexp(1.0, -53),
+    1.0,
+    "and 2^-53 must NOT: the doc's constant is 2^-54"
+  );
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  s.push(vec_window(&[1.0, 0.0], 0)).unwrap();
+  for i in 1..64usize {
+    s.push(vec_window(&[0.25, 0.0], i)).unwrap();
+  }
+  assert!(
+    s.mag[0] > 62.0 && s.mag[0] < 64.0,
+    "a rounding step per push must still be charged: {:?}",
+    s.mag
+  );
+}
+
+#[test]
+fn vector_ema_error_bound_needs_an_absolute_term_in_the_subnormal_regime() {
+  // FALSIFIER for the published bound `|e_t| <= 2u * M_t`. At alpha 0.5 a seed
+  // of `2^-400` and a run of all-zero windows halves the accumulator every
+  // push, walking it through the normal range and down into the subnormals. At
+  // the 675th push the exact recurrence is `2^-1075` and the computed
+  // accumulator rounds it to zero — an error of `2^-1075`, half the smallest
+  // subnormal `eta = 2^-1074`.
+  //
+  // The mass by then is `337 * eta`, so the RELATIVE allowance `2u * M` is
+  // `337 * 2^-52` eta — about 42 binary orders too small to cover it. Subnormal
+  // rounding is ABSOLUTE, and a bound with only a relative term cannot see it.
+  //
+  // Everything below is stated in units of `eta`, because `2u * M` itself is
+  // `~2^-1126` and has no f64 to be stated in.
+  const SEED_EXP: i32 = -400; // exactly `Real::MIN_AGG_MAGNITUDE`
+  const STEPS: usize = 675;
+  let eta = f64::from_bits(1);
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[libm::ldexp(1.0, SEED_EXP)], 0))
+    .expect("the seed is in domain and determinate");
+  for i in 1..=STEPS {
+    // Refused from the moment the accumulator falls under the gate's absolute
+    // floor, and advancing the accumulator through every refusal — which is the
+    // documented behaviour and what carries the state into the subnormals.
+    let _ = s.push(vec_window(&[0.0], i));
+  }
+
+  assert_eq!(
+    s.state,
+    vec![0.0],
+    "the computed accumulator must have rounded to zero"
+  );
+  let error_in_eta = 0.5; // the exact recurrence is `2^-1075`, half of eta
+  let mass_in_eta = s.mag[0] / eta;
+  assert_eq!(mass_in_eta, 337.0, "the mass at the underflow step");
+
+  // The relative term alone does NOT cover it — that is the whole finding, and
+  // it is asserted rather than described so the published bound can never be
+  // narrowed back.
+  let relative_in_eta = mass_in_eta * f64::EPSILON;
+  assert!(
+    relative_in_eta < error_in_eta,
+    "`2u * M` must be the term that fails here: {relative_in_eta:e} eta"
+  );
+
+  // The absolute term covers it, with room to spare: each step's two products
+  // can each round by at most `eta / 2` when their result is subnormal (a
+  // floating-point ADDITION never underflows), and those contributions
+  // accumulate undamped in the worst case, so `E_t <= t * eta`.
+  let absolute_in_eta = STEPS as f64;
+  assert!(
+    relative_in_eta + absolute_in_eta >= error_in_eta,
+    "the mixed bound must cover the error"
+  );
+
+  // And the absolute term never reaches a verdict, because the gate's own
+  // absolute floor is `2^-1000` — 74 binary orders above `t * eta` at this
+  // epoch, and above it for every epoch shorter than `2^74` windows.
+  let floor = f64::from_bits(0x0170_0000_0000_0000);
+  assert!(
+    absolute_in_eta * eta < floor,
+    "MIN_GATE_THRESHOLD must dominate the accumulated absolute term"
+  );
+  assert_eq!(
+    s.push(vec_window(&[0.0], STEPS + 1)).unwrap_err(),
+    WinditError::NonFinite,
+    "the verdict is refusal, and correctly so: the exact value is under the floor too"
+  );
+}
+
+#[test]
+fn vector_ema_gate_floor_decides_below_two_pow_minus_1000() {
+  // The absolute floor's own boundary, and the one regime where it decides a
+  // verdict rather than sitting far under the relative term. Same walk as the
+  // subnormal case above: alpha 0.5, a seed of `2^-400`, all-zero windows, so
+  // the accumulator is `2^-(400 + t)` exactly and the mass is `t * 2^-(400 + t)`
+  // — which puts `16 * EPSILON * ||M||` around `2^-1039` while the accumulator
+  // is still around `2^-1000`. The relative term is 39 binary orders too small
+  // to reach anything here; `MIN_GATE_THRESHOLD` is the whole threshold.
+  //
+  // Non-vacuous from both sides: one push earlier the same gate emits.
+  const SEED_EXP: i32 = -400;
+  let floor_exp = -1000;
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  s.push(vec_window(&[libm::ldexp(1.0, SEED_EXP)], 0))
+    .expect("the seed");
+  // 599 halvings leave the accumulator at `2^-999`, one binade ABOVE the floor.
+  for i in 1..=599usize {
+    s.push(vec_window(&[0.0], i))
+      .expect("still above the floor");
+  }
+  assert_eq!(s.state, vec![libm::ldexp(1.0, floor_exp + 1)]);
+  assert!(
+    16.0 * f64::EPSILON * s.mag[0] < libm::ldexp(1.0, floor_exp) / 1e9,
+    "the relative term must be irrelevant here: {:e}",
+    16.0 * f64::EPSILON * s.mag[0]
+  );
+
+  // One more halving puts it AT the floor, and the comparison is inclusive.
+  assert_eq!(
+    s.push(vec_window(&[0.0], 600)).unwrap_err(),
+    WinditError::NonFinite,
+    "at 2^-1000 the absolute floor refuses"
+  );
+  assert_eq!(s.state, vec![libm::ldexp(1.0, floor_exp)]);
 }
