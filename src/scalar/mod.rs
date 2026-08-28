@@ -120,12 +120,54 @@ pub trait Scalar: private::Sealed + Copy {
 /// A floating-point scalar the aggregation math can run in.
 ///
 /// This trait is sealed; see the [module documentation](self).
+///
+/// # Supertraits are not purely additive
+///
+/// Sealing prevents downstream *implementations*; it does not prevent a
+/// *method-resolution* collision at a call site, and adding a supertrait can
+/// therefore break source that compiled before. `Real` gained a
+/// [`Debug`](core::fmt::Debug) supertrait in `0.3.0`, so generic code bounded on
+/// `Real` **and** on something else that supplies an `fmt` method — a
+/// [`Display`](core::fmt::Display) bound, or a local trait of the dependent's
+/// own — now sees two candidates where it saw one:
+///
+/// ```compile_fail,E0034
+/// use core::fmt::{Display, Formatter, Result};
+/// use windit::scalar::Real;
+///
+/// fn show<T: Real + Display>(x: T, f: &mut Formatter<'_>) -> Result {
+///   x.fmt(f) // E0034: multiple applicable items in scope
+/// }
+/// ```
+///
+/// The fix is to name the trait at the call site, which is stable against any
+/// future supertrait as well:
+///
+/// ```
+/// use core::fmt::{Display, Formatter, Result};
+/// use windit::scalar::Real;
+///
+/// fn show<T: Real + Display>(x: T, f: &mut Formatter<'_>) -> Result {
+///   Display::fmt(&x, f)
+/// }
+/// ```
+///
+/// `cargo semver-checks` cannot see this class of break — it models items
+/// appearing and disappearing, not ambiguity at a use site — so it is recorded
+/// here and in the changelog rather than left to a tool that reports it as
+/// additive.
 pub trait Real:
   Scalar<Compute = Self>
   // Every implementor is a core float, so this costs implementors nothing and
   // buys the generic code its only way to *show* a compute value: without it a
   // `C: Real` is unformattable, and `VectorEmaState` had to report its shape
   // while withholding the coefficient it was configured with.
+  //
+  // Sealing keeps it from breaking a downstream *impl*, and that is all sealing
+  // does: it says nothing about method resolution at a call site. See the trait's
+  // own "Supertraits are not purely additive" note — a downstream
+  // `T: Real + Display` calling `x.fmt(f)` had one candidate before this bound
+  // and has two after, which is `E0034`.
   + core::fmt::Debug
   + core::ops::Add<Output = Self>
   + core::ops::Sub<Output = Self>

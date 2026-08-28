@@ -417,8 +417,10 @@ consumer against this crate:
   pinned an output. The division stays.
 
 - **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
-  supertrait.** The trait is sealed, so no downstream impl can break and all
-  three are additive for callers. `from_f64` widens an `f64` value the fold will
+  supertrait.** The trait is sealed, so no downstream *impl* can break.
+  `from_f64` and `'static` are additive for callers; **the `Debug` supertrait is
+  not, and the earlier wording here calling all three additive was wrong** — see
+  *Source compatibility* below. `from_f64` widens an `f64` value the fold will
   multiply an embedding by — an EMA smoothing factor, a `Span::coverage`, or the
   wire alpha `AggregatePolicyKind::into_policy` reads before any compute scalar
   exists — into the compute domain (the identity for `f64`). `'static` is a fact
@@ -437,6 +439,29 @@ consumer against this crate:
   embedding by is resolved at `f32` any more, and its documentation says so.
 
 ### Source compatibility
+
+- **`scalar::Real` gained a `Debug` supertrait, and a supertrait is not purely
+  additive.** Sealing prevents downstream *implementations*; it says nothing
+  about *method resolution* at a call site. Generic code bounded on `Real` **and**
+  on something else that supplies an `fmt` method — a `Display` bound, or a local
+  trait of the dependent's own — saw one `fmt` candidate at `0.2.0` and sees two
+  here:
+
+  ```text
+  fn show<T: Real + Display>(x: T, f: &mut Formatter<'_>) -> Result { x.fmt(f) }
+    error[E0034]: multiple applicable items in scope
+  ```
+
+  The fix is one line at the call site — `Display::fmt(&x, f)` — which is also
+  stable against any future supertrait. **The bound is kept**: `Real` has one
+  implementor and it is a core float, the capability is the only way generic code
+  can *show* a compute value (`smooth::VectorEmaState` could not report the
+  coefficient it was configured with without it), and dropping it would buy the
+  same collision class back under a rarer method name. What is corrected is the
+  claim, not the design: `cargo semver-checks` reports this as no change at all,
+  because it models items appearing and disappearing rather than ambiguity at a
+  use site, and its silence was read as evidence once already in this release.
+  A `compile_fail,E0034` doctest on `Real` now pins the break and the workaround.
 
 The glob-collision note this release inherits still applies, since it also adds
 public names:
