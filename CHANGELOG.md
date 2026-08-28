@@ -34,30 +34,51 @@ compiles unchanged.
 
   The renormalization is applied to an emitted *copy*; the accumulator stays raw.
   That is what makes window `i` emit the direction `EmaRenormalized` folds over
-  the prefix `[0..=i]` — a differential test pins that equivalence at four
-  smoothing factors over every prefix. Renormalizing the accumulator in place
-  would be a different filter with different weights.
+  the prefix `[0..=i]`, and a differential test pins it at five smoothing factors
+  over every prefix and both storage widths. Renormalizing the accumulator in
+  place would be a different filter with different weights.
 
-  Both the determinacy gate (`16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`) and the
-  scale-aware renormalization are the aggregation half's own routines, reached
-  rather than re-derived, so the two siblings cannot drift apart. `alpha` clamps
-  into `[0, 1]` at construction, NaN to `0.0`, exactly as `smooth::Ema` does —
-  the smoother idiom, not the aggregate's deferred `AlphaOutOfRange`.
+  The equivalence is exact in exact arithmetic and **not bit-exact in
+  floating point**, and cannot be made so: the aggregate materializes each weight
+  and folds the prefix with Neumaier compensation, this carries a two-term
+  recurrence. What holds — and what the tests establish across prefix lengths,
+  smoothing factors and storage widths — is that determinate prefixes agree to
+  within the sum of the two error bounds, that neither side fabricates a
+  direction out of cancellation, and that between those two regimes there is a
+  narrow band where the verdicts may differ *in one direction only*: this
+  smoother is the more conservative of the two. Its determinacy gate keeps the
+  aggregate's shape, constant and absolute floor
+  (`16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`) and its scale-aware
+  renormalization is the aggregation half's own routine, but the mass `M` is the
+  recurrence's, which carries the damped rounding of every step rather than the
+  term magnitudes of one — the error a recurrence propagates is not the error a
+  fold commits. `alpha` clamps into `[0, 1]` at construction, NaN to `0.0`,
+  exactly as `smooth::Ema` does — the smoother idiom, not the aggregate's
+  deferred `AlphaOutOfRange`.
+
+  Input domain: the aggregation one, unchanged (`aggregate`'s *Input domain*
+  note) — every component finite and either zero or between
+  `Real::MIN_AGG_MAGNITUDE` and `Real::MAX_AGG_MAGNITUDE`. The two-term
+  recurrence would not need it, but the determinacy gate's mass is an `n`-term
+  geometric fold over the epoch, which is exactly what that domain exists to keep
+  inside `f64`. No `f32`-storage embedding can reach the boundary; only an
+  `f64`-storage one can.
 
   Errors, all raised before the accumulator is written so a refused push is a
   no-op: `DimMismatch` for a width that changed mid-epoch, `NonFinite` for a
   non-finite component (the scalar `Ema` absorbs one and poisons; this one
-  refuses it), `Empty` for a zero-width embedding, `MissingDequantization` for
-  raw quantization codes, and `AllocFailed` for a refused buffer. The one
-  deliberate exception is a window whose *output* fails the determinacy gate: it
-  has still advanced the accumulator, because it was a real observation and the
-  prefix the aggregate would fold includes it.
+  refuses it), `MagnitudeOutOfRange` for a component outside the domain above,
+  `Empty` for a zero-width embedding, `MissingDequantization` for raw
+  quantization codes, and `AllocFailed` for a refused buffer. The one deliberate
+  exception is a window whose *output* fails the determinacy gate: it has still
+  advanced the accumulator, because it was a real observation and the prefix the
+  aggregate would fold includes it.
 
-  Re-exported from the prelude under `alloc`. Unlike the three scalar smoothers
-  it gates on `alloc` rather than living in the featureless core tier: its state
-  is one accumulator component per embedding dimension, which is a heap buffer
-  and not the O(1) that tier admits. The buffers are grown on the first push of
-  an epoch and reused by every push after it; `reset` keeps their capacity, so a
+  Re-exported from the prelude under `alloc`. Unlike the three scalar smoothers it
+  gates on `alloc` rather than living in the featureless core tier: its state is
+  one accumulator component per embedding dimension, which is a heap buffer and
+  not the O(1) that tier admits. The buffers are grown on the first push of an
+  epoch and reused by every push after it; `reset` keeps their capacity, so a
   discontinuity costs no allocation.
 
 ### Documented

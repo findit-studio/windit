@@ -2696,3 +2696,424 @@ fn vector_ema_emits_the_aggregate_ema_of_every_prefix() {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// The streaming gate against its aggregate sibling.
+//
+// Every gate test above is two windows long, and at length two the two
+// magnitude definitions coincide — which is why none of them can see a gate
+// that carries only the current step's mass. These measure the two sides
+// against each other at every prefix length instead.
+// ---------------------------------------------------------------------------
+
+/// The direction [`EmaRenormalized`](crate::aggregate::EmaRenormalized) folds
+/// over `fixture[..=upto]`, or the error its own determinacy gate raised.
+///
+/// The oracle the streaming sibling is measured against: same windows, same
+/// coefficient, the aggregation shape.
+fn aggregate_prefix(
+  alpha: f32,
+  fixture: &[Vec<f64>],
+  upto: usize,
+) -> Result<Vec<f64>, WinditError> {
+  let prefix: Vec<Windowed<RawF64Emb>> = fixture[..=upto]
+    .iter()
+    .enumerate()
+    .map(|(j, v)| vec_window(v, j))
+    .collect();
+  crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+    .map(|e| e.captured)
+}
+
+/// The three candidate mass definitions after folding `xs`, by a local
+/// recurrence written independently of the smoother's own.
+///
+/// - `two_term` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}|`: this step's two
+///   products and nothing older.
+/// - `fold` is `alpha * |x_t| + (1 - alpha) * fold_{t-1}`, the recency-weighted
+///   sum of term magnitudes the aggregate accumulates over the whole prefix.
+/// - `propagated` is `|alpha * x_t| + |(1 - alpha) * s_{t-1}| + (1 - alpha) *
+///   propagated_{t-1}` from `propagated_0 = 0`, which additionally carries the
+///   recurrence's own propagated rounding error — and starts at zero because
+///   the seed is a copy and rounds by nothing.
+struct Masses {
+  state: Vec<f64>,
+  two_term: Vec<f64>,
+  fold: Vec<f64>,
+  propagated: Vec<f64>,
+}
+
+fn masses(alpha: f32, xs: &[Vec<f64>]) -> Masses {
+  let a = f64::from(alpha);
+  let c = 1.0 - a;
+  let mut state = xs[0].clone();
+  let mut two_term: Vec<f64> = xs[0].iter().map(|v| v.abs()).collect();
+  let mut fold = two_term.clone();
+  let mut propagated = vec![0.0; xs[0].len()];
+  for x in &xs[1..] {
+    for j in 0..state.len() {
+      let recent = a * x[j];
+      let carried = c * state[j];
+      state[j] = recent + carried;
+      two_term[j] = recent.abs() + carried.abs();
+      fold[j] = recent.abs() + (c * fold[j]).abs();
+      propagated[j] = recent.abs() + carried.abs() + c * propagated[j];
+    }
+  }
+  Masses {
+    state,
+    two_term,
+    fold,
+    propagated,
+  }
+}
+
+/// The gate threshold for a mass vector: the crate's own
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`, spelled here so a test can say
+/// where a residue must land.
+fn tau(mass: &[f64]) -> f64 {
+  16.0 * f64::EPSILON * l2(mass) + f64::from_bits(0x0170_0000_0000_0000)
+}
+
+#[test]
+fn vector_ema_gate_agrees_with_the_aggregate_over_a_cancelling_three_window_prefix() {
+  // THE falsifier for "streaming sibling of `EmaRenormalized`". Three windows,
+  // not two: at length two the streaming gate's magnitude and the aggregate's
+  // coincide, so every existing gate test is blind to a gate that carries only
+  // the current step's two terms. At length three they part, and this prefix is
+  // built to land in the gap — both sides fold to a norm of ~3.43e-15, which is
+  // ABOVE a two-term threshold and BELOW the aggregate's.
+  //
+  // `x1` is chosen so that `||s_1||` is `alpha / (1 - alpha)`, which makes the
+  // unit vector `x2 = -s_1 / ||s_1||` cancel the accumulator exactly: the
+  // prefix has no direction, and the aggregate says so.
+  const ALPHA: f32 = 0.3;
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-0.9436345029127625, 0.33098931238422735],
+    vec![-0.9727890720095563, -0.23169251472325642],
+  ];
+
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  for i in 0..fixture.len() {
+    let got = s.push(vec_window(&fixture[i], i));
+    let want = aggregate_prefix(ALPHA, &fixture, i);
+    match (got, want) {
+      (Ok(g), Ok(w)) => {
+        let g = emitted(&g);
+        assert_eq!(g.len(), w.len(), "prefix {i}");
+        for (a, b) in g.iter().zip(&w) {
+          assert!(
+            (a - b).abs() < 1e-12,
+            "prefix {i}: streaming {g:?} vs aggregate {w:?}"
+          );
+        }
+      }
+      (Err(g), Err(w)) => assert_eq!(g, w, "prefix {i}"),
+      (Ok(g), Err(w)) => panic!(
+        "prefix {i}: the streaming gate EMITTED {:?} from a prefix its aggregate sibling \
+         calls indeterminate ({w})",
+        emitted(&g)
+      ),
+      (Err(g), Ok(w)) => panic!("prefix {i}: streaming rejected ({g}) but aggregate emitted {w:?}"),
+    }
+  }
+}
+
+#[test]
+fn vector_ema_gate_and_the_aggregate_agree_at_every_prefix_length() {
+  // The single counterexample above, generalized: at every prefix length from
+  // two to ten, and at five smoothing factors, a final window is tuned so the
+  // accumulator's residue lands strictly between the two-term threshold and the
+  // aggregate's own. Every one of those is a prefix the aggregate calls
+  // indeterminate, so the streaming sibling must call it indeterminate too.
+  //
+  // The `1e-3` and `4.0` factors keep the target inside the band with margin
+  // rather than on either edge, so no verdict here turns on a last-bit
+  // rounding difference between the two folds.
+  const DIM: usize = 4;
+  let mut rng = 0x5eed_1234_9abc_def0u64;
+  for alpha in [0.75f32, 0.5, 0.3, 0.2, 0.1] {
+    let a = f64::from(alpha);
+    let c = 1.0 - a;
+    for len in 2..=10usize {
+      // A prefix that cancels most of the way, so its collapsed accumulator
+      // carries far less magnitude than the mass that produced it — the regime
+      // in which the two definitions differ at all. Random windows, then one
+      // that cancels nine tenths of what they built.
+      let mut xs: Vec<Vec<f64>> = (0..len.saturating_sub(2))
+        .map(|_| {
+          (0..DIM)
+            .map(|_| 0.5 + f64::from(next_unit(&mut rng)))
+            .collect()
+        })
+        .collect();
+      if len > 2 {
+        let built = masses(alpha, &xs);
+        xs.push(
+          built
+            .state
+            .iter()
+            .map(|v| -(c / a) * v * 0.9)
+            .collect::<Vec<f64>>(),
+        );
+      } else {
+        xs.push(
+          (0..DIM)
+            .map(|_| 0.5 + f64::from(next_unit(&mut rng)))
+            .collect(),
+        );
+      }
+      let m = masses(alpha, &xs);
+      if len == 2 {
+        // Why no existing test could see this. At one step past the seed the
+        // accumulator IS the seed, so `|(1 - alpha) * s_0|` and
+        // `(1 - alpha) * |x_0|` are the same number: the two definitions are
+        // bit-identical and there is no band to land in. Pinned rather than
+        // skipped, so the blind spot is stated where it was.
+        assert_eq!(
+          tau(&m.two_term),
+          tau(&m.fold),
+          "alpha {alpha}: the two thresholds coincide at length two"
+        );
+        continue;
+      }
+      // The final window is `-((1 - alpha) / alpha) * s`, scaled just off exact
+      // cancellation, so the residue it leaves is `(1 - alpha) * scale * ||s||`
+      // — a dial. Its own term magnitude is `|(1 - alpha) * s|` per component,
+      // which makes the closing step's two-term mass twice that and the fold's
+      // that plus the damped history. The residue is aimed at the geometric
+      // mean of the two thresholds, so it clears both edges by the same factor
+      // however wide the band is at this alpha.
+      let closing_two: Vec<f64> = m.state.iter().map(|v| 2.0 * (c * v).abs()).collect();
+      let closing_fold: Vec<f64> = m
+        .state
+        .iter()
+        .zip(&m.fold)
+        .map(|(v, f)| (c * v).abs() + c * f)
+        .collect();
+      let (lo, hi) = (tau(&closing_two), tau(&closing_fold));
+      assert!(
+        hi > 1.2 * lo,
+        "alpha {alpha}, len {len}: the two thresholds must differ for this to test anything \
+         ({lo:e} vs {hi:e})"
+      );
+      let target = libm::sqrt(lo * hi);
+      let scale = target / (c * l2(&m.state));
+      let last: Vec<f64> = m
+        .state
+        .iter()
+        .map(|v| -(c / a) * v * (1.0 + scale))
+        .collect();
+      xs.push(last);
+
+      // Where the residue actually landed: above a two-term threshold, at or
+      // below the aggregate's. Asserted rather than assumed, so the fixture
+      // cannot quietly stop testing anything.
+      let fin = masses(alpha, &xs);
+      let residue = l2(&fin.state);
+      assert!(
+        tau(&fin.two_term) < residue && residue <= tau(&fin.fold),
+        "alpha {alpha}, len {len}: residue {residue:e} must sit between {:e} and {:e}",
+        tau(&fin.two_term),
+        tau(&fin.fold)
+      );
+
+      let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+      let mut got = None;
+      for (i, x) in xs.iter().enumerate() {
+        got = Some(s.push(vec_window(x, i)));
+      }
+      let got = got.unwrap();
+      let want = aggregate_prefix(alpha, &xs, len - 1);
+      assert!(
+        want.is_err(),
+        "alpha {alpha}, len {len}: fixture must be indeterminate for the aggregate too, got \
+         {want:?}"
+      );
+      assert_eq!(
+        got.map(|w| emitted(&w).to_vec()).err(),
+        Some(WinditError::NonFinite),
+        "alpha {alpha}, len {len}: the streaming gate emitted a direction from a prefix its \
+         aggregate sibling calls indeterminate"
+      );
+    }
+  }
+}
+
+#[test]
+fn vector_ema_and_the_aggregate_refuse_the_same_out_of_domain_component() {
+  // `[f64::MAX, f64::MAX]` is an ordinary diagonal — every component finite,
+  // direction plainly `[2^-0.5, 2^-0.5]` — but its NORM is not representable.
+  // The aggregate refuses it up front as outside the aggregation magnitude
+  // domain; the streaming gate must give the same answer rather than let its
+  // own `l2_norm` overflow to infinity and reject through `inf <= inf`.
+  let big = vec![f64::MAX, f64::MAX];
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&big, 0)).unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+  assert_eq!(
+    aggregate_prefix(0.5, &[big], 0).unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+
+  // Non-vacuity: the boundary itself is inside the domain, so the check rejects
+  // a domain violation rather than everything large. `2^400` is
+  // `Real::MAX_AGG_MAGNITUDE`, and a diagonal of it still normalizes.
+  let edge = libm::ldexp(1.0, 400);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  let out = s.push(vec_window(&[edge, edge], 0)).unwrap();
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(emitted(&out), &[want, want]);
+
+  // And the lower edge, the other half of the same domain.
+  let tiny = libm::ldexp(1.0, -400);
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert!(s.push(vec_window(&[tiny, tiny], 0)).is_ok());
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  assert_eq!(
+    s.push(vec_window(&[libm::ldexp(1.0, -401), 0.0], 0))
+      .unwrap_err(),
+    WinditError::MagnitudeOutOfRange {
+      window: 0,
+      component: 0
+    }
+  );
+}
+
+#[test]
+fn vector_ema_gate_mass_carries_the_whole_prefix_not_one_step() {
+  // The three candidate definitions, separated by hand on one four-window
+  // fixture at alpha 0.5 over `[1, 0]`, `[-1, 0]`, `[1, 0]`, `[-1, 0]`, whose
+  // accumulator runs `1`, `0`, `0.5`, `-0.25`:
+  //
+  //   this step's two terms  ->  [0.75, 0]
+  //   the aggregate's fold   ->  [1.0,  0]
+  //   propagated error mass  ->  [1.25, 0]
+  //
+  // The gate must measure against the last: the accumulator is a recurrence, so
+  // the rounding it carries is the whole damped history of its own steps, not
+  // the two products of the current one.
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-1.0, 0.0],
+    vec![1.0, 0.0],
+    vec![-1.0, 0.0],
+  ];
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(0.5));
+  for (i, x) in fixture.iter().enumerate() {
+    let _ = s.push(vec_window(x, i));
+  }
+  assert_eq!(s.mag, vec![1.25, 0.0]);
+
+  // The local recurrence agrees, so the fixture reads the same from both sides.
+  let m = masses(0.5, &fixture);
+  assert_eq!(m.two_term, vec![0.75, 0.0]);
+  assert_eq!(m.fold, vec![1.0, 0.0]);
+  assert_eq!(m.propagated, vec![1.25, 0.0]);
+}
+
+#[test]
+fn vector_ema_is_the_more_conservative_sibling_inside_the_band() {
+  // Where the two siblings are ALLOWED to disagree, and the only direction the
+  // disagreement may run. This prefix is the cancelling one above with its
+  // third window rotated by 4e-15, which lifts the residue to ~3.63e-15 —
+  // above the aggregate's threshold (~3.52e-15) and below the streaming
+  // sibling's (~6.30e-15).
+  //
+  // The aggregate emits a direction; the recurrence refuses, because at this
+  // residue its own propagated rounding is not provably smaller than the
+  // result. A gate carrying only the fold's mass would emit here too, and would
+  // be claiming an error bound the recurrence does not have.
+  const ALPHA: f32 = 0.3;
+  let fixture: Vec<Vec<f64>> = vec![
+    vec![1.0, 0.0],
+    vec![-0.9436345029127625, 0.33098931238422735],
+    vec![-0.9727890720095554, -0.2316925147232603],
+  ];
+  let m = masses(ALPHA, &fixture);
+  let residue = l2(&m.state);
+  assert!(
+    tau(&m.fold) < residue && residue <= tau(&m.propagated),
+    "fixture must sit in the band: {residue:e} against {:e} and {:e}",
+    tau(&m.fold),
+    tau(&m.propagated)
+  );
+
+  assert!(aggregate_prefix(ALPHA, &fixture, 2).is_ok());
+  let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(ALPHA));
+  for (i, x) in fixture.iter().enumerate().take(2) {
+    s.push(vec_window(x, i)).unwrap();
+  }
+  assert_eq!(
+    s.push(vec_window(&fixture[2], 2)).unwrap_err(),
+    WinditError::NonFinite
+  );
+}
+
+#[test]
+fn vector_ema_matches_the_aggregate_on_determinate_prefixes_at_both_storage_widths() {
+  // The other half of the relationship, and the one that has to hold
+  // everywhere: away from the gate's band the two siblings agree. Twelve
+  // windows, five smoothing factors, both storage widths — the `f64` verbatim
+  // double that reads the emitted value exactly, and the `f32` double that
+  // drives the widening projection and a narrowing reconstruction.
+  const DIM: usize = 5;
+  let mut rng = 0x1234_5678_9abc_def0u64;
+  let fixture: Vec<Vec<f64>> = (0..12)
+    .map(|_| {
+      (0..DIM)
+        .map(|_| f64::from(next_unit(&mut rng)) - 0.5)
+        .collect()
+    })
+    .collect();
+
+  for alpha in [1.0f32, 0.75, 0.5, 0.3, 0.1] {
+    let mut s = SmoothPolicy::<RawF64Emb>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s.push(vec_window(&fixture[i], i)).expect("determinate");
+      let want = aggregate_prefix(alpha, &fixture, i).expect("determinate");
+      for (g, w) in emitted(&got).iter().zip(&want) {
+        assert!(
+          (g - w).abs() < 1e-12,
+          "alpha {alpha}, prefix {i}: {:?} vs {want:?}",
+          emitted(&got)
+        );
+      }
+    }
+
+    let mut s = SmoothPolicy::<TestVec>::smoother(&VectorEma::new(alpha));
+    for i in 0..fixture.len() {
+      let got = s
+        .push(Windowed::new(
+          TestVec::from_unnormalized(&fixture[i]).unwrap(),
+          Span::new(i, 1, 1),
+        ))
+        .expect("determinate");
+      let prefix: Vec<Windowed<TestVec>> = fixture[..=i]
+        .iter()
+        .enumerate()
+        .map(|(j, v)| Windowed::new(TestVec::from_unnormalized(v).unwrap(), Span::new(j, 1, 1)))
+        .collect();
+      let want =
+        crate::aggregate::aggregate(&crate::aggregate::EmaRenormalized::new(alpha), &prefix)
+          .expect("determinate");
+      for (g, w) in got.value.as_slice().iter().zip(want.as_slice()) {
+        assert!(
+          (g - w).abs() < 1e-6,
+          "f32 storage, alpha {alpha}, prefix {i}: {:?} vs {:?}",
+          got.value.as_slice(),
+          want.as_slice()
+        );
+      }
+    }
+  }
+}
