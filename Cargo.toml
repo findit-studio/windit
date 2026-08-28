@@ -1,6 +1,6 @@
 [package]
 name = "windit"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 repository = "https://github.com/findit-studio/windit"
 homepage = "https://github.com/findit-studio/windit"

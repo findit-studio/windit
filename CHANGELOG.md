@@ -6,16 +6,95 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
-## 0.2.1
+## 0.3.0
 
-Additive: one new smoother, the streaming sibling of an aggregation policy that
-already existed. Nothing is removed and no signature changes: every `0.2.0` item
-keeps its shape, and `cargo semver-checks` agrees (196 checks, 196 passed). That
-is an API-**shape** verdict and is not evidence about source compatibility —
-it does not model downstream name resolution at all.
+One new smoother — the streaming sibling of an aggregation policy that already
+existed — and **one breaking change the two of them share**: an EMA smoothing
+factor is now the compute scalar itself rather than an `f32` widened into it.
+The new smoother was written with the defect, the aggregation policy has carried
+it since `0.2.0`, and both are fixed here rather than one now and one at a
+later major.
 
-Stated precisely, because the earlier blanket claim that "`0.2.0` code compiles
-unchanged" was false:
+`cargo semver-checks` does **not** report this break, and that is worth stating
+plainly rather than leaning on: forced to evaluate the change as a *patch* it
+returns `223 checks: 223 pass` and `no semver update required`. It models items
+appearing and disappearing, and nothing here disappears — a type parameter with a
+default keeps `EmaRenormalized` nameable — while a changed *parameter* type and a
+changed public *field* type have no lint at all. Its verdict is evidence about
+its own coverage, not about this release.
+
+The break was verified the only way it can be, by compiling a `0.2.0`-shaped
+consumer against this crate:
+
+- `EmaRenormalized::new(cfg_alpha)` with `cfg_alpha: f32` fails with
+  `the trait bound f32: Real is not satisfied`.
+- The same three-window fold at a bare `0.3` literal returns
+  `[0.9664376815532346, 0.2569011632398902]` at `0.2.0` and
+  `[0.9664376833865183, 0.2569011563432517]` here, while
+  `EmaRenormalized::new(f64::from(0.3f32))` reproduces the `0.2.0` vector bit
+  for bit.
+
+### Breaking
+
+- **`aggregate::EmaRenormalized` and `smooth::VectorEma` carry a `C: Real`
+  coefficient, defaulted to `f64`, instead of an `f32` one.**
+
+  ```text
+  0.2.0:  pub struct EmaRenormalized       { alpha: f32 }
+          pub const fn new(alpha: f32) -> Self
+          pub const fn alpha(&self) -> f32
+
+  0.3.0:  pub struct EmaRenormalized<C: Real = f64> { alpha: C }
+          pub const fn new(alpha: C) -> Self
+          pub const fn alpha(&self) -> C
+  ```
+
+  `VectorEma` is new in this release and takes the same shape. `smooth::Ema`,
+  `smooth::CadenceEma`, and the `segment` thresholds are **unchanged**, because
+  their value type really is `f32` and a coefficient should match what it
+  multiplies. What was wrong was a coefficient *narrower* than the arithmetic it
+  drives: `Real` has one implementor, `f64`, and every storage scalar computes in
+  it, so the EMA's weights, products and compensated sum were all `f64` around
+  one `f32` constant. No `f32` expresses `1 - 2^-30` — its nearest is exactly
+  `1.0`, which is a pass-through and not a slow filter — and the `f32` grid is
+  `2^-24` apart relatively where the fold rounds at `2^-53`.
+
+  **What a `0.2.x` caller edits.** Usually nothing, and that is the hazard:
+
+  - `EmaRenormalized::new(0.3)` still compiles — and now means a **different
+    number**. `0.3f32` widened to `0.30000001192092896`; `0.3f64` is
+    `0.29999999999999999`. The weights change in the eighth significant digit,
+    so for anyone who has pinned outputs bit-for-bit or tuned against a
+    threshold this is a **re-measure, not a recompile**. To keep the old
+    behaviour exactly, write `EmaRenormalized::new(f64::from(0.3f32))`; to take
+    the value you meant, change nothing.
+  - An `f32` *variable* — `EmaRenormalized::new(cfg.alpha)` where
+    `cfg.alpha: f32` — stops compiling, with `f32: Real` unsatisfied. That one
+    the compiler catches: write `f64::from(cfg.alpha)`.
+  - `AggregatePolicyKind::Ema { alpha }` keeps a concrete field, now `f64`. The
+    serde wire form is unchanged (a JSON number carries no width), so
+    configuration files are unaffected — but a configured `0.3` that used to
+    round through `f32` now reaches the fold at full `f64` precision, which is
+    the same re-measure as above.
+  - A custom `impl AggregatePolicy for MyPolicy` is untouched: the trait, its
+    method signature, and the `f32` coverage slice are all unchanged.
+
+- **`scalar::Real` gains `from_f64` and a `'static` bound.** The trait is sealed,
+  so no downstream impl can break and both are additive for callers. `from_f64`
+  widens an `f64` configuration value into the compute domain (the identity for
+  `f64`), and is how `AggregatePolicyKind::into_policy` reaches a generic `C`
+  from a wire type read before any compute scalar exists. `'static` is a fact
+  about every implementor — an owned, borrow-free arithmetic type — spelled so
+  that `Box<dyn AggregatePolicy<C>>` needs no re-declaration at each use site.
+
+- **`Real::from_f32` keeps its job and loses a claim.** It still widens a
+  `Span::coverage` and the determinacy gate's own constant; it is no longer how a
+  smoothing factor arrives, and its documentation no longer says it is.
+
+### Source compatibility
+
+The glob-collision note this release inherits still applies, since it also adds
+public names:
 
 - **Guaranteed.** The prelude is unchanged, so `use windit::prelude::*;`
   resolves exactly as it did at `0.2.0`, including alongside a glob of the
@@ -103,7 +182,21 @@ unchanged" was false:
   floor dominates that term for every epoch with `t * sqrt(dim) <= 2^74`, so no
   verdict ever turned on it. `alpha` clamps into `[0, 1]` at construction, NaN to `0.0`,
   exactly as `smooth::Ema` does — the smoother idiom, not the aggregate's
-  deferred `AlphaOutOfRange`.
+  deferred `AlphaOutOfRange`. The clamp is three comparisons rather than
+  `f64::clamp` (which propagates NaN, where `Real` offers ordering but no
+  `is_nan`), and that costs `VectorEma::new` its `const`: a trait method cannot
+  run in a `const fn`. `EmaRenormalized::new` stores without comparing and stays
+  `const`.
+
+  The coefficient is `C: Real` defaulted to `f64`, and the `SmoothPolicy` impl is
+  for `VectorEma<ComputeOf<E>>` — so the coefficient sits in the same domain as
+  the accumulator it multiplies by construction rather than by convention, while
+  `VectorEma::new(0.3)` still needs no turbofish. `MAX_EPOCH_STEPS` is stated on
+  `VectorEma<f64>` rather than on the generic impl: the horizon is derived from
+  the compute domain's own `EPSILON`, so a second `Real` would carry a different
+  number, and a `const` on the generic impl could not be reached through the bare
+  path `VectorEma::MAX_EPOCH_STEPS` (a type parameter's default does not apply to
+  an associated-item path).
 
   **The epoch is bounded, because `M` is floating point too.**
   `VectorEma::MAX_EPOCH_STEPS` (`2^50` charging steps) is enforced: the step that
@@ -157,8 +250,8 @@ unchanged" was false:
   costs a dependent one line, `use windit::smooth::VectorEma;`. Both breaks were
   reproduced directly rather than argued from the language reference;
   `cargo-semver-checks` passes either way, because it does not model downstream
-  glob resolution. The prelude is where the name can go at the next minor, when
-  a source break is expected and can be announced. Unlike the three scalar smoothers it
+  glob resolution. Whether the name joins the prelude is a decision separate from
+  this release's coefficient change, and is not taken here. Unlike the three scalar smoothers it
   gates on `alloc` rather than living in the featureless core tier: its state is
   one accumulator component per embedding dimension, which is a heap buffer and
   not the O(1) that tier admits. The buffers are grown on the first push of an

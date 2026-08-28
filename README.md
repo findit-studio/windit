@@ -36,7 +36,7 @@ crate's contract, enforced by an acceptance suite.
 
 ```toml
 [dependencies]
-windit = "0.2"
+windit = "0.3"
 ```
 
 ## The unifying idea: one geometry drives both ends

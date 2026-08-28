@@ -26,8 +26,9 @@
 //! either way. Adding the name to `smooth` carries the same hazard for anyone
 //! who globs *that* module, so this is a reduction in exposure rather than a
 //! guarantee: this prelude is the glob the crate documents and asks every
-//! dependent to write, and `smooth::*` is a glob it suggests nowhere. The next
-//! minor, where a source break can be announced, is where the name can join.
+//! dependent to write, and `smooth::*` is a glob it suggests nowhere. Whether
+//! the name joins is a decision of its own, not a consequence of any release
+//! that happens to announce a break elsewhere.
 
 pub use crate::{
   // Featureless and always available: the value, geometry, and scalar types, the
