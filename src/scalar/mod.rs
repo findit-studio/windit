@@ -163,9 +163,10 @@ pub trait Real:
   /// this bound itself puts at `2^-400`) — every nonzero intermediate stays a
   /// normal value, with no overflow and no flush to a subnormal.
   /// `EmaRenormalized` and `CoverageWeightedMean` are the two that reach below
-  /// it, and in neither is the cause a small weight *scale*: EMA's weights sum to
-  /// exactly `1` and a normalized coverage's largest is exactly `1`. It is the
-  /// *ratio* — EMA's recency factors decaying without limit, a coverage far below
+  /// it, and in neither is the cause a small weight *scale*: EMA's ideal weights
+  /// sum to exactly `1`, and a normalized coverage's largest is exactly a power
+  /// of two whatever scale the slice arrived in. It is the *ratio* — EMA's
+  /// recency factors decaying without limit, a coverage far below
   /// the fullest window's — that drives a product toward a subnormal. The
   /// determinacy gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor
   /// keeps that regime sound (see the `aggregate` module's Input domain note). A

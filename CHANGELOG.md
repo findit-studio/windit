@@ -24,7 +24,10 @@ silently different number. The coverage change alters the signature of an
 *object-safe trait method*, so **every downstream `AggregatePolicy` stops
 compiling**, and it moves `CoverageWeightedMean`'s output for every caller.
 
-**Three numeric re-measures, not two.** Reviewing the coverage change turned up
+**Three numeric re-measures, not two** — and a fourth change to
+`CoverageWeightedMean` that is deliberately not one, because it moves only the
+answers that were wrong (20736 of 20736 plan-reachable coverage slices fold
+bit-identically across it). Reviewing the coverage change turned up
 two more defects it had inherited rather than introduced, both fixed here and
 both listed below with measured numbers. `Span::coverage` was rounding each
 `usize` into an `f64` *before* dividing — a defect of the operands, not of the
@@ -265,12 +268,23 @@ consumer against this crate:
   renormalization that ends the policy divides `s` back out. So multiplying every
   coverage by a positive factor must leave the result unchanged — and it did not,
   because the determinacy gate's absolute floor read a quantity the caller's scale
-  controls. The fold's weights are now `c_i / max_j c_j`, so the largest is
-  exactly `1.0` however the slice was scaled, and the property holds by
-  construction rather than by argument: scaling by an exact `s` leaves every
-  quotient's exact value untouched, and IEEE division is correctly rounded, so the
-  whole fold is bit-identical. A test pins it across `1.0`, `2^-1001`, and a
-  factor reaching the minimum `f64` subnormal.
+  controls. The fold's weights are now `c_i / max_j c_j`, so the largest is a
+  fixed power of two however the slice was scaled, and the property holds by
+  construction rather than by argument: scaling by an `s` for which **every
+  product `s * c_i` is exactly representable** leaves every quotient's exact value
+  untouched, and IEEE division is correctly rounded, so the whole fold is
+  bit-identical. A test pins it across `1.0`, `2^-1001`, a factor reaching the
+  minimum `f64` subnormal, and the non-power-of-two `0.75`.
+
+  **The bit-identical contract is about the products, not about the factor**, and
+  the distinction is not academic: `[1.0, 0.1]` scaled by `0.1` is
+  `[0.1, 0.010000000000000002]`, where `0.1 * 0.1` is not exactly representable.
+  The two slices are no longer proportional, the secondary weight moves by an
+  ulp, and so does the answer (`[.., 0.09950371902099893]` ->
+  `[.., 0.09950371902099894]`). Ordinary floating scaling is *approximately*
+  invariant — the fold moves only by the rounding the caller's own multiplication
+  introduced — and the test now carries a row for each side of that line, having
+  covered only powers of two with exact products before.
 
   **What moves.** Only slices with no full window — every plan that has one
   divides by exactly `1.0`, which is the identity:
@@ -307,6 +321,100 @@ consumer against this crate:
   module's Input domain note, `Real::MIN_AGG_MAGNITUDE`, and
   `Real::MIN_GATE_THRESHOLD` all say so now; each had been rewritten to claim the
   opposite.
+
+- **`aggregate::CoverageWeightedMean` lifts its coverage slice by a shared power
+  of two before dividing, so no weight is ever formed in the subnormal range.**
+  *(Not a fourth re-measure: it moves only the answers that were wrong.)*
+
+  Normalizing by the largest coverage made the fold's weights `c_i / max_j c_j`,
+  and materializing each of those independently is sound only while the quotient
+  is a normal `f64`. Below `2^-1022` an `f64` rounds *absolutely*, to the
+  subnormal grid, and a weight's error stops being relative — which is the one
+  thing the fold's whole error argument rests on. With coverages
+  `[0.75, eta, 2 * eta]` (`eta = f64::from_bits(1)`, every entry an ordinary
+  in-domain fraction) the intended weights `(4/3)eta` and `(8/3)eta` round to
+  `eta` and `3 * eta`: a quarter and an eighth wrong, relatively. Neumaier cannot
+  recover what was destroyed before the multiply, and the determinacy gate
+  measures the residue against the mass that produced it, not against the weights
+  that were meant.
+
+  ```text
+  coverages [0.75, eta, 2 * eta], components [[0], [-2^400], [2^399]]
+    exact weighted sum   0            (the fold has no direction)
+    before               Ok([1.0])    a direction fabricated from exact cancellation
+    after                Err(NonFinite)
+
+  same coverages, components [[0, 0], [2^100, 0], [0, 2^100]]
+    exact direction      that of [1, 2]
+    before               [0.31622776601683794, 0.9486832980505138]   ([1, 3]/sqrt(10))
+    after                [0.4472135954999579,  0.8944271909999159]   ([1, 2]/sqrt(5))
+  ```
+
+  The weights are now `ldexp(c_i, shift) / max_j c_j`. The lift is one shared
+  power of two, so it changes no ratio and no answer, and it is **exact** — a
+  value at or under `1` scaled up by a power of two keeps its significand,
+  subnormals included. `shift` is sized so the smallest nonzero quotient lands in
+  the normal range, where correct rounding costs at most the unit roundoff. The
+  largest weight is then exactly `2^shift` (`ldexp(m, s) / m` is `2^s` to the
+  bit), so the fold still reads ratios only and the scale invariance above is
+  unchanged.
+
+  **`shift` is zero unless the smallest nonzero weight would itself be
+  subnormal** — a coverage ratio past `2^1022`, which `aggregate` cannot reach
+  because a plan's coverages are at worst `1 / usize::MAX` apart. Measured over
+  the same 20736 four-window slices the change above was measured on:
+
+  ```text
+  plan-reachable coverage slices   20736 of 20736 bit-identical
+  engaged regime (64 ratios)       63 of 64 changed
+    largest error before           1.42e-1   14% of a unit vector
+    largest error after            1.00 * EPSILON
+  ```
+
+  So this is the fourth change to this fold in the release only in the sense that
+  it is the fourth commit to touch it. Nothing a caller could previously have
+  measured and been right about moves.
+
+  **A weight is still a rounded quotient, and the note says so.** The lift does
+  not make the weight exact; it makes the rounding *relative*, bounded by the unit
+  roundoff, which is the property the fold's error bound rests on and the one a
+  subnormal quotient destroys. The error bound in the module's *Input domain* note
+  is restated to carry that formation error rather than to omit it: the claim is
+  against the exact weighted sum of the weights the policy *intends*, so a
+  materialized weight must carry a bounded **relative** error — zero for
+  `MeanRenormalized`'s constant `1`, one correctly rounded division for
+  `CoverageWeightedMean`. The stated constant (`4 * EPSILON * ||M|| + K_abs`) is
+  unchanged; it had the room. The note also says plainly which policies that
+  argument does **not** cover: `EmaRenormalized` builds its weights by repeated
+  multiplication (their relative error reaches `2.6u` at `alpha = 0.3, n = 4` and
+  grows about `0.7 * n * u` from there) and `SaliencyWeighted` takes each as a
+  norm, so for those two the bound is stated against the weights the fold was
+  *given* rather than the ones it intended.
+
+  **The exact alternative was measured, not waved away.** Dividing by
+  `2^exponent(max_j c_j)` rather than by `max_j c_j` is a shift, so it rounds
+  nothing at all and every weight is the caller's own coverage with its exponent
+  moved. It also forfeits a largest weight of exactly `1` for one anywhere in
+  `[1, 2)`, which moves the answer for **every slice whose largest coverage is not
+  a power of two**:
+
+  ```text
+  ldexp-only weighting, over the 46 distinct len/window ratios up to 12
+    3177923 of 4477456 four-window slices changed (71.0%)
+    largest displacement 4.0e-16
+    aggregate(&CoverageWeightedMean, [Windowed([3, 4], Span::new(0, 2, 3))])
+      shipped here  [0.6, 0.8]
+      ldexp-only    [0.6, 0.7999999999999999]
+  ```
+
+  That last row is the ragged single window this release had just made exact, and
+  `[0.6, 0.7999999999999999]` is the value the previous entry names as the defect
+  it cured. Exactness and a largest weight of `1` are
+  not jointly achievable — the second requires dividing by `max`, and that
+  division is exact only when `max` is a power of two — so the choice is which to
+  keep. A relative `u` on the weight costs the fold nothing the bound does not
+  already carry, and a fourth wholesale re-measure costs every caller who has
+  pinned an output. The division stays.
 
 - **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
   supertrait.** The trait is sealed, so no downstream impl can break and all

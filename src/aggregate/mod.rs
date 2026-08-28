@@ -112,16 +112,26 @@
 //! and in both what is unbounded is the *ratio* between weights rather than their
 //! scale:
 //!
-//! - [`EmaRenormalized`]'s recency weights `w_i = alpha * (1 - alpha)^(n - 1 - i)`
-//!   sum to exactly `1`, so there is no scale to divide out, but they decay
-//!   without limit against the newest window: at a large window count the oldest
-//!   windows' products underflow toward a subnormal (or to zero) even for
-//!   in-domain inputs.
-//! - [`CoverageWeightedMean`] folds `c_i / max_j c_j`, so its largest weight is
-//!   exactly `1` however the caller scaled the slice — see that type's *Weights
-//!   up to scale* note — but the domain admits the rest anywhere in `[0, 1]`, so
-//!   a window weighing `2^-1000` against the fullest one drives its own product
-//!   subnormal.
+//! - [`EmaRenormalized`]'s recency weights are `w_0 = (1 - alpha)^(n - 1)` for
+//!   the oldest window and `w_i = alpha * (1 - alpha)^(n - 1 - i)` for the rest —
+//!   the split the recurrence `s_i = alpha * e_i + (1 - alpha) * s_{i-1}` from
+//!   `s_0 = e_0` actually produces, the first window carrying no `alpha` factor
+//!   because nothing preceded it to blend with. Those *ideal* weights sum to
+//!   exactly `1` in exact arithmetic (the `alpha` terms telescope to
+//!   `1 - (1 - alpha)^(n - 1)`), which is the sense in which EMA has a canonical
+//!   unit-order scale and so no free scale to divide out; the `f64` weights the
+//!   policy materializes from it do not generally sum to `1` (at `alpha = 0.3`
+//!   and `n = 4` they sum to `0.9999999999999998`), and nothing here needs them
+//!   to. What matters is that they decay without limit against the newest
+//!   window: at a large window count the oldest windows' products underflow
+//!   toward a subnormal (or to zero) even for in-domain inputs.
+//! - [`CoverageWeightedMean`] folds `c_i / max_j c_j`, lifted by one shared
+//!   power of two, so its largest weight is exactly `2^shift` however the caller
+//!   scaled the slice — `shift` being zero for every slice whose weights are
+//!   already normal, which is every slice a plan can produce. See that type's
+//!   *Weights up to scale* note. The domain admits the rest anywhere in `[0, 1]`,
+//!   so a window weighing `2^-1000` against the fullest one drives its own
+//!   product subnormal.
 //!
 //! Both are regimes the determinacy gate's absolute floor handles (see below),
 //! and the floor's soundness argument is about products rather than about which
@@ -143,13 +153,28 @@
 //! `16 * `[`Real::EPSILON`]` * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] is reported as
 //! [`WinditError::NonFinite`] — no direction is determined at working precision.
 //! This is the crate's one accuracy claim, and it is a theorem rather than an
-//! observation. Each product `w_i * e_i` is rounded relatively when it is a normal
-//! `f64` (by at most `u * |w_i * e_i|`, `u = EPSILON / 2`) and absolutely when it
-//! has underflowed toward a subnormal (by at most `2^-1075`, half the subnormal
-//! spacing). Per dimension the relative parts sum to at most `u * M_j`, the
-//! Neumaier fold adds at most `2u * M_j` (plus an `O(n * u^2) * M_j` tail, and it
-//! is exact for subnormal operands), together at most `4 * EPSILON * M_j`; the
-//! absolute parts sum to at most `n * 2^-1075`. Over all dimensions,
+//! observation, and it is stated against the exact weighted sum of the weights
+//! the policy *intends*, not of the ones it managed to represent — which is why
+//! the weight's own formation error is the first term of the derivation and not
+//! an omission from it. **A materialized weight must therefore carry a bounded
+//! *relative* error**, and the two policies whose weights the domain's own
+//! reasoning turns on carry one of at most `u`: exactly zero for
+//! [`MeanRenormalized`]'s constant `1`, and one correctly rounded division for
+//! [`CoverageWeightedMean`], whose lift is what keeps that division out of the
+//! subnormal range where its error would turn absolute and unbounded in relative
+//! terms. [`EmaRenormalized`] builds its weights by repeated multiplication and
+//! [`SaliencyWeighted`] takes each as a norm, so those two carry a formation
+//! error that grows with the window count and with the dimension rather than a
+//! flat `u` (EMA's reaches `2.6u` at `alpha = 0.3, n = 4` and about `0.7 * n * u`
+//! beyond); for them the bound below is stated against the weighted sum of the
+//! weights the fold was *given*. Each product `w_i * e_i` is then rounded relatively when it
+//! is a normal `f64` (by at most `u * |w_i * e_i|`, `u = EPSILON / 2`) and
+//! absolutely when it has underflowed toward a subnormal (by at most `2^-1075`,
+//! half the subnormal spacing). Per dimension the weight and product relative
+//! parts sum to at most `2u * M_j`, the Neumaier fold adds at most `2u * M_j`
+//! (plus an `O(n * u^2) * M_j` tail, and it is exact for subnormal operands),
+//! together at most `4 * EPSILON * M_j`; the absolute parts sum to at most
+//! `n * 2^-1075`. Over all dimensions,
 //! `||R - exact|| <= 4 * EPSILON * ||M|| + K_abs` with
 //! `K_abs <= sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40` and
 //! `dim <= 2^32`. The threshold
@@ -377,17 +402,60 @@ pub fn keep_separate<E>(windows: Vec<WindowEmbedding<E>>) -> Vec<WindowEmbedding
 ///
 /// It is a property of the policy, so this policy establishes it rather than
 /// hoping for it: the fold's weights are `c_i / max_j c_j`, and the largest of
-/// them is exactly `1.0`. Scaling every coverage by an `s` that is itself exact
-/// leaves each quotient's exact value untouched, and IEEE division is correctly
-/// rounded, so the weights — and with them the whole fold, bit for bit — are the
-/// same. An all-zero slice is not a scale of anything: every weight is zero, the
-/// exact sum is the zero vector, and the [determinacy gate](self#input-domain)
-/// reports [`WinditError::NonFinite`], no direction to report.
+/// them is exactly a power of two. An all-zero slice is not a scale of anything:
+/// every weight is zero, the exact sum is the zero vector, and the
+/// [determinacy gate](self#input-domain) reports [`WinditError::NonFinite`], no
+/// direction to report.
 ///
-/// Two consequences worth naming. A slice that already contains a full window
-/// (`1.0`, as every plan with one does) divides by exactly `1.0` and folds
-/// bit-identically to an un-normalized fold. And the [input domain](self#input-domain)'s
-/// `[0, 1]` is now the whole of the contract: a coverage anywhere in it, however
+/// # A ratio is not materialized where it cannot be represented
+///
+/// A weight is a *ratio*, and the ratio of two in-domain coverages can be
+/// arbitrarily small — `f64::from_bits(1)` against `0.75` is `(4/3) * 2^-1074`.
+/// Below `2^-1022` an `f64` quotient rounds *absolutely*, to the subnormal grid,
+/// so that ratio and its double land on `2^-1074` and `3 * 2^-1074`: a relative
+/// error of a quarter and an eighth, in a fold whose whole error argument is
+/// relative. Nothing downstream recovers it — a compensated sum is exact for
+/// subnormal operands but sums the terms it is handed — and an exactly
+/// cancelling in-domain fold then reports a direction it does not have.
+///
+/// So the slice is first lifted by one shared, exact `2^shift` and the weights
+/// are `ldexp(c_i, shift) / max_j c_j`. The lift is a common positive factor, so
+/// it changes no ratio; it is exact, because a value at or under `1` scaled up by
+/// a power of two keeps its significand, subnormals included; and it is sized so
+/// the smallest nonzero quotient lands in the normal range. `shift` is **zero
+/// unless the smallest nonzero weight would itself be subnormal**, so this is the
+/// identity on every slice a plan can produce and on every slice whose weights
+/// were already sound.
+///
+/// **Each weight is still a rounded quotient**, and this note says so rather than
+/// claiming otherwise: what the lift establishes is not that no weight is rounded
+/// but that every weight is rounded *relatively*, by at most the unit roundoff,
+/// which is the property the fold's [error bound](self#input-domain) is stated
+/// against and the one a subnormal quotient breaks. Making the weight exact
+/// outright is possible — divide by `2^exponent(max_j c_j)` instead of by
+/// `max_j c_j`, which is a shift and rounds nothing — but it forfeits a largest
+/// weight of exactly `1` for one anywhere in `[1, 2)`, and so moves the answer for
+/// every slice whose largest coverage is not a power of two: 71% of the
+/// plan-reachable four-window slices, including the ragged single window whose
+/// answer this release had just made exact. A relative `u` on the weight costs
+/// the fold nothing the bound does not already carry; that trade is why the
+/// division stays.
+///
+/// # Scaling, bit for bit and otherwise
+///
+/// Scaling every coverage by an `s` for which **every product `s * c_i` is
+/// exactly representable**, stays in range, and leaves no positive entry rounded
+/// to zero, leaves each quotient's exact value untouched — and IEEE division is
+/// correctly rounded, so the weights and with them the whole fold are
+/// bit-identical. That is the contract, and it is about the *products*, not
+/// about the factor: `[1.0, 0.1]` scaled by `0.1` is `[0.1,
+/// 0.010000000000000002]`, whose second product is not exactly representable, so
+/// the two slices are no longer proportional and the fold moves by an ulp.
+/// Ordinary floating scaling is *approximately* invariant — the answer moves only
+/// by the rounding the caller's own multiplication introduced.
+///
+/// One consequence worth naming: the [input domain](self#input-domain)'s
+/// `[0, 1]` is the whole of the contract. A coverage anywhere in it, however
 /// small, weighs against the others rather than against `f64`'s exponent range.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CoverageWeightedMean;
@@ -500,12 +568,19 @@ impl<C: Real> AggregatePolicy<C> for CoverageWeightedMean {
     // a coverage outside it reaches `check_inputs` below and is rejected before
     // any weight is read.
     let largest = max_magnitude(coverages);
+    // The whole slice is first lifted by one common, exact power of two, so that
+    // no quotient is ever *formed* in the subnormal range where its rounding
+    // would stop being relative (see [`normalizing_shift`]). The lift is a shared
+    // factor and so changes no ratio; it is zero for every slice whose weights
+    // are already normal, which is every slice a plan can produce.
+    let shift = normalizing_shift(coverages, largest);
     weighted_sum_renorm(embeddings, coverages, dim, move |i, _| {
       if largest > 0.0 {
-        // `coverages[i] <= largest` and both are positive, so the quotient is in
-        // `(0, 1]` — it cannot overflow, and it cannot underflow either, being at
-        // least `coverages[i]` itself.
-        C::from_f64(coverages[i] / largest)
+        // `coverages[i] <= largest`, so the quotient is at most `2^shift` and
+        // cannot overflow; `shift` is chosen so it cannot be subnormal either.
+        // `ldexp` by a non-negative exponent onto a value of at most `1` is exact,
+        // so the only rounding is the division's own, and that is relative.
+        C::from_f64(coverages[i].ldexp(shift) / largest)
       } else {
         // Every coverage is zero. The exact weighted sum is the zero vector, and
         // the determinacy gate is what reports it; the division is skipped rather
@@ -800,6 +875,104 @@ fn max_magnitude<C: Real>(v: &[C]) -> C {
     }
   }
   max
+}
+
+/// The smallest nonzero absolute component of `v`, or `ZERO` when every
+/// component is zero (or `v` is empty).
+///
+/// The lower companion to [`max_magnitude`], and NaN loses here for the same
+/// reason: `m > ZERO` is false for it, so it never becomes the minimum and
+/// reaches the caller's own arithmetic instead.
+fn min_positive_magnitude<C: Real>(v: &[C]) -> C {
+  let mut min = C::ZERO;
+  for &x in v {
+    let m = x.abs();
+    if m > C::ZERO && (min == C::ZERO || m < min) {
+      min = m;
+    }
+  }
+  min
+}
+
+/// The binary exponent of the smallest positive normal `f64`, `2^-1022`.
+///
+/// Named rather than written into [`normalizing_shift`] as a literal, and pinned
+/// by a test against `f64::MIN_POSITIVE`: it is the boundary below which a
+/// division's error stops being relative, which is the only reason that function
+/// exists.
+const MIN_NORMAL_EXPONENT: i32 = -1022;
+
+/// The common power of two [`CoverageWeightedMean`] lifts its coverage slice by
+/// before dividing, so that no weight is ever *formed* in the subnormal range.
+///
+/// A weight is a ratio, and the ratio of two in-domain coverages can be
+/// arbitrarily small — `f64::from_bits(1)` against `0.75` is `(4/3) * 2^-1074`.
+/// Materializing such a ratio rounds it *absolutely*, to the subnormal grid: the
+/// intended `(4/3) * 2^-1074` and `(8/3) * 2^-1074` become `2^-1074` and
+/// `3 * 2^-1074`, a relative error of a quarter and an eighth. Nothing
+/// downstream can recover that — a compensated sum is exact for subnormal
+/// operands but sums the terms it is given, and the determinacy gate measures a
+/// residue against the mass that produced it, not against the weights that were
+/// meant. An exactly cancelling in-domain fold then leaves a residue far above
+/// the gate and is reported as a direction.
+///
+/// Lifting the whole slice by one shared `2^shift` first is what stops that. The
+/// lift is a common positive factor, so it changes no ratio and no answer; it is
+/// exact, because `coverages[i] <= 1` and `shift <= 53` put every lifted value at
+/// or under `2^53` with its significand untouched (a subnormal scaled up by a
+/// power of two is exact); and it is chosen so the smallest nonzero quotient
+/// lands at or above `2^-1022`, where correct rounding is relative to at most the
+/// unit roundoff. The largest weight is then exactly `2^shift` — `ldexp(m, s) / m`
+/// is `2^s` to the bit — so the fold still reads only the ratios, whatever scale
+/// the caller's slice arrived in.
+///
+/// The lift does not make the weight *exact*; the division after it still rounds.
+/// It makes that rounding **relative**, which is the property the fold's error
+/// bound rests on and the one a subnormal quotient destroys. See
+/// [`CoverageWeightedMean`]'s own note for why the exact alternative — dividing by
+/// `2^exponent(max)` and dropping the division entirely — was not taken.
+///
+/// **`shift` is zero unless the smallest nonzero weight would itself be
+/// subnormal**, so this is the identity on every slice a [`WindowPlan`] can
+/// produce (whose coverages are at worst `1 / usize::MAX` apart) and on every
+/// slice whose weights were already sound. Reaching a nonzero `shift` takes a
+/// weight *ratio* past `2^1022`, hand-built by a direct
+/// [`aggregate_values`](AggregatePolicy::aggregate_values) caller.
+///
+/// Zero when `coverages` has no scale to speak of — all zero, or a largest that
+/// is not finite. Both are rejected by [`check_inputs`] before any weight is read,
+/// so the guard below is about keeping this function total on its own rather than
+/// about a reachable verdict.
+///
+/// There is deliberately **no** second guard on the smallest: past that first
+/// one some component has a magnitude above zero, and [`min_positive_magnitude`]
+/// only ever assigns such a magnitude, so it cannot return zero here. A guard
+/// there would read as load-bearing while being unreachable.
+///
+/// [`WindowPlan`]: crate::plan::WindowPlan
+fn normalizing_shift(coverages: &[f64], largest: f64) -> i32 {
+  if !(largest > 0.0 && largest.is_finite()) {
+    return 0;
+  }
+  let smallest = min_positive_magnitude(coverages);
+  // The smallest weight the fold would form, at the resolution it would form it
+  // in. Taking the *quotient's* exponent rather than the difference of the two
+  // operands' is what makes the lift itself scale-invariant: scaling every
+  // coverage by a factor that leaves the slice exactly proportional leaves this
+  // ratio's exact value — and so its correctly rounded value, and so `shift` —
+  // untouched. An out-of-domain `largest` can drive this quotient to zero, whose
+  // exponent is not below the boundary, so no lift is attempted before
+  // `check_inputs` rejects the slice.
+  let smallest_weight = (smallest / largest).exponent();
+  if smallest_weight < MIN_NORMAL_EXPONENT {
+    // One bit of headroom above the boundary: the quotient whose exponent this
+    // is was itself rounded, so its exact value can sit just under `2^exponent`.
+    // `smallest_weight >= -1074`, so `shift <= 53` and no lifted coverage or
+    // product can leave the range.
+    MIN_NORMAL_EXPONENT + 1 - smallest_weight
+  } else {
+    0
+  }
 }
 
 /// The exponent of the power of two a reduction over `v` divides by: that of
