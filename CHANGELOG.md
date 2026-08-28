@@ -6,6 +6,66 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.2.1
+
+Additive: one new smoother, the streaming sibling of an aggregation policy that
+already existed. Nothing is removed, no signature changes, and `0.2.0` code
+compiles unchanged.
+
+### Added
+
+- **`smooth::VectorEma`** (and its state, `smooth::VectorEmaState`): a
+  component-wise exponential moving average over an *embedding*, L2-renormalized
+  at every window — the streaming, span-preserving sibling of
+  `aggregate::EmaRenormalized`. Where the aggregate folds a finished slice to one
+  point, this rewrites one window in / one window out with the input span intact,
+  so a per-window embedding stream can be denoised without being collapsed. That
+  was the one shape the crate could not express: `smooth` had only the `f32`
+  scalar low-passes, and a downstream `impl Smoother<TheirEmbedding>` is an
+  orphan impl.
+
+  It is generic over `windowed::Vector` — the carrier trait the aggregation half
+  already reads embeddings through — so a consumer's own embedding type flows
+  through `Windowed<E>` with no conversion at any window, and the crate gains no
+  new public trait. The accumulator is carried in the embedding's compute domain
+  (`ComputeOf<E>`, `f64` for every shipped scalar) and read through
+  `Vector::compute_components`, so quantized storage with no dequantization
+  override fails closed with `MissingDequantization` exactly as aggregation does.
+
+  The renormalization is applied to an emitted *copy*; the accumulator stays raw.
+  That is what makes window `i` emit the direction `EmaRenormalized` folds over
+  the prefix `[0..=i]` — a differential test pins that equivalence at four
+  smoothing factors over every prefix. Renormalizing the accumulator in place
+  would be a different filter with different weights.
+
+  Both the determinacy gate (`16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`) and the
+  scale-aware renormalization are the aggregation half's own routines, reached
+  rather than re-derived, so the two siblings cannot drift apart. `alpha` clamps
+  into `[0, 1]` at construction, NaN to `0.0`, exactly as `smooth::Ema` does —
+  the smoother idiom, not the aggregate's deferred `AlphaOutOfRange`.
+
+  Errors, all raised before the accumulator is written so a refused push is a
+  no-op: `DimMismatch` for a width that changed mid-epoch, `NonFinite` for a
+  non-finite component (the scalar `Ema` absorbs one and poisons; this one
+  refuses it), `Empty` for a zero-width embedding, `MissingDequantization` for
+  raw quantization codes, and `AllocFailed` for a refused buffer. The one
+  deliberate exception is a window whose *output* fails the determinacy gate: it
+  has still advanced the accumulator, because it was a real observation and the
+  prefix the aggregate would fold includes it.
+
+  Re-exported from the prelude under `alloc`. Unlike the three scalar smoothers
+  it gates on `alloc` rather than living in the featureless core tier: its state
+  is one accumulator component per embedding dimension, which is a heap buffer
+  and not the O(1) that tier admits. The buffers are grown on the first push of
+  an epoch and reused by every push after it; `reset` keeps their capacity, so a
+  discontinuity costs no allocation.
+
+### Documented
+
+- `Smoother::push`'s error note no longer implies that reading no spans makes a
+  stage infallible, and `SmoothPolicy::smooth`'s "none for the shipped built-ins"
+  is corrected. Both statements predate a fallible smoother existing.
+
 ## 0.2.0 - 2026-07-25
 
 The temporal half of the crate — smoothing, gating, segmentation — is rebuilt
