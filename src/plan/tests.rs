@@ -135,6 +135,194 @@ fn coverage_past_f32_integer_range_is_the_exact_ratio() {
   );
 }
 
+/// The same class one domain wider, and this is the one that survived widening:
+/// `f64` holds every integer only to `2^53`, so a window of `2^53 + 1` casts to
+/// the very same `f64` as the `2^53`-element tail inside it and the quotient is
+/// exactly `1.0` again.
+///
+/// The defect was never "`f32` rounds too early". It is that **both operands are
+/// rounded independently before the division**, and no wider domain removes
+/// that — it only moves the first geometry that shows it. Reached through the
+/// public planner in a single allocation (`input_len` is a count, not a slice
+/// length, and this plan is one span), so nothing about it needs a hand-built
+/// `Span`. 64-bit only: where `usize` is 32 bits every count is exact in `f64`
+/// and the regime does not exist.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn coverage_past_f64_integer_range_is_below_one_for_a_ragged_tail() {
+  let len = 1_usize << 53;
+  let window = len + 1;
+  assert_eq!(
+    len as f64, window as f64,
+    "the premise: both operands cast to one f64"
+  );
+
+  let s = WindowPlan::spans(&WindowOptions::new(window), len).unwrap();
+  assert_eq!(s.len(), 1);
+  assert_eq!((s[0].len(), s[0].window()), (len, window));
+
+  let cov = s[0].coverage();
+  assert!(
+    cov < 1.0,
+    "a tail one element short of a 2^53 + 1 window must not report full coverage, got {cov:?}"
+  );
+  assert_eq!(
+    cov,
+    f64::from_bits(0x3fef_ffff_ffff_ffff),
+    "coverage must be the correctly rounded 2^53 / (2^53 + 1)"
+  );
+}
+
+/// The integer path against an oracle: `Fraction(len, window)` rounded to the
+/// nearest `f64` by an implementation with unbounded rationals (CPython), for ten
+/// geometries whose window is past `2^53` and whose ratios span `2^-64` to within
+/// two ulps of one.
+///
+/// The table is the whole point: nothing in this crate produced these bits, so
+/// agreeing with them is evidence rather than a restatement.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn coverage_past_f64_integer_range_is_correctly_rounded() {
+  const ORACLE: [(usize, usize, u64); 10] = [
+    (1, usize::MAX, 0x3bf0_0000_0000_0000),
+    (1, (1 << 63) + 1, 0x3c00_0000_0000_0000),
+    (3, (1 << 54) + 1, 0x3ca8_0000_0000_0000),
+    (7, 1 << 60, 0x3c5c_0000_0000_0000),
+    (usize::MAX / 3, usize::MAX, 0x3fd5_5555_5555_5555),
+    ((1 << 53) - 1, (1 << 54) + 1, 0x3fdf_ffff_ffff_ffff),
+    ((1 << 62) + 12_345, (1 << 63) - 7, 0x3fe0_0000_0000_000c),
+    (1 << 55, (1 << 55) + 1024, 0x3fef_ffff_ffff_ff00),
+    ((1 << 53) + 1, (1 << 53) + 3, 0x3fef_ffff_ffff_fffe),
+    (1 << 53, (1 << 53) + 1, 0x3fef_ffff_ffff_ffff),
+  ];
+  for (len, window, bits) in ORACLE {
+    let got = Span::new(0, len, window).coverage();
+    assert_eq!(
+      got.to_bits(),
+      bits,
+      "{len}/{window}: got {got:?} ({:#018x}), oracle {:?}",
+      got.to_bits(),
+      f64::from_bits(bits)
+    );
+  }
+}
+
+/// The integer path against the `f64` division it replaces, over a sweep.
+///
+/// A ratio is unchanged by scaling both counts by a power of two, so
+/// `ratio_to_f64(l << k, w << k)` must equal `ratio_to_f64(l, w)` — and for `w`
+/// small the second is the exact-operand `f64` division, which IEEE already
+/// requires to be correctly rounded. That makes this a cross-check of the two
+/// paths against each other over 2485 geometries rather than a table of pinned
+/// constants.
+///
+/// The shift decides which path the scaled pair takes, and `56` is the one that
+/// matters: `window << 56` is past `2^53` for every window here, so every
+/// geometry is checked on the integer path at least once (the test counts them
+/// and asserts the count). `10` keeps the pair on the fast path, checking that a
+/// ratio is scale-free there too, and `50` straddles the two.
+///
+/// The saturation regime is reached at no shift. Its test,
+/// `(w - l) * 2^54 <= w`, has both sides scaled by `2^k` and so is invariant
+/// under the shift — it reduces to the unshifted geometry, where a deficit of at
+/// least `1` against a window of at most `70` cannot satisfy it.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn the_integer_path_agrees_with_exact_operand_division() {
+  let (mut checked, mut on_the_integer_path) = (0_u32, 0_u32);
+  for window in 1_usize..=70 {
+    for len in 1..=window {
+      let direct = ratio_to_f64(len, window);
+      assert_eq!(
+        direct,
+        len as f64 / window as f64,
+        "{len}/{window} must take the exact-operand fast path"
+      );
+      for k in [10, 50, 56] {
+        let (l, w) = (len << k, window << k);
+        let scaled = ratio_to_f64(l, w);
+        assert_eq!(
+          scaled, direct,
+          "{len}/{window} scaled by 2^{k} changed the ratio: {scaled:?} vs {direct:?}"
+        );
+        if w > 1 << 53 {
+          on_the_integer_path += 1;
+        }
+      }
+      checked += 1;
+    }
+  }
+  assert_eq!(
+    checked, 2485,
+    "the sweep must cover every len <= window <= 70"
+  );
+  assert!(
+    on_the_integer_path >= checked,
+    "every geometry must reach the integer path at least once, got \
+     {on_the_integer_path} integer-path checks over {checked} geometries"
+  );
+}
+
+/// `coverage() == 1.0` if and only if `len == window`, including where the true
+/// ratio is inside half an ulp of one and would round there.
+///
+/// `2^54 - 1` real elements in a window of `2^54` is the exact midpoint
+/// `1 - 2^-54`, which ties to `1.0` — and `2^64 - 2` in `2^64 - 1` is far past
+/// it. Both saturate down to the largest `f64` below one instead, which is what
+/// keeps a ragged tail distinguishable from a full window at every geometry
+/// rather than only at the ones `f64` resolves. The under-report is at most one
+/// ulp and never in the direction of claiming coverage the span does not have.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn a_ragged_span_never_reports_full_coverage() {
+  for (len, window) in [
+    ((1_usize << 54) - 1, 1_usize << 54),
+    ((1 << 63) - 1, 1 << 63),
+    (1 << 63, (1 << 63) + 1),
+    (usize::MAX - 1, usize::MAX),
+  ] {
+    let cov = Span::new(0, len, window).coverage();
+    assert_eq!(
+      cov, NEAREST_BELOW_ONE,
+      "{len}/{window} must saturate below one, got {cov:?}"
+    );
+    assert!(cov < 1.0);
+  }
+
+  // And the equivalence in the other direction, at the same windows: only a full
+  // span reports `1.0`.
+  for window in [1_usize, 4, (1 << 54) - 1, 1 << 54, usize::MAX] {
+    assert_eq!(Span::new(0, window, window).coverage(), 1.0);
+  }
+}
+
+/// The tie-breaking rule, which only an exactly-halfway ratio can observe.
+///
+/// A tie needs the window to divide the scaled real length exactly *and* the
+/// quotient's dropped bits to be `100…0`; both happen, and the rule is round to
+/// nearest with ties to **even**, the same rule IEEE division follows on the fast
+/// path. `2^54 - 3` and `2^54 - 5` real elements in a window of `2^54` are the
+/// pair that pins it from both sides: their exact ratios are the two midpoints
+/// either side of `1 - 2^-52`, so one must round *down* to it and the other *up*,
+/// and any rule that always breaks a tie the same way gets one of them wrong.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn coverage_breaks_an_exact_tie_to_even() {
+  for (len, window, bits) in [
+    ((1_usize << 54) - 3, 1_usize << 54, 0x3fef_ffff_ffff_fffe),
+    ((1 << 54) - 5, 1 << 54, 0x3fef_ffff_ffff_fffe),
+    (14_001_415_880_023_897, 1 << 54, 0x3fe8_df1b_55f0_cfac),
+  ] {
+    let got = Span::new(0, len, window).coverage();
+    assert_eq!(
+      got.to_bits(),
+      bits,
+      "{len}/{window} is an exact tie and must round to even: got {got:?} ({:#018x})",
+      got.to_bits()
+    );
+  }
+}
+
 #[test]
 #[should_panic(expected = "0 < len <= window")]
 fn span_new_rejects_len_above_window_in_every_build() {
