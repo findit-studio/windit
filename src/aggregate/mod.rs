@@ -20,7 +20,7 @@
 //! itself:
 //! [`EmaRenormalized`] carries a `C`, defaulted to `f64` exactly as the trait
 //! is, and a coefficient can no longer be resolved more coarsely than the
-//! arithmetic it drives. Only the serde selector [`AggregatePolicyKind`] keeps
+//! arithmetic it drives. Only the serde selector `AggregatePolicyKind` keeps
 //! an `f64` there, being a wire type read before any compute scalar exists; it
 //! widens through [`Real::from_f64`].
 //!
@@ -365,7 +365,7 @@ pub struct MeanRenormalized;
 /// Carrying the domain as a type parameter rather than hardcoding `f64` is what
 /// keeps the policy honest if a second `Real` is ever sealed in: its
 /// coefficient would follow its own domain with no further signature change.
-/// The serde selector [`AggregatePolicyKind`] is the one place an `f64` remains,
+/// The serde selector `AggregatePolicyKind` is the one place an `f64` remains,
 /// being a wire type that is read before any compute scalar exists.
 ///
 /// The bound is on the type and not only on its impls, matching
