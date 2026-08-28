@@ -10,7 +10,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Additive: one new smoother, the streaming sibling of an aggregation policy that
 already existed. Nothing is removed, no signature changes, and `0.2.0` code
-compiles unchanged.
+compiles unchanged — including code that globs `windit::prelude` alongside its
+own module. That last clause is why the new type is **not** in the prelude: see
+below.
 
 ### Added
 
@@ -74,7 +76,16 @@ compiles unchanged.
   advanced the accumulator, because it was a real observation and the prefix the
   aggregate would fold includes it.
 
-  Re-exported from the prelude under `alloc`. Unlike the three scalar smoothers it
+  **Not re-exported from the prelude.** Adding a name to a glob prelude is the
+  one additive change that can still break a downstream build: a crate with its
+  own `VectorEma` brought in by `use other::*;` alongside `use
+  windit::prelude::*;` compiles against 0.2.0 and fails against a prelude
+  carrying the name, with `E0659` at the use site. `cargo-semver-checks` does not
+  model downstream glob resolution, so its green result says nothing about this;
+  the break was reproduced directly. A release whose whole value is that it can
+  be taken without thinking does not spend that on saving one `use` line —
+  `use windit::smooth::VectorEma;` — and the prelude is where the name can go at
+  the next minor, when a break is expected. Unlike the three scalar smoothers it
   gates on `alloc` rather than living in the featureless core tier: its state is
   one accumulator component per embedding dimension, which is a heap buffer and
   not the O(1) that tier admits. The buffers are grown on the first push of an

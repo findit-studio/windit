@@ -11,13 +11,21 @@
 //! `Vote` gate configs with the `Dwell` and `Hangover` gate combinators,
 //! `Segmenter`, `SegmentTail`, `Range`, `SegmentOptions`, and the `Decoder`
 //! pipeline with its `Step` output. The heap-tier items — the planner, the
-//! pre-processing helpers, the aggregation and split families, the batch
-//! segmentation drivers (`runs`, `longest_run`, `runs_sorted`), and the vector
-//! smoother `VectorEma` — are re-exported under the `alloc` feature, matching
-//! where they are defined. The content-aware
+//! pre-processing helpers, the aggregation and split families, and the batch
+//! segmentation drivers (`runs`, `longest_run`, `runs_sorted`) — are re-exported
+//! under the `alloc` feature, matching where they are defined. The content-aware
 //! chunker `ContentAware`, its `Chunk` payload, and the `MeasureText` measurer it
 //! reads length through join them under the `text` feature, and
 //! `AggregatePolicyKind` under `serde`.
+//!
+//! The vector smoother `smooth::VectorEma` is deliberately **not** here, and is
+//! imported by path. Adding a name to a glob prelude is the one additive change
+//! that can still break a downstream build: a crate that globs both this module
+//! and one of its own carrying the same name stops compiling with `E0659`,
+//! ambiguity being reported at the use site rather than at the import.
+//! `cargo-semver-checks` does not model that, so its verdict is not evidence
+//! either way. A release that claims every earlier program still compiles has to
+//! leave the glob alone; the next minor is where the name can join it.
 
 pub use crate::{
   // Featureless and always available: the value, geometry, and scalar types, the
@@ -44,7 +52,6 @@ pub use crate::{
   plan::WindowPlan,
   pre::{slice_pad_mask, try_slice_pad_mask},
   segment::{longest_run, runs, runs_sorted},
-  smooth::VectorEma,
   split::{FixedWindow, SplitPolicy},
 };
 

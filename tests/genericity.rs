@@ -11,7 +11,10 @@
 
 use std::{cell::Cell, rc::Rc};
 
-use windit::prelude::*;
+// By path, not through the prelude: the vector smoother is deliberately outside
+// the glob (see `windit::prelude`), so this is also the acceptance case for it
+// staying reachable — and for the one extra line a consumer pays.
+use windit::{prelude::*, smooth::VectorEma};
 
 /// A minimal embedding double that L2-normalizes on construction, standing in
 /// for a real 384/512/768-dimension model embedding. Integration tests see only
