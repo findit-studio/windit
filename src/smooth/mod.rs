@@ -1222,19 +1222,23 @@ impl<E: Vector> Clone for VectorEmaState<E> {
   }
 }
 
-/// Hand-written for the same reason as [`Clone`], and reporting the state's
-/// *shape* rather than its numbers: [`Real`] carries no [`Debug`] bound, so
-/// neither the accumulator nor the coefficient can be formatted from here at
-/// all. The coefficient joined them when it became `ComputeOf<E>`; bounding this
-/// impl on `ComputeOf<E>: Debug` would print it, at the cost of making the impl
-/// unprovable from a bare `E: Vector` — a worse trade for a shape report.
-/// [`VectorEma::alpha`] reads the configured value directly.
+/// Hand-written for the same reason as [`Clone`]: a derive would demand
+/// `E: Debug` for a parameter this state never stores a value of.
+///
+/// It prints the coefficient and reports the buffers by *shape*. The
+/// coefficient is available because [`Real`] carries a [`Debug`] supertrait —
+/// every implementor is a core float, so the bound costs nothing and the whole
+/// state used to be unprintable without it. The buffers stay a shape report by
+/// choice rather than by obligation: `state` is one component per embedding
+/// dimension, and a `Debug` line that dumps 768 floats is not one anybody reads.
+/// `seeded` is the fact the emptiness of `state` actually encodes.
 ///
 /// [`Debug`]: core::fmt::Debug
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("VectorEmaState")
+      .field("alpha", &self.alpha)
       .field("seeded", &!self.state.is_empty())
       .field("dim", &self.state.len())
       .field("steps", &self.steps)

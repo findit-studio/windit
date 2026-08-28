@@ -85,7 +85,7 @@ fn refused<P: AggregatePolicy<f64>>(policy: &P, dim: usize) -> Result<Vec<f64>, 
   let a: Vec<f64> = (0..dim).map(|i| 1.0 + (i % 7) as f64).collect();
   let b: Vec<f64> = (0..dim).map(|i| 2.0 + (i % 5) as f64).collect();
   let embeddings: [&[f64]; 2] = [&a, &b];
-  let coverages = [1.0_f32, 1.0];
+  let coverages = [1.0_f64, 1.0];
 
   // Unarmed, the ordinary answer — proof the geometry itself is fine.
   policy

@@ -3,12 +3,13 @@ use std::{vec, vec::Vec};
 #[cfg(feature = "serde")]
 use super::AggregatePolicyKind;
 use super::{
-  aggregate, keep_separate, AggregatePolicy, CoverageWeightedMean, EmaRenormalized,
-  MeanRenormalized, SaliencyWeighted,
+  aggregate, keep_separate, l2_renorm, max_magnitude, normalizing_shift, weighted_sum_renorm,
+  AggregatePolicy, CoverageWeightedMean, EmaRenormalized, MeanRenormalized, SaliencyWeighted,
+  MIN_NORMAL_EXPONENT,
 };
 use crate::{
   plan::Span,
-  scalar::TestQuant,
+  scalar::{Real, TestQuant},
   test_support::{
     assert_close, assert_close_f64, BareI8Emb, QuantEmb, RawF64Emb, TestQuantVec, TestVec,
   },
@@ -56,6 +57,611 @@ fn coverage_weighted_mean_f64_pinned() {
   let widened_f32 = f64::from(0.894_427_2_f32);
   let diff = (widened_f32 - 0.894_427_190_999_915_9_f64).abs();
   assert!(diff > 1e-12, "f32 precision must not satisfy the f64 pin");
+}
+
+/// Two window geometries whose true coverages differ by far less than an `f32`
+/// ulp must reach the fold as *different* weights.
+///
+/// Every operand is at most `2^24` and so exactly representable in `f32`, which
+/// is what makes this a statement about the quotient alone — nothing rounds on
+/// the way into the division, unlike the geometry
+/// `coverage_past_f32_integer_range_is_the_exact_ratio` pins. The two ratios
+/// `8388607/16777213` and `8388608/16777215` differ by exactly
+/// `1/(16777213 * 16777215)`, about `3.6e-15`: 32 `f64` ulps, and `6e-8` of the
+/// `f32` ulp at `0.5`. A coverage channel narrower than the fold rounds both to
+/// `0.50000006` and weighs two different windows identically.
+#[test]
+fn sub_ulp_coverages_reach_the_fold_as_distinct_weights() {
+  let cov_a = Span::new(0, 8_388_607, 16_777_213).coverage();
+  let cov_b = Span::new(0, 8_388_608, 16_777_215).coverage();
+
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let out_a = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[1.0, cov_a], 2)
+    .unwrap();
+  let out_b = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[1.0, cov_b], 2)
+    .unwrap();
+
+  assert_ne!(
+    out_a, out_b,
+    "spans (len 8388607, window 16777213) and (len 8388608, window 16777215) \
+     have true coverages 3.6e-15 apart, yet both folded at {cov_a:?} / {cov_b:?} \
+     and produced one vector"
+  );
+  assert_ne!(
+    cov_a, cov_b,
+    "two window geometries 3.6e-15 apart in true coverage must not share a coverage"
+  );
+
+  // And through `aggregate`, which collects the coverages itself: the seam above
+  // is the one a caller reaches directly, this is the one the crate walks, and a
+  // narrowing anywhere along it collapses the two geometries again.
+  let mk = |len, window| {
+    [
+      Windowed::new(
+        RawF64Emb {
+          data: vec![1.0, 0.0],
+          captured: Vec::new(),
+        },
+        Span::new(0, 4, 4),
+      ),
+      Windowed::new(
+        RawF64Emb {
+          data: vec![0.0, 1.0],
+          captured: Vec::new(),
+        },
+        Span::new(0, len, window),
+      ),
+    ]
+  };
+  let folded_a = aggregate(&CoverageWeightedMean, &mk(8_388_607, 16_777_213)).unwrap();
+  let folded_b = aggregate(&CoverageWeightedMean, &mk(8_388_608, 16_777_215)).unwrap();
+  assert_ne!(
+    folded_a.captured, folded_b.captured,
+    "`aggregate` must carry the distinction its spans hold"
+  );
+}
+
+/// Multiplying every coverage by a common positive factor must not change a
+/// normalized weighted mean.
+///
+/// The weights of a *normalized* weighted mean are defined only up to a common
+/// positive factor: `sum_i (s * c_i) * e_i` is `s * sum_i c_i * e_i`, and the
+/// renormalization that ends the fold divides `s` back out. So the scale of the
+/// coverage slice carries no information about the answer, and any part of the
+/// policy that reads it is reading noise.
+#[test]
+fn coverage_weights_are_scale_invariant() {
+  // One window, one component, and the fold's exact result is the normal value
+  // `[2^-1001]`, whose direction is `[1.0]` — the same direction the same fold
+  // has at coverage `1.0`. Nothing here is ill-conditioned: there is one term,
+  // no cancellation, and the result is finite, nonzero and safely normalizable.
+  let one: [&[f64]; 1] = [&[1.0]];
+  let at_one = CoverageWeightedMean.aggregate_values(&one, &[1.0], 1);
+  let at_tiny = CoverageWeightedMean.aggregate_values(&one, &[libm::ldexp(1.0, -1001)], 1);
+  assert_eq!(
+    at_tiny.as_ref().ok(),
+    at_one.as_ref().ok(),
+    "one window's direction cannot depend on the scale of the single weight it \
+     carries: at 1.0 {at_one:?}, at 2^-1001 {at_tiny:?}"
+  );
+
+  // And across a family of factors on a two-window fold whose weights differ:
+  // `1.0`, `2^-1001`, and a factor that carries the smaller coverage all the way
+  // to the minimum `f64` subnormal. Each factor is a power of two and no product
+  // underflows, so each scaled slice is *exactly* the base one times the factor —
+  // which is what makes a difference in the output a statement about the policy.
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let base = [1.0_f64, 0.5];
+  let reference = CoverageWeightedMean
+    .aggregate_values(&embeddings, &base, 2)
+    .expect("the unscaled fold resolves");
+  for exp in [0, -1001, -1073] {
+    let factor = libm::ldexp(1.0, exp);
+    let scaled = [base[0] * factor, base[1] * factor];
+    assert_eq!(
+      (scaled[0], scaled[1]),
+      (factor, libm::ldexp(1.0, exp - 1)),
+      "the scaling must be exact for this to be a statement about the fold"
+    );
+    let got = CoverageWeightedMean.aggregate_values(&embeddings, &scaled, 2);
+    assert_eq!(
+      got.as_ref().ok(),
+      Some(&reference),
+      "scaling every coverage by 2^{exp} changed the fold, got {got:?}"
+    );
+  }
+  assert_eq!(
+    libm::ldexp(1.0, -1074),
+    f64::from_bits(1),
+    "the last factor must reach the minimum f64 subnormal"
+  );
+
+  // Beyond the powers of two: a factor whose products are all exactly
+  // representable keeps the two slices exactly proportional, so the contract
+  // still binds. `0.75` is not a power of two, and `[1.0, 0.5] * 0.75` is
+  // `[0.75, 0.375]` with no rounding anywhere.
+  let exact_factor = 0.75_f64;
+  let exactly_proportional = [base[0] * exact_factor, base[1] * exact_factor];
+  assert_eq!(
+    exactly_proportional,
+    [0.75, 0.375],
+    "both products must be exact for this to be a statement about the fold"
+  );
+  let got = CoverageWeightedMean.aggregate_values(&embeddings, &exactly_proportional, 2);
+  assert_eq!(
+    got.as_ref().ok(),
+    Some(&reference),
+    "scaling every coverage by an exactly representable {exact_factor} changed the fold, got {got:?}"
+  );
+
+  // And an ordinary floating factor, which is where the *bit-identical* contract
+  // stops — the boundary being a property of the products, not of the factor.
+  // `0.1` is representable and in range, and neither product leaves the domain or
+  // rounds to zero, so a contract keyed on the factor would have to cover this
+  // one. It cannot: `0.1 * 0.1` is not exactly representable, so the scaled slice
+  // is not the base slice times a constant and its second weight is a different
+  // number. The invariance that survives is approximate, and the assertion below
+  // says which is which rather than leaving the stronger claim to be assumed.
+  let ordinary = [1.0_f64, 0.1];
+  let ordinary_reference = CoverageWeightedMean
+    .aggregate_values(&embeddings, &ordinary, 2)
+    .expect("the unscaled fold resolves");
+  let ordinary_scaled = [ordinary[0] * 0.1, ordinary[1] * 0.1];
+  assert_ne!(
+    ordinary_scaled[1] / ordinary_scaled[0],
+    ordinary[1] / ordinary[0],
+    "this row is only evidence while the scaled slice is *not* proportional"
+  );
+  let got = CoverageWeightedMean
+    .aggregate_values(&embeddings, &ordinary_scaled, 2)
+    .expect("the scaled fold resolves too");
+  assert_ne!(
+    got, ordinary_reference,
+    "an inexactly scaled slice is a different slice, and the bit-identical \
+     contract must not be claimed for it"
+  );
+  assert_close_f64(&got, &ordinary_reference);
+
+  // All-zero coverage is not a scale: no positive factor produces it, and the
+  // zero vector it folds to has no direction. It stays `NonFinite`.
+  let all_zero = CoverageWeightedMean.aggregate_values(&embeddings, &[0.0, 0.0], 2);
+  assert!(
+    matches!(all_zero, Err(WinditError::NonFinite)),
+    "an all-zero coverage slice has no direction to report, got {all_zero:?}"
+  );
+}
+
+/// A weight must not be *rounded into existence* before it multiplies its
+/// component.
+///
+/// FALSIFIER. The weights are ratios, and a ratio of two in-domain coverages can
+/// land anywhere in `f64` — including the subnormal range, where rounding stops
+/// being relative and becomes absolute. Materializing such a ratio as a value
+/// replaces it with one up to a factor of two away, and the fold then answers a
+/// question nobody asked. Neither the compensated sum nor the determinacy gate
+/// can recover information destroyed before the multiply.
+#[test]
+fn subnormal_coverage_ratios_do_not_fabricate_a_direction() {
+  // `eta` is the minimum `f64` subnormal, and all three coverages are ordinary
+  // in-domain fractions. Against a largest coverage of `0.75` the intended
+  // weights are `1`, `(4/3)eta` and `(8/3)eta`, and against these components the
+  // exact weighted sum is `(4/3)eta * -2^400 + (8/3)eta * 2^399`, which is
+  // exactly zero. There is no direction here to report.
+  let eta = f64::from_bits(1);
+  let coverages = [0.75, eta, 2.0 * eta];
+  let embeddings: [&[f64]; 3] = [&[0.0], &[-libm::ldexp(1.0, 400)], &[libm::ldexp(1.0, 399)]];
+  let got = CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction, got {got:?}"
+  );
+
+  // The blunter witness, where the fabrication is a wrong answer rather than a
+  // wrong verdict: the same coverages against two orthogonal components. The
+  // exact sum is `(4/3)eta * [2^100, 0] + (8/3)eta * [0, 2^100]`, whose
+  // direction is that of `[1, 2]`. Rounding the two ratios independently to
+  // `eta` and `3 * eta` turns it into the direction of `[1, 3]`.
+  let two = libm::ldexp(1.0, 100);
+  let orthogonal: [&[f64]; 3] = [&[0.0, 0.0], &[two, 0.0], &[0.0, two]];
+  let want = MeanRenormalized
+    .aggregate_values(&[&[1.0, 2.0]], &[1.0], 2)
+    .expect("[1, 2] has a direction");
+  let got = CoverageWeightedMean
+    .aggregate_values(&orthogonal, &coverages, 2)
+    .expect("two nonzero terms in one quadrant have a direction");
+  assert_eq!(
+    got, want,
+    "the fold must point where the exact weighted sum does, not where the \
+     rounded ratios do"
+  );
+
+  // The same shape at eight ratios, so the fix is a property rather than one
+  // arithmetic coincidence. The ideal weights are `(4/3)eta` and `(4k/3)eta`, so
+  // the answer is the direction of `[1, k]` whatever `k` is; independently
+  // rounded ratios give `[1, round(4k/3)]`, which agrees only at `k = 1`.
+  for k in 1..=8_u32 {
+    let coverages = [0.75, eta, f64::from(k) * eta];
+    let want = MeanRenormalized
+      .aggregate_values(&[&[1.0, f64::from(k)]], &[1.0], 2)
+      .expect("[1, k] has a direction");
+    let got = CoverageWeightedMean
+      .aggregate_values(&orthogonal, &coverages, 2)
+      .expect("two nonzero terms in one quadrant have a direction");
+    for (g, w) in got.iter().zip(&want) {
+      let gap = if g > w { g - w } else { w - g };
+      assert!(
+        gap <= 4.0 * f64::EPSILON * w.abs(),
+        "at k = {k} the fold must reach the direction of [1, {k}] to within the \
+         rounding its weights carry: got {got:?}, want {want:?}"
+      );
+    }
+  }
+
+  // A window that carries no coverage at all must not disable the lift for the
+  // others. It is the *smallest nonzero* weight that decides whether a ratio can
+  // be represented, and a zero weight is not a ratio that has to be — it is a
+  // window that drops out. A reduction that let the zero through comes back with
+  // the un-lifted answer for everything else.
+  let with_a_gap = [0.75, eta, 2.0 * eta, 0.0];
+  let four: [&[f64]; 4] = [&[0.0, 0.0], &[two, 0.0], &[0.0, two], &[0.0, 0.0]];
+  let got = CoverageWeightedMean
+    .aggregate_values(&four, &with_a_gap, 2)
+    .expect("the zero-coverage window drops out; the rest still has a direction");
+  assert_eq!(
+    got, want,
+    "a zero coverage must not decide the lift for the weights that are ratios"
+  );
+}
+
+/// The lift that keeps a weight out of the subnormal range is the identity
+/// everywhere the weights were already sound.
+///
+/// Which is the whole of its design: a correction that moved the common case
+/// would be a fourth re-measure of a fold this release has already re-measured
+/// three times, bought to fix a regime no plan can reach. So the engagement
+/// boundary is pinned from both sides, and so is the bound on how far the lift
+/// can ever go.
+#[test]
+fn the_weight_lift_engages_only_below_the_normal_boundary() {
+  assert_eq!(
+    f64::MIN_POSITIVE.exponent(),
+    MIN_NORMAL_EXPONENT,
+    "the boundary constant is the smallest normal f64's exponent, not a literal \
+     that happens to look like one"
+  );
+
+  // The ratio decides, and nothing else. Sweeping the smaller coverage across
+  // every exponent an `f64` has puts the boundary at exactly the place a weight
+  // stops being normal, and bounds the lift by 53 there rather than by argument.
+  for exp in -1074..=0 {
+    let coverages = [1.0, libm::ldexp(1.0, exp)];
+    let shift = normalizing_shift(&coverages, 1.0);
+    assert_eq!(
+      shift == 0,
+      exp >= MIN_NORMAL_EXPONENT,
+      "at a weight of 2^{exp} the lift must engage if and only if that weight is \
+       subnormal, got {shift}"
+    );
+    assert!(
+      (0..=53).contains(&shift),
+      "no in-domain slice can ask for a lift outside [0, 53], got {shift} at \
+       2^{exp}"
+    );
+  }
+
+  // The lift is computed before `check_inputs` runs, so an out-of-domain largest
+  // can drive the quotient to zero — and `Real::exponent` is documented for a
+  // finite *nonzero* value. What it returns for zero is therefore pinned here
+  // rather than relied on: whatever it is, it must not read as a subnormal
+  // weight, so no lift is attempted on a slice that is about to be rejected.
+  assert!(
+    0.0_f64.exponent() >= MIN_NORMAL_EXPONENT,
+    "a quotient that underflowed to zero must not be read as a subnormal weight"
+  );
+  let out_of_domain = [1e300, f64::from_bits(1)];
+  assert_eq!(
+    f64::from_bits(1) / 1e300,
+    0.0,
+    "this row is only evidence while the quotient really does underflow"
+  );
+  assert_eq!(
+    normalizing_shift(&out_of_domain, max_magnitude(&out_of_domain)),
+    0,
+    "no lift before the rejection"
+  );
+  assert!(matches!(
+    CoverageWeightedMean.aggregate_values(&[&[1.0], &[1.0]], &out_of_domain, 1),
+    Err(WinditError::CoverageOutOfRange { window: 0 })
+  ));
+
+  // And the lift it does ask for keeps every product inside the domain's own
+  // ceiling, which is what makes 53 a bound rather than a hope.
+  assert!(
+    (libm::ldexp(1.0, 53) * <f64 as Real>::MAX_AGG_MAGNITUDE).is_finite(),
+    "the largest lift must leave the largest in-domain product representable"
+  );
+
+  // The largest weight stays exactly a power of two through the lift: `m` scaled
+  // by `2^s` and divided by `m` is `2^s` to the bit, at every `m` and every `s`
+  // the policy can reach. That is what keeps the fold reading ratios only.
+  for exp in [0, -1, -7, -52, -53, -400, -1000, -1021, -1022, -1074] {
+    let largest = libm::ldexp(0.75, exp);
+    for shift in [0, 1, 2, 52, 53] {
+      assert_eq!(
+        libm::ldexp(largest, shift) / largest,
+        libm::ldexp(1.0, shift),
+        "the largest weight must be exactly 2^{shift} at a largest coverage of \
+         {largest:?}"
+      );
+    }
+  }
+
+  // A few whole slices, including the two boundary neighbours and the witness
+  // the falsifier above is built from.
+  let eta = f64::from_bits(1);
+  let rows: [(&[f64], i32); 7] = [
+    (&[1.0, 0.5], 0),
+    (&[1.0 / 3.0, 1.0], 0),
+    (&[eta, 4.0 * eta], 0),
+    (&[1.0, libm::ldexp(1.0, MIN_NORMAL_EXPONENT)], 0),
+    (&[1.0, libm::ldexp(1.0, MIN_NORMAL_EXPONENT - 1)], 2),
+    (&[0.75, eta, 2.0 * eta], 53),
+    (&[0.0, 0.0], 0),
+  ];
+  for (coverages, want) in rows {
+    let shift = normalizing_shift(coverages, max_magnitude(coverages));
+    assert_eq!(shift, want, "wrong lift for {coverages:?}");
+  }
+}
+
+/// The lift changes nothing it does not have to change.
+///
+/// **Real plan output never engages the lift, and that is structural:** a
+/// plan's non-final windows all carry coverage exactly `1.0`, so a real slice's
+/// largest coverage is always `1.0`, and its smallest is bounded below by
+/// `1 / usize::MAX` — a plan's coverages are at worst that far apart — which
+/// keeps `shift` at `0` (the lift engages only past a ratio of `2^1022`) on
+/// every slice a plan can produce, independent of this or any other sample.
+///
+/// This is a broader characterization check on top of that proof, not the
+/// source of it: a sweep over the same 20736 *synthetic* four-window coverage
+/// slices this release's previous `CoverageWeightedMean` change was measured
+/// over — arbitrary four-tuples of the twelve `len / 12` ratios
+/// `Span::coverage` can produce, pushed through the policy directly rather than
+/// through a `WindowPlan`, so most of them are not slices any plan would
+/// actually emit. Every one of them still folds bit-identically against the
+/// weighting as it stood before the lift. A fourth re-measure of this fold
+/// would need its own entry in the changelog; this test is what says there is
+/// not one.
+#[test]
+fn the_weight_lift_is_the_identity_on_every_synthetic_direct_api_slice() {
+  // The weighting verbatim as it was, folded through the very same routine, so
+  // the weight is the only thing that differs.
+  fn unlifted(
+    embeddings: &[&[f64]],
+    coverages: &[f64],
+    dim: usize,
+  ) -> Result<Vec<f64>, WinditError> {
+    let largest = max_magnitude(coverages);
+    weighted_sum_renorm(embeddings, coverages, dim, move |i, _| {
+      if largest > 0.0 {
+        coverages[i] / largest
+      } else {
+        0.0
+      }
+    })
+  }
+
+  let ratios: Vec<f64> = (1..=12)
+    .map(|len| Span::new(0, len, 12).coverage())
+    .collect();
+  let embeddings: [&[f64]; 4] = [&[1.0, 0.0], &[0.0, 1.0], &[0.6, 0.8], &[0.8, -0.6]];
+  let mut folded = 0_u32;
+  for &a in &ratios {
+    for &b in &ratios {
+      for &c in &ratios {
+        for &d in &ratios {
+          let coverages = [a, b, c, d];
+          assert_eq!(
+            normalizing_shift(&coverages, max_magnitude(&coverages)),
+            0,
+            "no plan-reachable slice engages the lift, {coverages:?} did"
+          );
+          let want = unlifted(&embeddings, &coverages, 2);
+          let got = CoverageWeightedMean.aggregate_values(&embeddings, &coverages, 2);
+          assert_eq!(
+            got.as_ref().ok(),
+            want.as_ref().ok(),
+            "the lift moved a fold it does not engage on, at {coverages:?}"
+          );
+          folded += 1;
+        }
+      }
+    }
+  }
+  assert_eq!(
+    folded, 20736,
+    "the sweep must cover every four-window combination"
+  );
+
+  // Non-vacuity: where the lift *does* engage the two disagree, and the lifted
+  // answer is the right one. Without this the assertion above would be satisfied
+  // by a lift that never engaged at all.
+  let eta = f64::from_bits(1);
+  let coverages = [0.75, eta, 2.0 * eta];
+  let two = libm::ldexp(1.0, 100);
+  let orthogonal: [&[f64]; 3] = [&[0.0, 0.0], &[two, 0.0], &[0.0, two]];
+  let before = unlifted(&orthogonal, &coverages, 2).expect("the un-lifted fold answers");
+  let after = CoverageWeightedMean
+    .aggregate_values(&orthogonal, &coverages, 2)
+    .expect("the lifted fold answers");
+  assert_ne!(before, after, "the lift must engage somewhere");
+  let want = MeanRenormalized
+    .aggregate_values(&[&[1.0, 2.0]], &[1.0], 2)
+    .expect("[1, 2] has a direction");
+  assert_eq!(after, want, "and where it engages it must be right");
+}
+
+/// Two consequences of the weights being normalized, each the kind of thing a
+/// caller can rely on.
+///
+/// A single window has nothing to weigh against, so its coverage cannot matter
+/// at all: whatever it is, the answer is that window's own direction, which is
+/// exactly what [`MeanRenormalized`] returns. Before normalization the fold
+/// multiplied by the coverage first and renormalized after, so a coverage that
+/// is not a power of two cost an ulp for nothing — `2/3` on `[3, 4]` returned
+/// `[0.6, 0.7999999999999999]`.
+///
+/// And a slice that contains a full window — every plan with one does — divides
+/// by exactly `1.0`, so normalization is the identity and those folds are
+/// bit-identical to the un-normalized ones.
+#[test]
+fn normalized_weights_leave_the_common_geometries_where_they_were() {
+  let raw: [&[f64]; 1] = [&[3.0, 4.0]];
+  let reference = MeanRenormalized
+    .aggregate_values(&raw, &[1.0], 2)
+    .expect("one window has a direction");
+  assert_eq!(reference, vec![0.6, 0.8], "the exact direction of [3, 4]");
+  for len in 1..=3_usize {
+    let coverage = Span::new(0, len, 3).coverage();
+    let got = CoverageWeightedMean
+      .aggregate_values(&raw, &[coverage], 2)
+      .expect("one window has a direction at every coverage");
+    assert_eq!(
+      got, reference,
+      "one window at coverage {coverage:?} must be its own direction"
+    );
+  }
+
+  // A full window present: the divisor is exactly 1.0 and every weight is its own
+  // coverage, unrounded.
+  let four: [&[f64]; 4] = [&[1.0, 0.0], &[0.0, 1.0], &[0.6, 0.8], &[0.8, -0.6]];
+  let coverages = [1.0, 1.0, 1.0, 1.0 / 3.0];
+  let got = CoverageWeightedMean
+    .aggregate_values(&four, &coverages, 2)
+    .unwrap();
+  let mut acc = [0.0_f64; 2];
+  for (e, c) in four.iter().zip(coverages) {
+    for (a, x) in acc.iter_mut().zip(e.iter()) {
+      *a += c * x;
+    }
+  }
+  let norm = libm::sqrt(acc[0] * acc[0] + acc[1] * acc[1]);
+  assert_close_f64(&got, &[acc[0] / norm, acc[1] / norm]);
+}
+
+/// The divisor is the *largest* coverage, and no other entry will do.
+///
+/// Any fixed positive divisor preserves the ratios a weighted mean reads, so the
+/// choice looks free. It is not: dividing by the largest is what puts every
+/// weight in `(0, 2^shift]` with the largest exactly `2^shift`, and a largest
+/// weight the caller's scale cannot move is the property the determinacy gate's
+/// absolute floor is read against. Dividing by, say, the first coverage instead
+/// fails in both directions — a leading zero annihilates a fold that has a
+/// direction, and a leading *smallest* sends the other weights past `f64`'s
+/// range.
+#[test]
+fn the_divisor_is_the_largest_coverage() {
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+
+  // A window with no coverage contributes nothing, and the rest still folds.
+  let got = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[0.0, 1.0], 2)
+    .expect("a zero-coverage window drops out; the other still has a direction");
+  assert_close_f64(&got, &[0.0, 1.0]);
+
+  // The smallest coverage first: dividing by it would make the other weight
+  // `2^1074`, which is not an `f64` at all.
+  let got = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[f64::from_bits(1), 1.0], 2)
+    .expect("no weight exceeds 1, so nothing here can leave the range");
+  assert_close_f64(&got, &[0.0, 1.0]);
+}
+
+/// The recurrence's oldest window carries no `alpha` factor, and the weights
+/// that fact produces do not generally sum to one in `f64`.
+///
+/// Both halves are corrections to prose, and both are pinned here because prose
+/// is where they went wrong. The module's Input domain note displayed
+/// `w_i = alpha * (1 - alpha)^(n - 1 - i)` for every `i`, which is not the split
+/// `s_i = alpha * e_i + (1 - alpha) * s_{i-1}` from `s_0 = e_0` produces — nothing
+/// preceded the first window for it to blend with — and it claimed the
+/// materialized weights sum to exactly `1`. The *ideal* weights do, in exact
+/// arithmetic. The `f64` ones do not, and a spot check at a dyadic `alpha` cannot
+/// see the difference.
+#[test]
+fn ema_weights_are_the_split_the_recurrence_produces() {
+  // The implementation's own backward pass, replicated so the two claims below
+  // are about the numbers the fold actually carries. The basis fold that follows
+  // is what ties this replica to the policy.
+  fn materialized(alpha: f64, n: usize) -> Vec<f64> {
+    let complement = 1.0 - alpha;
+    let mut w = vec![0.0; n];
+    let mut power = 1.0;
+    for i in (1..n).rev() {
+      w[i] = alpha * power;
+      power *= complement;
+    }
+    if n > 0 {
+      w[0] = power;
+    }
+    w
+  }
+
+  // Folding the standard basis makes the weight vector itself observable, up to
+  // the L2 normalization every policy ends with. The two candidate formulas
+  // differ only in the oldest window and there by exactly a factor of `alpha`,
+  // so the fold can tell them apart.
+  let alpha = 0.3_f64;
+  let n = 4_usize;
+  let basis: Vec<Vec<f64>> = (0..n)
+    .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+    .collect();
+  let refs: Vec<&[f64]> = basis.iter().map(Vec::as_slice).collect();
+  let coverages = vec![1.0; n];
+  let got = EmaRenormalized::new(alpha)
+    .aggregate_values(&refs, &coverages, n)
+    .expect("a convex EMA over the basis has a direction");
+
+  let split = materialized(alpha, n);
+  let mut uniform_alpha = split.clone();
+  uniform_alpha[0] *= alpha;
+  let mut want_split = split.clone();
+  let mut want_uniform = uniform_alpha.clone();
+  l2_renorm(&mut want_split).expect("the split weights have a direction");
+  l2_renorm(&mut want_uniform).expect("the uniform-alpha weights have a direction");
+  assert_close_f64(&got, &want_split);
+  let gap = got[0] - want_uniform[0];
+  assert!(
+    gap > 0.1,
+    "the displayed formula must be the one the fold uses: {got:?} against the \
+     uniform-alpha {want_uniform:?}"
+  );
+
+  // And the sum. At a dyadic `alpha` every weight is exact and the sum is exactly
+  // one, which is why checking `0.5` proves nothing about `0.3`.
+  let sum = |w: &[f64]| w.iter().fold(0.0_f64, |a, x| a + x);
+  for n in 2..=8 {
+    assert_eq!(
+      sum(&materialized(0.5, n)),
+      1.0,
+      "a dyadic alpha keeps every weight exact"
+    );
+  }
+  assert_eq!(
+    sum(&materialized(0.3, 3)),
+    1.0,
+    "and 0.3 survives to n = 3, which is how a partial check passes"
+  );
+  assert_ne!(
+    sum(&materialized(0.3, 4)),
+    1.0,
+    "but the materialized weights do not generally sum to one, and no part of \
+     the policy needs them to"
+  );
+  assert_eq!(sum(&materialized(0.3, 4)), 0.999_999_999_999_999_8);
 }
 
 #[test]
@@ -310,7 +916,7 @@ fn ema_renormalized_rejects_out_of_range_alpha() {
 
 /// A built-in policy's `aggregate_values`, as a plain function pointer so a test
 /// can iterate over the four of them.
-type PolicyRun = fn(&[&[f64]], &[f32], usize) -> Result<Vec<f64>, WinditError>;
+type PolicyRun = fn(&[&[f64]], &[f64], usize) -> Result<Vec<f64>, WinditError>;
 
 /// The four built-in policies, paired with a name for failure messages, over one
 /// compute scalar. Saves each magnitude test from spelling the list four times.
@@ -609,7 +1215,7 @@ fn exact_cancellation_is_rejected() {
     113.0 / 512.0,
     -2799.0 / 512.0,
   ];
-  let coverages = [1.0_f32; 4];
+  let coverages = [1.0_f64; 4];
   for order in permutations(4) {
     let cols = [
       [raw[order[0]]],
@@ -653,7 +1259,7 @@ fn exact_cancellation_is_rejected() {
 fn assert_wide_spread_cancellation_rejected(e: f64, d: f64, domain_rejected: bool) {
   let de = d * e; // exact: the tiny term that rides on `e`
   let values = [e, -e, 48.0 * de, -32.0 * de, -16.0 * de];
-  let coverages = [1.0_f32; 5];
+  let coverages = [1.0_f64; 5];
   for order in permutations(5) {
     let cols: Vec<[f64; 1]> = order.iter().map(|&i| [values[i]]).collect();
     let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
@@ -777,7 +1383,7 @@ fn exact_cancellation_across_three_tiers_is_gated() {
     [d, -1.0],
     [1.0, 0.0],
   ];
-  let coverages = [1.0_f32; 6];
+  let coverages = [1.0_f64; 6];
   let mut orders = 0;
   for order in permutations(6) {
     orders += 1;
@@ -850,7 +1456,7 @@ fn ema_subnormal_product_cancellation_family_a_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
   cols.resize(700, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 700];
+  let coverages = vec![1.0_f64; 700];
   let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -874,7 +1480,7 @@ fn ema_subnormal_product_cancellation_family_b_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e0, 0.0], [e1, 0.0], [e2, 0.0]];
   cols.resize(84, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 84];
+  let coverages = vec![1.0_f64; 84];
   let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -897,7 +1503,7 @@ fn ema_single_subnormal_product_term_is_gated() {
   let mut cols: Vec<[f64; 2]> = vec![[e, 0.0]];
   cols.resize(701, [0.0, 0.0]);
   let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
-  let coverages = vec![1.0_f32; 701];
+  let coverages = vec![1.0_f64; 701];
   let got = EmaRenormalized::new(0.5).aggregate_values(&embeddings, &coverages, 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
@@ -924,7 +1530,7 @@ fn determinacy_gate_floor_boundary_is_monotone() {
   cols_above.resize(606, [0.0, 0.0]);
   let e_above: Vec<&[f64]> = cols_above.iter().map(|c| c.as_slice()).collect();
   let out = EmaRenormalized::new(0.5)
-    .aggregate_values(&e_above, &vec![1.0_f32; 606], 2)
+    .aggregate_values(&e_above, &vec![1.0_f64; 606], 2)
     .unwrap();
   assert_close_f64(&out, &[0.447_213_595_499_957_9, 0.894_427_190_999_915_9]);
 
@@ -932,7 +1538,7 @@ fn determinacy_gate_floor_boundary_is_monotone() {
   let mut cols_below: Vec<[f64; 2]> = vec![[below, 2.0 * below]];
   cols_below.resize(606, [0.0, 0.0]);
   let e_below: Vec<&[f64]> = cols_below.iter().map(|c| c.as_slice()).collect();
-  let got = EmaRenormalized::new(0.5).aggregate_values(&e_below, &vec![1.0_f32; 606], 2);
+  let got = EmaRenormalized::new(0.5).aggregate_values(&e_below, &vec![1.0_f64; 606], 2);
   assert!(
     matches!(got, Err(WinditError::NonFinite)),
     "sub-floor mass must be NonFinite, got {got:?}"
@@ -1001,6 +1607,107 @@ fn domain_corners_are_accepted_at_the_boundary_and_rejected_beyond() {
   }
 }
 
+/// Where the determinacy gate's absolute floor still decides a
+/// `CoverageWeightedMean` verdict — and where it was made to decide one it had
+/// no business deciding.
+///
+/// REVOKED, and this note is the record. `0.3.0` widened the coverage channel to
+/// `f64`, which widened the smallest positive coverage the input domain admits
+/// from `2^-149` to `2^-1074`; the first round answered that by declaring the
+/// policy a member of `EmaRenormalized`'s regime, so a fold whose whole mass sat
+/// under [`MIN_GATE_THRESHOLD`](crate::scalar::Real::MIN_GATE_THRESHOLD) came
+/// back `NonFinite`. That test asserted the wrong thing. `2^-1074` is not a
+/// degraded `1.0`; it is `1.0` times a positive factor, and a normalized weighted
+/// mean does not depend on that factor. The floor is an *absolute* bound
+/// borrowed from a gate whose quantity is a norm in the embedding's own units,
+/// and a weight has no units to measure it in.
+///
+/// So the first half below is the old fixture with its verdict corrected: the
+/// smallest coverage `f64` can hold, on both windows, is a scale and resolves to
+/// the same direction `1.0` does.
+///
+/// The floor is not thereby unreachable here — it is reached by an unbounded
+/// *ratio* rather than by a scale, exactly as it is for EMA. After
+/// normalization the largest weight is `1.0`, so a fold's mass falls under the
+/// floor only when the windows carrying the largest coverages contribute no mass
+/// of their own. The second half builds that: a zero-valued window at coverage
+/// `1.0` beside a real one at `2^-1000`, whose entire accumulated mass is
+/// `2^-1000` and so at or below the floor. That is a statement about the
+/// embeddings, and scaling both coverages does not change it.
+#[test]
+fn a_coverage_scale_is_not_a_loss_of_precision_but_a_ratio_can_be() {
+  let subnormal = f64::from_bits(1); // 2^-1074, unrepresentable as a nonzero f32
+  assert!(subnormal.is_finite() && subnormal > 0.0 && subnormal < 1.0);
+  assert_eq!(subnormal as f32, 0.0, "no f32 carries this coverage");
+
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  let at_subnormal = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[subnormal; 2], 2)
+    .expect("a uniform coverage resolves whatever its scale");
+  assert_close_f64(&at_subnormal, &[core::f64::consts::FRAC_1_SQRT_2; 2]);
+  let at_one = CoverageWeightedMean
+    .aggregate_values(&embeddings, &[1.0; 2], 2)
+    .expect("the same fold at coverage 1.0");
+  assert_eq!(
+    at_subnormal, at_one,
+    "the smallest positive coverage is a scale of the largest, not a degradation of it"
+  );
+
+  // The ratio regime. Window 0 carries the largest coverage and no mass; window 1
+  // carries all the mass at a coverage `2^-1000` of it, so the fold accumulates
+  // `2^-1000` against a floor of `2^-1000` and there is no direction at working
+  // precision. Both windows are in domain (zero is, and `1.0` is).
+  let ratio: [&[f64]; 2] = [&[0.0, 0.0], &[1.0, 0.0]];
+  let tiny = libm::ldexp(1.0, -1000);
+  let got = CoverageWeightedMean.aggregate_values(&ratio, &[1.0, tiny], 2);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a fold whose whole mass sits at the floor has no direction, got {got:?}"
+  );
+  // And that verdict is itself scale-invariant: halving both coverages keeps the
+  // ratio, and so keeps the verdict.
+  let scaled = CoverageWeightedMean.aggregate_values(&ratio, &[0.5, tiny / 2.0], 2);
+  assert!(
+    matches!(scaled, Err(WinditError::NonFinite)),
+    "the ratio regime must not depend on the scale either, got {scaled:?}"
+  );
+
+  // One window above it, to show the floor is a boundary and not a blanket: the
+  // same geometry at a ratio of `2^-900` resolves to window 1's direction.
+  let above = libm::ldexp(1.0, -900);
+  let out = CoverageWeightedMean
+    .aggregate_values(&ratio, &[1.0, above], 2)
+    .expect("mass well above the floor must resolve");
+  assert_close_f64(&out, &[1.0, 0.0]);
+}
+
+/// The coverage slice must be as long as the window sequence, at every policy.
+///
+/// The shared input check enforces it, so even a policy that never reads a
+/// coverage rejects a mismatched one rather than folding a sequence it was
+/// handed no geometry for. Both directions are checked: a short slice is the one
+/// that would index out of bounds inside `CoverageWeightedMean`, and a long one
+/// is the one the per-window zip would silently truncate.
+#[test]
+fn a_coverage_slice_that_does_not_match_the_windows_is_rejected() {
+  let embeddings: [&[f64]; 2] = [&[1.0, 0.0], &[0.0, 1.0]];
+  for (label, coverages) in [("short", &[1.0][..]), ("long", &[1.0, 1.0, 1.0][..])] {
+    for (name, run) in builtin_policies() {
+      let got = run(&embeddings, coverages, 2);
+      assert!(
+        matches!(
+          got,
+          Err(WinditError::DimMismatch {
+            got: g,
+            expected: 2
+          }) if g == coverages.len()
+        ),
+        "{name} must reject a {label} coverage slice, got {got:?}"
+      );
+    }
+  }
+}
+
 #[test]
 fn out_of_range_coverage_is_rejected() {
   // A coverage is a geometric fraction in [0, 1]; NaN, above 1, or below 0 is
@@ -1008,7 +1715,7 @@ fn out_of_range_coverage_is_rejected() {
   // lives in the shared input path, so even the policies that ignore coverage
   // enforce its range.
   let embeddings: [&[f64]; 1] = [&[1.0, 0.0]];
-  for bad in [f32::NAN, 1.5, -0.1] {
+  for bad in [f64::NAN, 1.5, -0.1] {
     for (name, run) in builtin_policies() {
       let got = run(&embeddings, &[bad], 2);
       assert!(
@@ -1131,7 +1838,7 @@ fn kind_into_policy_matches_builtin() {
   let fine = 1.0 - libm::ldexp(1.0, -30);
   assert_eq!(fine as f32, 1.0, "no f32 is nearer to this alpha than 1.0");
   let raw: [&[f64]; 3] = [&[0.0, 1.0], &[0.0, 1.0], &[1.0, 0.0]];
-  let cov = [1.0f32; 3];
+  let cov = [1.0f64; 3];
   let via_kind = AggregatePolicyKind::Ema { alpha: fine }
     .into_policy()
     .aggregate_values(&raw, &cov, 2)

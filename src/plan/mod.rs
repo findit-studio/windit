@@ -106,10 +106,145 @@ impl Span {
   ///
   /// Both constructors enforce `0 < len <= window` in every build, so the
   /// denominator is positive and the quotient is finite.
+  ///
+  /// # The fraction is a weight, so it is `f64`
+  ///
+  /// This is not a report a caller merely reads: it is what the
+  /// `CoverageWeightedMean` aggregation policy multiplies an embedding by, in
+  /// the `f64` domain every shipped scalar computes in (named rather than
+  /// linked — that policy sits behind `alloc` and this tier is featureless). A
+  /// weight resolved more coarsely than the arithmetic it drives loses two
+  /// distinct things, and this fraction lost both while it was `f32`:
+  ///
+  /// - **The operands rounded before the division.** `f32` represents every
+  ///   integer only to `2^24`; `f64` to `2^53`. A window of `2^24 + 1` narrowed
+  ///   to `2^24`, so a tail one element short of it divided out to exactly `1.0`
+  ///   and a ragged tail was indistinguishable from a full window.
+  /// - **The quotient was rounded to the `f32` grid.** That grid is `2^-24`
+  ///   apart relatively where the fold rounds at `2^-53`, so two window
+  ///   geometries whose true coverages differ by less than an `f32` ulp — as
+  ///   `8388607/16777213` and `8388608/16777215` do, by `3.6e-15` — arrived at
+  ///   an `f64` fold as one weight.
+  ///
+  /// Both were read as a defect of `f32`, and only the second one was. Widening
+  /// the quotient to `f64` did fix the second. The first is not about width at
+  /// all: it is that **both operands were rounded independently before the
+  /// division**, and `f64` only moves the first geometry that shows it out to
+  /// `2^53`. `Span::new(0, 2^53, 2^53 + 1)` — one span of
+  /// `WindowPlan::spans(&WindowOptions::new(2^53 + 1), 2^53)` — casts both counts
+  /// to the same `f64` and divided out to exactly `1.0`, a ragged tail wearing a
+  /// full window's coverage in the crate that documents ragged tails as strictly
+  /// below one.
+  ///
+  /// # The ratio, and where it saturates
+  ///
+  /// So the division is not performed on rounded operands. This returns the
+  /// **correctly rounded** value of the exact rational `len / window` for every
+  /// geometry a [`Span`] can hold, with one deliberate exception at the top of
+  /// the range:
+  ///
+  /// `coverage() == 1.0` **if and only if** `len == window`.
+  ///
+  /// A true ratio within half an ulp of one — `window - len` below
+  /// `window * 2^-54`, which needs a window of at least `2^54` — would round to
+  /// `1.0` and make a ragged span indistinguishable from a full one again. Those
+  /// saturate *downwards* instead, to `1 - 2^-53`, the largest `f64` below one.
+  /// The error that introduces is under one ulp and never overstates coverage,
+  /// the mapping stays monotone in `len`, and the equivalence above holds for
+  /// every geometry rather than for the ones `f64` happens to resolve. Rounding
+  /// is otherwise nearest-even, so the two window geometries `8388607/16777213`
+  /// and `8388608/16777215` stay `3.6e-15` apart rather than collapsing.
+  ///
+  /// The precision is what the weighting reads and the *scale* is not:
+  /// `CoverageWeightedMean` folds each coverage divided by the largest in the
+  /// plan, so what reaches its sum is the ratios between these fractions. Two
+  /// geometries an ulp apart must stay an ulp apart; a plan whose coverages are
+  /// uniformly small is the same plan as one whose coverages are uniformly
+  /// large.
   #[must_use]
-  pub fn coverage(&self) -> f32 {
-    self.len as f32 / self.window as f32
+  pub fn coverage(&self) -> f64 {
+    // The span invariant (`0 < len <= window`, enforced by both constructors in
+    // every build) is exactly this helper's precondition.
+    ratio_to_f64(self.len, self.window)
   }
+}
+
+/// The largest `f64` strictly below `1.0`, `1 - 2^-53`.
+const NEAREST_BELOW_ONE: f64 = f64::from_bits(0x3fef_ffff_ffff_ffff);
+
+/// The `f64` significand width, `53`: every integer up to `2^SIGNIFICAND_BITS`
+/// is exactly an `f64`, and the next one is not.
+const SIGNIFICAND_BITS: u32 = f64::MANTISSA_DIGITS;
+
+/// The `f64` exponent bias, `1023`.
+const EXPONENT_BIAS: i32 = 1023;
+
+// `ratio_to_f64` reduces both counts through `u64` and bounds its scaled
+// numerator by `2^118` on that basis. A wider `usize` would silently break both,
+// so it is refused at compile time rather than mis-divided at run time.
+const _: () = assert!(usize::BITS <= 64);
+
+/// The correctly rounded value of the exact rational `numer / denom`, saturating
+/// to [`NEAREST_BELOW_ONE`] whenever `numer < denom` but the true ratio rounds to
+/// `1.0`.
+///
+/// The precondition is [`Span`]'s own invariant, `0 < numer <= denom`.
+///
+/// Casting each count to `f64` first is what this exists to avoid: past
+/// `2^SIGNIFICAND_BITS` that cast rounds, and two counts one apart can land on
+/// the same value — after which no amount of care in the division recovers the
+/// distinction. The quotient is formed from the integers themselves instead.
+///
+/// Three regimes, in the order they are tested:
+///
+/// - `numer == denom`: exactly `1.0`, the only input that produces it.
+/// - `denom <= 2^SIGNIFICAND_BITS`: both counts are exact `f64`s, so IEEE
+///   division *is* the correctly rounded ratio and this is one instruction.
+///   Always taken where `usize` is 32 bits, which is why the bare-metal tier
+///   never reaches the integer path. A quotient here is at most `1 - 1/denom`,
+///   itself an `f64`, so it never rounds up to `1.0`.
+/// - otherwise: the saturation test, then an exact integer division. The test is
+///   `deficit * 2^54 <= denom`, equivalently a true ratio at or above
+///   `1 - 2^-54` — the midpoint whose tie rounds to `1.0`. Because it claims
+///   everything from there up, the division below is left with a ratio strictly
+///   under `1 - 2^-54`, which cannot round to `1.0` either.
+fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
+  debug_assert!(numer > 0 && numer <= denom, "0 < numer <= denom");
+  if numer == denom {
+    return 1.0;
+  }
+  let (n, d) = (numer as u64, denom as u64);
+  if d <= 1 << SIGNIFICAND_BITS {
+    return n as f64 / d as f64;
+  }
+  if u128::from(d - n) << (SIGNIFICAND_BITS + 1) <= u128::from(d) {
+    return NEAREST_BELOW_ONE;
+  }
+  // Scale the numerator so the quotient lands in `[2^53, 2^55)` — one or two bits
+  // wider than the significand, whatever the two magnitudes are. `n < d` gives
+  // `n.ilog2() <= d.ilog2()`, so the shift is between `54` and `117` and the
+  // shifted numerator stays under `2^118`.
+  let shift = SIGNIFICAND_BITS + 1 + d.ilog2() - n.ilog2();
+  let scaled = u128::from(n) << shift;
+  let (quotient, remainder) = (scaled / u128::from(d), scaled % u128::from(d));
+  // Round to nearest, ties to even. `remainder` is the sticky bit: nonzero means
+  // the exact value sits strictly above the midpoint the dropped bits describe,
+  // so a tie is a tie only when the division came out exact.
+  let extra = quotient.ilog2() + 1 - SIGNIFICAND_BITS;
+  let mut kept = quotient >> extra;
+  let dropped = quotient & ((1 << extra) - 1);
+  let midpoint = 1 << (extra - 1);
+  if dropped > midpoint || (dropped == midpoint && (remainder != 0 || kept & 1 == 1)) {
+    kept += 1;
+  }
+  // `kept * 2^exponent` is the answer, and both factors are exact: `kept` is at
+  // most `2^53` — the round-up carries at most one bit past the `[2^52, 2^53)`
+  // the shift placed it in, and `2^53` is itself an `f64` — while `exponent`
+  // lands between `-116` and `-53`, well inside the normal range. So no
+  // renormalization is needed for the carry: `2^53 * 2^e` and `2^52 * 2^(e + 1)`
+  // are the same `f64`, and a branch for it would be inert rather than defensive.
+  let exponent = extra as i32 - shift as i32;
+  kept as f64 * f64::from_bits(((exponent + EXPONENT_BIAS) as u64) << (SIGNIFICAND_BITS - 1))
 }
 
 /// How the planner treats a final window that does not fill a whole [`Span`].

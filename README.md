@@ -213,7 +213,7 @@ impl AggregatePolicy for FirstWindow {
     fn aggregate_values(
         &self,
         embeddings: &[&[f64]],
-        _coverages: &[f32],
+        _coverages: &[f64],
         dim: usize,
     ) -> Result<Vec<f64>, WinditError> {
         let first = embeddings.first().ok_or(WinditError::Empty)?;
@@ -231,7 +231,11 @@ The aggregate trait takes its compute scalar as a type parameter defaulting to
 reconstruction stays generic through the free `aggregate` function. The example
 above serves the default `f64` domain by leaving the parameter off;
 `impl<C: Real> AggregatePolicy<C> for FirstWindow`, with `&[&[C]]` and `Vec<C>`,
-serves every compute scalar instead.
+serves every compute scalar instead. The coverage slice is a concrete `f64` at
+every scalar rather than a `C`: a coverage is derived by `Span::coverage` from
+two `usize`s before any embedding exists, so there is no compute domain to ask
+for it in — and it is a weight on an `f64` fold, so it is not carried narrower
+than one.
 
 ## Scalars
 

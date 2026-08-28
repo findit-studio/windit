@@ -120,8 +120,55 @@ pub trait Scalar: private::Sealed + Copy {
 /// A floating-point scalar the aggregation math can run in.
 ///
 /// This trait is sealed; see the [module documentation](self).
+///
+/// # Supertraits are not purely additive
+///
+/// Sealing prevents downstream *implementations*; it does not prevent a
+/// *method-resolution* collision at a call site, and adding a supertrait can
+/// therefore break source that compiled before. `Real` gained a
+/// [`Debug`](core::fmt::Debug) supertrait in `0.3.0`, so generic code bounded on
+/// `Real` **and** on something else that supplies an `fmt` method — a
+/// [`Display`](core::fmt::Display) bound, or a local trait of the dependent's
+/// own — now sees two candidates where it saw one:
+///
+/// ```compile_fail,E0034
+/// use core::fmt::{Display, Formatter, Result};
+/// use windit::scalar::Real;
+///
+/// fn show<T: Real + Display>(x: T, f: &mut Formatter<'_>) -> Result {
+///   x.fmt(f) // E0034: multiple applicable items in scope
+/// }
+/// ```
+///
+/// The fix is to name the trait at the call site, which is stable against any
+/// future supertrait as well:
+///
+/// ```
+/// use core::fmt::{Display, Formatter, Result};
+/// use windit::scalar::Real;
+///
+/// fn show<T: Real + Display>(x: T, f: &mut Formatter<'_>) -> Result {
+///   Display::fmt(&x, f)
+/// }
+/// ```
+///
+/// `cargo semver-checks` cannot see this class of break — it models items
+/// appearing and disappearing, not ambiguity at a use site — so it is recorded
+/// here and in the changelog rather than left to a tool that reports it as
+/// additive.
 pub trait Real:
   Scalar<Compute = Self>
+  // Every implementor is a core float, so this costs implementors nothing and
+  // buys the generic code its only way to *show* a compute value: without it a
+  // `C: Real` is unformattable, and `VectorEmaState` had to report its shape
+  // while withholding the coefficient it was configured with.
+  //
+  // Sealing keeps it from breaking a downstream *impl*, and that is all sealing
+  // does: it says nothing about method resolution at a call site. See the trait's
+  // own "Supertraits are not purely additive" note — a downstream
+  // `T: Real + Display` calling `x.fmt(f)` had one candidate before this bound
+  // and has two after, which is `E0034`.
+  + core::fmt::Debug
   + core::ops::Add<Output = Self>
   + core::ops::Sub<Output = Self>
   + core::ops::Mul<Output = Self>
@@ -153,15 +200,20 @@ pub trait Real:
   ///
   /// With [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) it bounds the input
   /// domain within which every intermediate of every built-in aggregation policy
-  /// stays finite, and — for the policies whose weights are bounded below
-  /// (`MeanRenormalized`, `CoverageWeightedMean`, `SaliencyWeighted`) — every
-  /// nonzero intermediate stays a normal value, with no overflow and no flush to
-  /// a subnormal. `EmaRenormalized`'s recency weights are unbounded below, so its
-  /// oldest-window products may underflow toward a subnormal; the determinacy
-  /// gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor keeps that
-  /// regime sound (see the `aggregate` module's Input domain note). A nonzero
-  /// component below this bound is rejected before any arithmetic. Every magnitude
-  /// an `f32`-storage embedding can produce sits far above it.
+  /// stays finite, and — for the policies whose weights the domain itself bounds
+  /// below (`MeanRenormalized` at the constant `1`, `SaliencyWeighted` at a norm
+  /// this bound itself puts at `2^-400`) — every nonzero intermediate stays a
+  /// normal value, with no overflow and no flush to a subnormal.
+  /// `EmaRenormalized` and `CoverageWeightedMean` are the two that reach below
+  /// it, and in neither is the cause a small weight *scale*: EMA's ideal weights
+  /// sum to exactly `1`, and a normalized coverage's largest is exactly a power
+  /// of two whatever scale the slice arrived in. It is the *ratio* — EMA's
+  /// recency factors decaying without limit, a coverage far below
+  /// the fullest window's — that drives a product toward a subnormal. The
+  /// determinacy gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor
+  /// keeps that regime sound (see the `aggregate` module's Input domain note). A
+  /// nonzero component below this bound is rejected before any arithmetic. Every
+  /// magnitude an `f32`-storage embedding can produce sits far above it.
   const MIN_AGG_MAGNITUDE: Self;
 
   /// The largest magnitude a nonzero input component may carry into aggregation
@@ -179,36 +231,47 @@ pub trait Real:
   /// The determinacy gate rejects a folded result whose norm is at or below
   /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD`, where `M`
   /// is the accumulated term-magnitude vector. The relative `16 * EPSILON * ||M||`
-  /// part underflows to zero once `EmaRenormalized`'s unbounded-below recency
-  /// weights drive the fold's products into the subnormal range, where per-term
-  /// rounding is absolute (at most `2^-1075`) rather than relative. This floor
-  /// dominates the largest residue such an exactly-cancelling fold can leave
+  /// part underflows to zero once an unbounded weight *ratio* drives the fold's
+  /// products into the subnormal range, where per-term rounding is absolute (at
+  /// most `2^-1075`) rather than relative. This floor dominates the largest
+  /// residue such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
-  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass the
-  /// three bounded-weight policies can accumulate in-domain, so their verdicts are
-  /// bit-for-bit unchanged. For `EmaRenormalized` it engages whenever the
-  /// accumulated mass falls below about `2^-948`, including folds whose products
-  /// are still normal — where it monotonically turns a sub-floor direction into
-  /// `NonFinite` (an engagement boundary a regression test pins); no realizable
-  /// `f32` workload reaches that regime. See the `aggregate` module's Input domain
-  /// note.
+  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
+  /// fold whose heaviest window carries its own accumulates, so those verdicts
+  /// are bit-for-bit unchanged. It engages whenever the accumulated mass falls below about
+  /// `2^-948`, including folds whose products are still normal — where it
+  /// monotonically turns a sub-floor direction into `NonFinite` (an engagement
+  /// boundary a regression test pins).
+  ///
+  /// **This bound is absolute, so it is sound only against a quantity carried in
+  /// the embedding's own units** — the accumulator's norm and `M`, which the
+  /// input domain bounds below, and not a dimensionless *weight*, whose scale a
+  /// caller sets and which every policy divides back out. Reaching the regime
+  /// therefore takes an unbounded weight ratio: `EmaRenormalized`'s decaying
+  /// recency factors, or a `CoverageWeightedMean` fold whose fullest windows are
+  /// all zero. No realizable `f32` workload gets there. See the `aggregate`
+  /// module's Input domain note.
   const MIN_GATE_THRESHOLD: Self;
 
-  /// Widen an `f32` configuration value — a [`Span::coverage`], or one of the
-  /// determinacy gate's own dimensionless constants — into this domain. Exact
-  /// for every implementor.
+  /// Widen one of the determinacy gate's own dimensionless constants — the `16`
+  /// its threshold carries — into this domain. Exact for every implementor.
   ///
-  /// A smoothing factor does **not** arrive this way. It multiplies an
-  /// accumulator, so it is configured at the accumulator's own width and widens
-  /// through [`from_f64`](Real::from_f64); a coverage is a geometric fraction of
-  /// a window, computed in `f32` and never accumulated in.
+  /// Nothing the fold *multiplies an embedding by* arrives this way any more.
+  /// Both such weights — an EMA smoothing factor and a [`Span::coverage`] — are
+  /// resolved at the accumulator's own width and reach a `Real` through
+  /// [`from_f64`](Real::from_f64); a coverage stopped coming through here in
+  /// `0.3.0`, when it stopped being typed by its provenance. What is left is a
+  /// small exact integer written into a threshold, which is not a weight and
+  /// never was a tuning knob, so the narrow constructor names it without
+  /// implying either.
   ///
   /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f32(x: f32) -> Self;
 
-  /// Widen an `f64` configuration value — an EMA smoothing factor — into this
-  /// domain. Exact for every implementor, and the identity for `f64`.
+  /// Widen an `f64` value the fold will multiply an embedding by — an EMA
+  /// smoothing factor, or a [`Span::coverage`] — into this domain. Exact for
+  /// every implementor, and the identity for `f64`.
   ///
   /// Every implementor of this trait *is* the compute domain (`Real` is
   /// `Scalar<Compute = Self>`), and that domain is `f64` for every shipped
@@ -220,9 +283,63 @@ pub trait Real:
   /// constructors — `aggregate::EmaRenormalized::new` and
   /// `smooth::VectorEma::new`, named rather than linked because both sit behind
   /// `alloc` and this tier is featureless — take the compute domain itself
-  /// rather than widening into it. What still reaches them through here is the
-  /// serde selector `AggregatePolicyKind`, a wire value read before any compute
-  /// scalar exists.
+  /// rather than widening into it. Two kinds of value cannot be asked for in the
+  /// compute domain because they exist before one does, and both reach it
+  /// through here instead: the serde selector `AggregatePolicyKind`, a wire value
+  /// read before any embedding, and a `Span::coverage`, which the planner derives
+  /// from two `usize`s in a tier that has no compute scalar at all. Neither is
+  /// configured at the accumulator's width; both are nonetheless resolved at it,
+  /// because what a value multiplies is what decides how finely it must be
+  /// carried.
+  ///
+  /// # Not purely additive
+  ///
+  /// Sealing prevents a downstream *implementation* of `Real`; it says nothing
+  /// about *method resolution* at a call site, and an associated function
+  /// reached through a type parameter is exactly as exposed to that as the
+  /// `Debug` supertrait documented above is. Generic code bounded on `Real`
+  /// **and** on a local trait that also names a `from_f64` associated function
+  /// saw one candidate at `0.2.0` and sees two here:
+  ///
+  /// ```compile_fail,E0034
+  /// use windit::scalar::Real;
+  ///
+  /// trait LocalFromF64 {
+  ///   fn from_f64(x: f64) -> Self;
+  /// }
+  ///
+  /// fn widen<T: Real + LocalFromF64>(x: f64) -> T {
+  ///   T::from_f64(x) // E0034: multiple applicable items in scope
+  /// }
+  /// ```
+  ///
+  /// An associated function has no receiver to name the trait through, so the
+  /// fix is fully qualified syntax rather than `Debug`'s `Trait::method(&x, ..)`
+  /// shape, and it is likewise stable against any future addition to either
+  /// trait:
+  ///
+  /// ```
+  /// use windit::scalar::Real;
+  ///
+  /// trait LocalFromF64 {
+  ///   fn from_f64(x: f64) -> Self;
+  /// }
+  ///
+  /// fn widen<T: Real + LocalFromF64>(x: f64) -> T {
+  ///   <T as Real>::from_f64(x)
+  /// }
+  /// ```
+  ///
+  /// **The function is kept**: it is the only way a coefficient resolved before
+  /// a compute scalar exists in scope — the wire alpha
+  /// `AggregatePolicyKind::into_policy` reads, or a `Span::coverage` computed in
+  /// a tier with no compute scalar at all — reaches the accumulator's own width
+  /// instead of rounding through `f32` first. What is corrected is the claim,
+  /// not the design: `cargo semver-checks` misses this the same way it missed
+  /// the `Debug` break, because it models items appearing and disappearing
+  /// rather than ambiguity at a use site.
+  ///
+  /// [`Span::coverage`]: crate::plan::Span::coverage
   fn from_f64(x: f64) -> Self;
 
   /// The square root, for L2 norms.
