@@ -9,10 +9,25 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## 0.2.1
 
 Additive: one new smoother, the streaming sibling of an aggregation policy that
-already existed. Nothing is removed, no signature changes, and `0.2.0` code
-compiles unchanged — including code that globs `windit::prelude` alongside its
-own module. That last clause is why the new type is **not** in the prelude: see
-below.
+already existed. Nothing is removed and no signature changes: every `0.2.0` item
+keeps its shape, and `cargo semver-checks` agrees (196 checks, 196 passed). That
+is an API-**shape** verdict and is not evidence about source compatibility —
+it does not model downstream name resolution at all.
+
+Stated precisely, because the earlier blanket claim that "`0.2.0` code compiles
+unchanged" was false:
+
+- **Guaranteed.** The prelude is unchanged, so `use windit::prelude::*;`
+  resolves exactly as it did at `0.2.0`, including alongside a glob of the
+  dependent's own module that happens to export a `VectorEma`.
+- **Not guaranteed, and not guaranteeable by any release that adds a public
+  name.** A dependent that globs the *module* — `use windit::smooth::*;`
+  together with `use their_own::*;` where the other glob also supplies
+  `VectorEma` — compiles at `0.2.0` and fails here with `E0659`, reported at
+  the use site. Adding a public item anywhere carries that hazard; it is not
+  special to the prelude, which is why the paragraph below argues about
+  *exposure* rather than about safety. If your build globs `windit::smooth`,
+  check for the collision before taking this release.
 
 ### Added
 
@@ -43,18 +58,45 @@ below.
   The equivalence is exact in exact arithmetic and **not bit-exact in
   floating point**, and cannot be made so: the aggregate materializes each weight
   and folds the prefix with Neumaier compensation, this carries a two-term
-  recurrence. What holds — and what the tests establish across prefix lengths,
-  smoothing factors and storage widths — is that determinate prefixes agree to
-  within the sum of the two error bounds, that neither side fabricates a
-  direction out of cancellation, and that between those two regimes there is a
-  narrow band where the verdicts may differ *in one direction only*: this
-  smoother is the more conservative of the two. Its determinacy gate keeps the
+  recurrence. What the tests establish across prefix lengths, smoothing factors
+  and storage widths is that determinate prefixes agree to within the sum of the
+  two error bounds and that neither side fabricates a direction out of
+  cancellation. **Near either threshold the verdicts can differ in *either*
+  direction**, and no ordering between the two thresholds is claimed: a
+  three-window prefix at `alpha = 0.3` is emitted by the aggregate and refused
+  here, and the exact-bit case `alpha = 0x3e99999a` over the one-dimensional
+  windows `0x3f0ca8ca28200000`, `0xbf20b7cb3226ac2d`, `0xbc2767b60c530643` puts
+  both accumulators on `0x3c0c160dbb1cff8d` with the two thresholds one ulp
+  apart the other way, so this side emits where the aggregate refuses. Both are
+  regression tests.
+
+  **The gate's contract is self-contained: it refuses when the accumulator is
+  within its own error bound of zero.** That is provable from this type's own
+  recurrence and says nothing about how another code path rounds; whether the
+  two siblings agree on a given prefix is measured, not promised. (An earlier
+  draft of this entry claimed this smoother was never the less conservative of
+  the two. The induction behind it compared against the mass an *ideal* fold
+  would accumulate, and `EmaRenormalized` rematerializes its weights instead —
+  so the ordering does not survive its actual roundings.) The gate keeps the
   aggregate's shape, constant and absolute floor
   (`16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD`) and its scale-aware
   renormalization is the aggregation half's own routine, but the mass `M` is the
   recurrence's, which carries the damped rounding of every step rather than the
   term magnitudes of one — the error a recurrence propagates is not the error a
-  fold commits. `alpha` clamps into `[0, 1]` at construction, NaN to `0.0`,
+  fold commits.
+
+  A step that rounds nothing charges nothing: `alpha = 0` (an exact hold) and
+  `alpha = 1` (an exact pass-through) accumulate no mass at all. Without that
+  rule a held seed still charged `|s_0|` a push, so the threshold grew linearly
+  and reached the seed's own magnitude after `2^48` pushes, after which the gate
+  refused the hold forever. The mass does still grow at every other coefficient,
+  and the horizon where it would overtake a determinate accumulator
+  (`alpha < 2^-48`, upward of `2^48` pushes) is documented as reachable in
+  principle rather than argued away. The published error bound now carries the
+  absolute term the subnormal range needs — `|e_t| <= 2u * M_t + t * 2^-1074` —
+  since a purely relative bound is false there; the gate's `MIN_GATE_THRESHOLD`
+  floor dominates that term for every epoch with `t * sqrt(dim) <= 2^74`, so no
+  verdict ever turned on it. `alpha` clamps into `[0, 1]` at construction, NaN to `0.0`,
   exactly as `smooth::Ema` does — the smoother idiom, not the aggregate's
   deferred `AlphaOutOfRange`.
 
@@ -76,16 +118,18 @@ below.
   advanced the accumulator, because it was a real observation and the prefix the
   aggregate would fold includes it.
 
-  **Not re-exported from the prelude.** Adding a name to a glob prelude is the
-  one additive change that can still break a downstream build: a crate with its
-  own `VectorEma` brought in by `use other::*;` alongside `use
-  windit::prelude::*;` compiles against 0.2.0 and fails against a prelude
-  carrying the name, with `E0659` at the use site. `cargo-semver-checks` does not
-  model downstream glob resolution, so its green result says nothing about this;
-  the break was reproduced directly. A release whose whole value is that it can
-  be taken without thinking does not spend that on saving one `use` line —
-  `use windit::smooth::VectorEma;` — and the prelude is where the name can go at
-  the next minor, when a break is expected. Unlike the three scalar smoothers it
+  **Not re-exported from the prelude.** Adding a name to a glob prelude and
+  adding one to a module carry the same hazard — `E0659` at a downstream use
+  site where two globs both supply the name — so keeping it out of the prelude
+  buys *less* exposure, not safety, and the release note above no longer claims
+  otherwise. The difference is real all the same: `use windit::prelude::*;` is
+  the import this crate documents and asks every dependent to write, while
+  `use windit::smooth::*;` is suggested nowhere. Removing the larger exposure
+  costs a dependent one line, `use windit::smooth::VectorEma;`. Both breaks were
+  reproduced directly rather than argued from the language reference;
+  `cargo-semver-checks` passes either way, because it does not model downstream
+  glob resolution. The prelude is where the name can go at the next minor, when
+  a source break is expected and can be announced. Unlike the three scalar smoothers it
   gates on `alloc` rather than living in the featureless core tier: its state is
   one accumulator component per embedding dimension, which is a heap buffer and
   not the O(1) that tier admits. The buffers are grown on the first push of an

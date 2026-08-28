@@ -19,13 +19,15 @@
 //! `AggregatePolicyKind` under `serde`.
 //!
 //! The vector smoother `smooth::VectorEma` is deliberately **not** here, and is
-//! imported by path. Adding a name to a glob prelude is the one additive change
-//! that can still break a downstream build: a crate that globs both this module
-//! and one of its own carrying the same name stops compiling with `E0659`,
-//! ambiguity being reported at the use site rather than at the import.
+//! imported by path. A crate that globs both this module and one of its own
+//! carrying the same name stops compiling with `E0659`, ambiguity being
+//! reported at the use site rather than at the import — and
 //! `cargo-semver-checks` does not model that, so its verdict is not evidence
-//! either way. A release that claims every earlier program still compiles has to
-//! leave the glob alone; the next minor is where the name can join it.
+//! either way. Adding the name to `smooth` carries the same hazard for anyone
+//! who globs *that* module, so this is a reduction in exposure rather than a
+//! guarantee: this prelude is the glob the crate documents and asks every
+//! dependent to write, and `smooth::*` is a glob it suggests nowhere. The next
+//! minor, where a source break can be announced, is where the name can join.
 
 pub use crate::{
   // Featureless and always available: the value, geometry, and scalar types, the
