@@ -932,6 +932,11 @@ impl VectorEma {
 /// An empty accumulator *is* the unseeded state: [`reset`](Smoother::reset)
 /// clears the buffers without releasing their capacity, so a new epoch re-seeds
 /// without allocating.
+///
+/// The `E: Vector` bound is structural, not behavioural: the buffers are
+/// `Vec<ComputeOf<E>>` — a projection through `E`'s associated `Scalar` — so the
+/// field types cannot be *named* without it, and it therefore cannot be narrowed
+/// onto the impls that call `E`'s methods. Nothing here stores an `E`.
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub struct VectorEmaState<E: Vector> {
@@ -973,6 +978,14 @@ impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
       .finish()
   }
 }
+
+// `C: Real` on this helper and the two below it is the narrowest bound the crate
+// offers, not a convenience reach for the whole numeric surface: `ZERO`, `ONE`,
+// `EPSILON`, `MIN_GATE_THRESHOLD`, `abs`, and `from_f32` are declared on `Real`
+// and on nothing narrower, and `l2_norm`/`l2_renorm` demand it in turn. The type
+// parameter is load-bearing too — `ComputeOf<E>` reaches these as an
+// unnormalized projection, so a monomorphic `f64` signature would not accept the
+// buffers even though `Real` is sealed to `f64` alone.
 
 /// Fit `buf` to exactly `dim` zeroed components, reusing whatever capacity a
 /// previous epoch left.
