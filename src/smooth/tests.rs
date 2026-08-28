@@ -2828,9 +2828,10 @@ fn vector_ema_gate_and_the_aggregate_agree_at_every_prefix_length() {
   // aggregate's own. Every one of those is a prefix the aggregate calls
   // indeterminate, so the streaming sibling must call it indeterminate too.
   //
-  // The `1e-3` and `4.0` factors keep the target inside the band with margin
-  // rather than on either edge, so no verdict here turns on a last-bit
-  // rounding difference between the two folds.
+  // The residue is aimed at the GEOMETRIC MEAN of the two thresholds, and the
+  // band is required to be at least 1.2 wide before the case counts, so it
+  // clears both edges by the same factor and no verdict here turns on a
+  // last-bit rounding difference between the two folds.
   const DIM: usize = 4;
   let mut rng = 0x5eed_1234_9abc_def0u64;
   for alpha in [0.75f32, 0.5, 0.3, 0.2, 0.1] {

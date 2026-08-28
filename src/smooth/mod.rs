@@ -866,6 +866,16 @@ impl SmoothPolicy<f32> for CadenceEma {
 /// there on this threshold is never the smaller of the two: see
 /// *A recurrence, not a fold* above for what that buys and what it costs.
 ///
+/// The mass grows with the epoch — geometrically toward `max|x| / alpha`, or
+/// linearly at an `alpha` so small that `1 - alpha` rounds to exactly `1` — so
+/// far enough out the threshold would in principle overtake a determinate
+/// accumulator. It cannot be reached. That needs `32 * u > alpha`, so
+/// `alpha < 2^-48`, and at such an `alpha` the mass takes more than `2^48`
+/// pushes to grow that far; `alpha = 0`, where the accumulator is a held seed
+/// and the mass grows by `|x_0|` a push, meets the same `2^48` bound. The
+/// error a recurrence propagates really does accumulate, and this is the
+/// horizon at which allowing for it would start to cost something.
+///
 /// # Dimension
 ///
 /// The first push after construction (or after a
