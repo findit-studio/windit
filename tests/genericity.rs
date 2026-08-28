@@ -631,6 +631,86 @@ fn value_free_stages_carry_a_non_f32_payload() {
   );
 }
 
+/// Smooth any embedding stream at a coefficient in that embedding's own compute
+/// domain, naming no scalar.
+///
+/// The downstream half of the coefficient's type: `VectorEma<C: Real = f64>`'s
+/// `SmoothPolicy` impl is for `VectorEma<ComputeOf<E>>`, so this function needs
+/// `E: Vector` and nothing else — no `where ComputeOf<E>: ...` clause, and no
+/// turbofish at the constructor. A shape that made a dependent add a bound here
+/// would be the wrong shape.
+fn smooth_any<E: Vector + Clone>(
+  windows: &[Windowed<E>],
+  alpha: ComputeOf<E>,
+) -> Result<Vec<Windowed<E>>, WinditError> {
+  VectorEma::new(alpha).smooth(windows)
+}
+
+/// The aggregation twin of [`smooth_any`], for the same reason.
+fn fold_any<E: Vector>(
+  windows: &[WindowEmbedding<E>],
+  alpha: ComputeOf<E>,
+) -> Result<E, WinditError> {
+  aggregate(&EmaRenormalized::new(alpha), windows)
+}
+
+#[test]
+fn ema_coefficients_take_the_compute_domain_with_no_annotation() {
+  // The ergonomics contract for the coefficient's type, asserted from OUTSIDE
+  // the crate. Both EMA configurations carry `C: Real` with a `= f64` default,
+  // and a dependent must never have to name it.
+  //
+  // `TestEmbedding` stores `f32` and computes in `f64`, so this also pins which
+  // domain the default is: the embedding's COMPUTE domain, not its storage. A
+  // coefficient on the storage grid could not express the value below at all.
+  let fine = 1.0 - 1.0 / 1_073_741_824.0; // 1 - 2^-30, exact in f64
+  assert_eq!(fine as f32, 1.0, "no f32 is nearer to this alpha than 1.0");
+
+  let spans = WindowPlan::spans(&WindowOptions::new(4).with_overlap(2), 12).expect("spans");
+  let windows: Vec<Windowed<TestEmbedding>> = spans
+    .iter()
+    .enumerate()
+    .map(|(i, span)| {
+      let raw = [1.0 + i as f64, 2.0 - i as f64, 0.5];
+      Windowed::new(
+        TestEmbedding::from_unnormalized(&raw).expect("embedding"),
+        *span,
+      )
+    })
+    .collect();
+
+  // A bare float literal at both constructors, no turbofish anywhere.
+  let smoothed = VectorEma::new(0.3).smooth(&windows).expect("smooth");
+  assert_eq!(smoothed.len(), windows.len());
+  assert_eq!(VectorEma::new(fine).alpha(), fine, "and it is kept, in f64");
+  assert_eq!(EmaRenormalized::new(fine).alpha(), fine);
+
+  // Through the generic helpers above, which name no scalar: `ComputeOf<E>` is
+  // inferred from the windows, and the literal flows into it.
+  let via_generic = smooth_any(&windows, 0.3).expect("smooth_any");
+  assert_eq!(via_generic.len(), smoothed.len());
+  for (a, b) in via_generic.iter().zip(&smoothed) {
+    assert_eq!(a.value().as_slice(), b.value().as_slice());
+    assert_eq!(a.span(), b.span());
+  }
+  let at_fine = smooth_any(&windows, fine).expect("smooth_any at a fine alpha");
+  assert_eq!(at_fine.len(), windows.len());
+
+  // And the aggregation twin, whose compute domain is inferred the same way.
+  let folded: Vec<WindowEmbedding<TestEmbedding>> = windows
+    .iter()
+    .map(|w| Windowed::new(w.value().clone(), w.span()))
+    .collect();
+  let one = fold_any(&folded, 0.3).expect("fold_any");
+  let direct = aggregate(&EmaRenormalized::new(0.3), &folded).expect("aggregate");
+  assert_eq!(one.as_slice(), direct.as_slice());
+
+  // The epoch limit still reads through the bare path: a type parameter default
+  // does not reach an associated-item path, so this resolving at all is what the
+  // constant's placement on `VectorEma<f64>` buys.
+  assert_eq!(VectorEma::MAX_EPOCH_STEPS, 1 << 50);
+}
+
 #[test]
 fn clap_per_window_embedding_stream_stays_per_window() {
   // The shape the CLAP audio-embedding consumer needs and that

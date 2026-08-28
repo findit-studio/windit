@@ -1019,12 +1019,36 @@ impl SmoothPolicy<f32> for CadenceEma {
 ///
 /// # Alpha
 ///
+/// **The coefficient is the compute scalar, not `f32`.** `VectorEma<C>` carries
+/// a `C: Real` — defaulted to `f64` exactly as
+/// [`AggregatePolicy`](crate::aggregate::AggregatePolicy) is, so
+/// `VectorEma::new(0.3)` needs no turbofish — and the
+/// [`SmoothPolicy`] impl ties that `C` to
+/// [`ComputeOf<E>`](crate::windowed::ComputeOf), the domain the recurrence
+/// actually runs in. A coefficient cannot be resolved more coarsely than the
+/// arithmetic it drives, which an `f32` field could not promise. Two
+/// consequences, both real:
+///
+/// - **The top of the range was a cliff, not a slope.** The only `f32` within
+///   `2^-24` of `1` is `1` itself, so every coefficient whose complement was
+///   below that — `1 - 2^-30`, say — arrived as exactly `1.0`. That is not a
+///   near-pass-through with a `2^-30` memory; it is an exact pass-through, which
+///   by *Exact steps* charges no mass and never advances the epoch. A whole
+///   family of filters was not approximated but deleted.
+/// - **The tuning grid did not match the arithmetic.** Adjacent `f32`
+///   coefficients are `2^-24` apart relatively, while the recurrence rounds at
+///   `2^-53` and its complement does not collapse until `2^-54`. A caller was
+///   tuning on a grid twenty-nine binary orders coarser than the regime the
+///   *Exact steps* rule is stated over, and two intended coefficients `2^-40`
+///   apart were the same filter.
+///
 /// [`new`](VectorEma::new) clamps `alpha` into `[0, 1]` exactly as
 /// [`Ema::new`] does, NaN included (it clamps to `0.0`, holding the seed
 /// direction). The smoothing path is therefore total in its coefficient, and
 /// `alpha` never reaches the error channel — the smoother idiom, not the
 /// aggregate's deferred [`AlphaOutOfRange`](WinditError::AlphaOutOfRange)
-/// check.
+/// check. Clamping costs `new` its `const`: the comparisons are
+/// [`Real`]'s `PartialOrd`, and a trait method cannot run in a `const fn`.
 ///
 /// # Allocation
 ///
@@ -1048,13 +1072,32 @@ impl SmoothPolicy<f32> for CadenceEma {
 /// [`Ema`], and [`CadenceEma`] do not.
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
+///
+/// `C: Real` sits on the type and not only on its impls, matching
+/// [`AggregatePolicy<C: Real = f64>`](crate::aggregate::AggregatePolicy): `C`
+/// names a *compute domain*, and `VectorEma<String>` is not a type this crate
+/// wants to be nameable. It is not needed to name the field — the test
+/// [`VectorEmaState`]'s own `E: Vector` bound has to meet — so it is a contract
+/// bound, kept deliberately, rather than a structural one.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VectorEma {
-  alpha: f32,
+pub struct VectorEma<C: Real = f64> {
+  alpha: C,
 }
 
+/// The `f64` compute domain's epoch limit.
+///
+/// On `VectorEma<f64>` rather than on the generic impl, and not because the
+/// concept is `f64`-specific: the *number* is. The horizon is derived from the
+/// compute domain's own unit roundoff — the gate stays conservative while
+/// `(1 - u)^(2t + 1) >= 1/16`, `u = EPSILON / 2` — so a second [`Real`] would
+/// carry a different one, computed from its own `EPSILON`, and there is no way
+/// to spell that as a `const` generic over `C` today. Stating it here keeps the
+/// bare path `VectorEma::MAX_EPOCH_STEPS` resolvable, which a `const` on the
+/// generic impl would not be: a type parameter's default does not apply to an
+/// associated-item path, so that spelling would demand
+/// `VectorEma::<f64>::MAX_EPOCH_STEPS` at every use site.
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl VectorEma {
+impl VectorEma<f64> {
   /// The longest epoch the determinacy gate is proven over: `2^50` charging
   /// steps.
   ///
@@ -1073,8 +1116,15 @@ impl VectorEma {
   /// workloads — at one window a millisecond an epoch would run for 35,700
   /// years before reaching it — it is the edge of what this type can prove about
   /// its own threshold.
+  ///
+  /// `f64` is the compute domain of every shipped storage scalar, so this is the
+  /// limit every embedding the crate can carry is held to; the enforcement in
+  /// [`Smoother::push`] reads the same value.
   pub const MAX_EPOCH_STEPS: u64 = VECTOR_EMA_MAX_EPOCH_STEPS;
+}
 
+#[cfg(any(feature = "std", feature = "alloc"))]
+impl<C: Real> VectorEma<C> {
   /// A renormalizing vector EMA with the given smoothing factor, clamped into
   /// `[0, 1]`.
   ///
@@ -1086,23 +1136,35 @@ impl VectorEma {
   /// [`EmaRenormalized`](crate::aggregate::EmaRenormalized)'s deferred
   /// rejection: a smoother's `push` must stay total in its configuration.
   #[must_use]
-  pub const fn new(alpha: f32) -> Self {
-    // A NaN fails both comparisons and falls through to `0.0`; `f32::clamp`
-    // would propagate it instead, and is not const.
-    let alpha = if alpha > 1.0 {
-      1.0
-    } else if alpha >= 0.0 {
-      alpha
-    } else {
-      0.0
-    };
-    Self { alpha }
+  pub fn new(alpha: C) -> Self {
+    Self {
+      alpha: clamp_coefficient(alpha),
+    }
   }
 
   /// The smoothing factor, always in `[0, 1]`.
   #[must_use]
-  pub const fn alpha(&self) -> f32 {
+  pub const fn alpha(&self) -> C {
     self.alpha
+  }
+}
+
+/// Clamp a smoothing factor into `[0, 1]`, NaN included.
+///
+/// Spelled as two comparisons rather than as `clamp`: a NaN fails both of
+/// them and falls through to `ZERO`, where `f64::clamp` would propagate it, and
+/// [`Real`] offers ordering but no `is_nan`. That makes the shape the *only*
+/// spelling available generically as well as the one [`Ema::new`] already uses,
+/// so the two smoothers cannot drift apart on the coefficient invariant the
+/// recurrence depends on.
+#[cfg(any(feature = "std", feature = "alloc"))]
+fn clamp_coefficient<C: Real>(alpha: C) -> C {
+  if alpha > C::ONE {
+    C::ONE
+  } else if alpha >= C::ZERO {
+    alpha
+  } else {
+    C::ZERO
   }
 }
 
@@ -1129,7 +1191,7 @@ impl VectorEma {
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub struct VectorEmaState<E: Vector> {
-  alpha: f32,
+  alpha: ComputeOf<E>,
   /// The raw EMA accumulator, `s_t`. Empty until the first push seeds it.
   state: Vec<ComputeOf<E>>,
   /// `M`: the gate's running mass — this step's two term magnitudes plus the
@@ -1161,15 +1223,18 @@ impl<E: Vector> Clone for VectorEmaState<E> {
 }
 
 /// Hand-written for the same reason as [`Clone`], and reporting the state's
-/// *shape* rather than its components: [`Real`] carries no [`Debug`] bound, so
-/// the accumulator's values cannot be formatted from here at all.
+/// *shape* rather than its numbers: [`Real`] carries no [`Debug`] bound, so
+/// neither the accumulator nor the coefficient can be formatted from here at
+/// all. The coefficient joined them when it became `ComputeOf<E>`; bounding this
+/// impl on `ComputeOf<E>: Debug` would print it, at the cost of making the impl
+/// unprovable from a bare `E: Vector` — a worse trade for a shape report.
+/// [`VectorEma::alpha`] reads the configured value directly.
 ///
 /// [`Debug`]: core::fmt::Debug
 #[cfg(any(feature = "std", feature = "alloc"))]
 impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.debug_struct("VectorEmaState")
-      .field("alpha", &self.alpha)
       .field("seeded", &!self.state.is_empty())
       .field("dim", &self.state.len())
       .field("steps", &self.steps)
@@ -1179,11 +1244,12 @@ impl<E: Vector> core::fmt::Debug for VectorEmaState<E> {
 
 // `C: Real` on this helper and the two below it is the narrowest bound the crate
 // offers, not a convenience reach for the whole numeric surface: `ZERO`, `ONE`,
-// `EPSILON`, `MIN_GATE_THRESHOLD`, `abs`, and `from_f32` are declared on `Real`
-// and on nothing narrower, and `l2_norm`/`l2_renorm` demand it in turn. The type
-// parameter is load-bearing too — `ComputeOf<E>` reaches these as an
-// unnormalized projection, so a monomorphic `f64` signature would not accept the
-// buffers even though `Real` is sealed to `f64` alone.
+// `EPSILON`, `MIN_GATE_THRESHOLD`, `abs`, `from_f32` (the gate's constant `16`)
+// and `from_f64` (the coefficient) are declared on `Real` and on nothing
+// narrower, and `l2_norm`/`l2_renorm` demand it in turn. The type parameter is
+// load-bearing too — `ComputeOf<E>` reaches these as an unnormalized projection,
+// so a monomorphic `f64` signature would not accept the buffers even though
+// `Real` is sealed to `f64` alone.
 
 /// Fit `buf` to exactly `dim` zeroed components, reusing whatever capacity a
 /// previous epoch left.
@@ -1397,9 +1463,23 @@ fn ema_step<C: Real>(state: &mut [C], mag: &mut [C], x: &[C], alpha: C) -> bool 
 /// Neither norm can overflow, because `push` confines every input component to
 /// the aggregation magnitude domain before the accumulator is written: `state`
 /// is a convex combination of in-domain components and so is bounded by
-/// [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE), and `M` by that over
-/// `alpha` — at most `2^400 / 2^-149` for any nonzero `f32` `alpha`, and
-/// `(t + 1) * 2^400` when `alpha` is zero. Both are far inside `f64`.
+/// [`MAX_AGG_MAGNITUDE`](Real::MAX_AGG_MAGNITUDE) (`2^400`), and `M` by the
+/// **epoch**, which is the only bound available and is the tighter one anyway.
+///
+/// A charging step adds `|alpha * x_t| + |c * s_{t-1}| <= 2^401` and carries the
+/// previous mass at `c <= 1`; a step that does not charge leaves `M` a copy
+/// (`c` is exactly `1`) or zeroes it (`c` is exactly `0`). So `M_t <= t * 2^401`
+/// over the epoch's `t` charging steps, and with
+/// [`MAX_EPOCH_STEPS`](VectorEma::MAX_EPOCH_STEPS) that is `M <= 2^451` and
+/// `||M|| <= sqrt(dim) * 2^451 <= 2^467` for any `dim <= 2^32` — far inside
+/// `f64`, and independent of the coefficient.
+///
+/// It has to be. The geometric bound `2 * MAX / alpha` this comment used to
+/// quote was read off `f32`'s smallest subnormal (`2^400 / 2^-149`), and the
+/// coefficient is no longer an `f32`: a nonzero `alpha` now reaches `2^-1074`,
+/// where `2 * 2^400 / alpha` is not representable at all. Its companion clause —
+/// `(t + 1) * 2^400` at `alpha = 0` — had already been overtaken by the
+/// exact-step rule, which charges an exact hold nothing.
 ///
 /// # Errors
 ///
@@ -1467,7 +1547,7 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
     // charging steps, so an unseeded state (or an epoch of exact holds) never
     // reaches it. *Epoch horizon* on `VectorEma` says why the limit exists and
     // what a caller does about it.
-    if self.steps >= VectorEma::MAX_EPOCH_STEPS {
+    if self.steps >= VECTOR_EMA_MAX_EPOCH_STEPS {
       return Err(WinditError::EpochTooLong);
     }
 
@@ -1491,12 +1571,7 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
       refit(&mut self.unit, x.len())?;
       refit(&mut self.state, x.len())?;
       self.state.copy_from_slice(x);
-    } else if ema_step(
-      &mut self.state,
-      &mut self.mag,
-      x,
-      <ComputeOf<E> as Real>::from_f32(self.alpha),
-    ) {
+    } else if ema_step(&mut self.state, &mut self.mag, x, self.alpha) {
       // Counted here rather than at the top of `push`, and only when the step
       // charged: the epoch's budget is the mass's relative precision, and a step
       // that left `mag` unrounded spent none of it. A push the gate then refuses
@@ -1524,7 +1599,7 @@ impl<E: Vector> Smoother<E> for VectorEmaState<E> {
 }
 
 #[cfg(any(feature = "std", feature = "alloc"))]
-impl<E: Vector> SmoothPolicy<E> for VectorEma {
+impl<E: Vector> SmoothPolicy<E> for VectorEma<ComputeOf<E>> {
   type Smoother = VectorEmaState<E>;
 
   fn smoother(&self) -> VectorEmaState<E> {
@@ -1532,13 +1607,8 @@ impl<E: Vector> SmoothPolicy<E> for VectorEma {
     // this re-clamp is currently unreachable — kept, exactly as `Ema`'s is, as
     // the last line of defence for the recurrence's coefficient invariant
     // (`alpha` in `[0, 1]` and never NaN) against any future construction path
-    // that bypasses `new`. NaN is handled explicitly since `f32::clamp` would
-    // propagate it.
-    let alpha = if self.alpha.is_nan() {
-      0.0
-    } else {
-      self.alpha.clamp(0.0, 1.0)
-    };
+    // that bypasses `new`.
+    let alpha = clamp_coefficient(self.alpha);
     // No allocation here: the trait's factory is infallible, so the buffers are
     // grown on the first push, which is not.
     VectorEmaState {
