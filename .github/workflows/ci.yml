@@ -357,12 +357,35 @@ jobs:
   #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
   #     #   working-directory: integration
 
-  # Prove what will actually be published, before it is published. Every other
-  # job here builds the working tree; none of them builds the *tarball*, whose
-  # contents are decided by `exclude` in Cargo.toml. A file the acceptance suite
-  # needs and `exclude` drops leaves the published crate broken for every consumer
-  # while CI stays green — which is precisely the class of failure that only
-  # shows up after `cargo publish`.
+  # Prove that the *tarball* is testable, before it is published. Every other job
+  # here builds the working tree; none of them builds the tarball, whose contents
+  # are decided by `exclude` in Cargo.toml. A file the acceptance suite needs and
+  # `exclude` drops leaves the published crate broken for every consumer while CI
+  # stays green — which is precisely the class of failure that only shows up
+  # after `cargo publish`.
+  #
+  # That is the whole of what this job establishes, and the rest of this comment
+  # is the half that matters: what a green here does **not** mean. It says
+  # nothing about whether the version in Cargo.toml can actually be published.
+  # `cargo publish --dry-run` used to run as the last step as though it did, and
+  # was removed after measuring that it cannot fail for that — or for anything
+  # else the `cargo package` step above does not already catch:
+  #
+  #   version already on crates.io   exit 0, with only `warning: crate
+  #                                  windit@0.2.0 already exists on crates.io
+  #                                  index` to show for it
+  #   no description, no license     exit 0 — from the dry run *and* from
+  #                                  `cargo package`; both merely warn
+  #
+  # (`RUSTFLAGS: -Dwarnings` does not reach either: those are Cargo's warnings,
+  # not rustc's.) It does not validate `keywords` or `categories` either — the
+  # registry rejects those only on a real publish. So its one distinguishing act
+  # was a second verification build of the same tarball.
+  #
+  # Publishing is a deliberate manual step; there is no release workflow. The
+  # version bump, the changelog entry and the registry's metadata rules are a
+  # human's responsibility at publish time. Nothing in CI gates them, and no job
+  # here should be read as claiming otherwise.
   package:
     name: package
     runs-on: ubuntu-latest
@@ -385,11 +408,6 @@ jobs:
           tar -xzf target/package/*.crate -C target/unpacked
           cd target/unpacked/*/
           cargo hack test --each-feature
-      # Registry-side validation the local package step does not perform. Note it
-      # is not a metadata check: a dry run does not validate `keywords` or
-      # `categories`, which the registry only rejects on a real publish.
-      - name: cargo publish --dry-run
-        run: cargo publish --dry-run
 
   # Execute the benchmarks. Criterion's `--test` runs every benchmark once
   # without measuring, which is what makes the equivalence claims in
