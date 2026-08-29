@@ -383,8 +383,10 @@
 //! damped by it, so neither half of that coefficient is window 0's: its chain
 //! roundings arrive undamped and its unit is `D`. The gap is `1 / (2 * alpha)`,
 //! and it is reachable because past the flush point the ladder does not decay to
-//! zero but **stalls** — `fl(p * b) == p` once `(1 - b) * p <= 2^-1075`, a fixed
-//! point of the subnormal grid sitting at exactly the derived `2^-1075 * D`.
+//! zero but **stalls** — `fl(p * b) == p` while `(1 - b) * p <= 2^-1075`, so the
+//! chain lands on a fixed point of the subnormal grid at `floor(D / 2)` ulps of
+//! `2^-1074`, within one grid step *below* the derived `2^-1075 * D` rather than
+//! on it. One step, not orders: nothing smaller than `D` is a bound.
 //!
 //! ```text
 //! alpha = 0.05, n = 20000, dim = 1, one 2^400 component on window 0, zeros elsewhere
@@ -1060,19 +1062,30 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 /// — which leaves the same factor of two for the roundings in `D` and the mass.
 ///
 /// **Nothing smaller than `D` will do at window 0**, because the ladder does not
-/// decay to zero: past the flush point it **stalls**. `fl(p * b) == p` as soon as
-/// `(1 - b) * p <= eta / 2`, that is `p <= (eta/2) * D`, so the chain lands on a
-/// fixed point of the subnormal grid that attains the derived bound. Measured,
+/// decay to zero: past the flush point it **stalls**. `fl(p * b) == p` while
+/// `(1 - b) * p <= eta / 2`, that is while `p <= (eta/2) * D`, so the chain lands
+/// on a fixed point of the subnormal grid at the largest grid multiple under that
+/// condition — `floor(D / 2)` ulps of `eta`. That is *within one grid step below*
+/// the derived bound, never on it, and one step is what makes the bound tight:
+/// any coefficient smaller than `D` is one the stall already exceeds. Measured,
 /// with `n` chosen just past the flush and `w[0]` in units of `eta`:
 ///
 /// ```text
 /// alpha      0.02  0.05   0.1  0.125  0.15   0.2   0.25   0.3   0.4  0.5  0.75   0.9
 /// w[0]/eta     24     9     5      4     3     2      2     1     1    0     0     0
 /// D          50.0  20.0  10.0    8.0  6.67   5.0    4.0  3.33   2.5  2.0  1.33  1.11
+/// D/2        25.0  10.0   5.0    4.0  3.33   2.5    2.0  1.67  1.25  1.0  0.67  0.56
 /// ```
 ///
-/// against a `(1 + alpha * D)` that is a flat `2` at every one of those
-/// coefficients. `alpha = 0.05` stalls at `9 * eta` where the general unit charges
+/// `w[0]/eta` is `floor(D/2)` in every column but `alpha = 0.5`, and that one is
+/// the tie-break rather than an exception to the bound: where `b` is a power of
+/// two the last representable step is exactly `b` ulps, at `b = 1/2` exactly the
+/// half-ulp rounding point, so round-half-to-even sends it to an exact zero
+/// instead of holding it at a fixed point. `0.75`'s quarter-ulp step falls short
+/// of the point outright, and `floor(D/2)` is `0` there anyway.
+///
+/// Against all of that, a `(1 + alpha * D)` that is a flat `2` at every one of
+/// those coefficients. `alpha = 0.05` stalls at `9 * eta` where the general unit charges
 /// `2 * eta`, so the oldest weight sits at `4.5x` its own supposed bound and one
 /// `2^400` component on it clears the gate;
 /// `the_oldest_weights_charge_is_not_damped_by_alpha` drives that.

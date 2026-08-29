@@ -953,16 +953,24 @@ public names:
   own text names as the exception.
 
   It is reachable because past the flush the ladder does not decay to zero, it
-  **stalls**: `fl(p * b) == p` once `(1 - b) * p <= 2^-1075`, a fixed point of the
-  subnormal grid sitting at exactly the derived `2^-1075 * D`.
+  **stalls**: `fl(p * b) == p` while `(1 - b) * p <= 2^-1075`, so the chain lands
+  on a fixed point of the subnormal grid at `floor(D / 2)` ulps of `2^-1074` —
+  within one grid step *below* the derived `2^-1075 * D` rather than on it, which
+  is still what makes `D` tight.
 
   ```text
   alpha      0.02  0.05   0.1  0.125  0.15   0.2   0.25   0.3   0.4  0.5  0.75   0.9
   w[0]/eta     24     9     5      4     3     2      2     1     1    0     0     0
   D          50.0  20.0  10.0    8.0  6.67   5.0    4.0  3.33   2.5  2.0  1.33  1.11
+  D/2        25.0  10.0   5.0    4.0  3.33   2.5    2.0  1.67  1.25  1.0  0.67  0.56
   ```
 
-  against a `(1 + alpha * D)` that quantizes to a flat `2` at every one of them.
+  `alpha = 0.5` is the one column where `w[0]/eta` is not `floor(D/2)`, and it is
+  the tie-break rather than an exception: where `b` is a power of two the last
+  representable step is exactly `b` ulps, at `b = 1/2` exactly the half-ulp
+  rounding point, so round-half-to-even reaches an exact zero instead of a fixed
+  point. Against all of that, a `(1 + alpha * D)` that quantizes to a flat `2` at
+  every one of them.
 
   ```text
   alpha = 0.05, n = 20000, dim = 1, one 2^400 component on window 0, zeros elsewhere

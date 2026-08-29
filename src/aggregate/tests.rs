@@ -1391,6 +1391,17 @@ fn the_oldest_weights_charge_is_not_damped_by_alpha() {
        {charge:e} against {:e}",
       w[0]
     );
+    // Exact rather than toleranced, because the unit is an integer number of
+    // `2^-1074`: there is no rounding to allow for, so `damping * eta` either
+    // quantizes to the derived coefficient or it does not.
+    assert_eq!(
+      charge,
+      damping * (f64::MIN_NORMAL * f64::EPSILON),
+      "alpha {alpha}: at the stall the relative term has underflowed to zero, so \
+       this charge is the oldest window's absolute unit and nothing else — the \
+       bare `D` at twice its derived size. Halving that unit, or damping it by \
+       `alpha`, has to show up right here."
+    );
   }
 
   // The verdict, on the production path, at the reviewer's row.
