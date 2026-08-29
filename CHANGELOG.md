@@ -941,6 +941,97 @@ public names:
   whole mass rides on the underflowed windows has no direction at working
   precision, and now says so.
 
+- **`aggregate::EmaRenormalized`'s *oldest* weight is charged the bound derived
+  for it** (the fourth round of the release review). *(A fifth re-measure: `90` of
+  `13818` swept aggregations move, every one `Ok -> Err`.)* `weights[0]` is the
+  bare ladder value `p_(n-1)`; every later weight is `fl(alpha * p_k)`. The
+  absolute unit `(1 + alpha * D)` the entry above added is derived from that final
+  multiplication — the `1` is its own rounding, the `alpha * D` is every chain
+  rounding damped by it — so **neither half of it is window 0's**, and window 0's
+  unit is the bare `D`. This is the fourth defect on this seam with the same
+  shape: a bound derived for the general term, applied to the element the module's
+  own text names as the exception.
+
+  It is reachable because past the flush the ladder does not decay to zero, it
+  **stalls**: `fl(p * b) == p` once `(1 - b) * p <= 2^-1075`, a fixed point of the
+  subnormal grid sitting at exactly the derived `2^-1075 * D`.
+
+  ```text
+  alpha      0.02  0.05   0.1  0.125  0.15   0.2   0.25   0.3   0.4  0.5  0.75   0.9
+  w[0]/eta     24     9     5      4     3     2      2     1     1    0     0     0
+  D          50.0  20.0  10.0    8.0  6.67   5.0    4.0  3.33   2.5  2.0  1.33  1.11
+  ```
+
+  against a `(1 + alpha * D)` that quantizes to a flat `2` at every one of them.
+
+  ```text
+  alpha = 0.05, n = 20000, dim = 1, one 2^400 component on window 0, zeros elsewhere
+    the ladder stalls at   9 * 2^-1074
+    the absolute charge    2 * 2^-1074    against a derived 20 * 2^-1074
+    acc                    0x1.2p-671     tau  0x1.0000000000048p-673
+    before                 Ok([1.0])      ideal contribution 2^-1079.94, eighty
+                                          binary orders under the 2^-1000 floor
+    now                    Err(NonFinite)
+  ```
+
+  **Nothing else on this seam is borrowed**, and that is measured rather than
+  argued: every position and every degenerate ladder against a scaled
+  double-double reference, over `425` coefficients — `25` named, `300`
+  pseudorandom, `2^-e` and `1 - 2^-e` for `e` in `1..=40`, and `1/k` for `k` in
+  `1..=40` — at every window count that straddles the flush.
+
+  ```text
+                            worst |w_i - W_i| / E_i
+    window 0        before   2^3.45   (undercharged by 10.9x, at alpha ~ 0.0223)
+                    after    2^-0.64
+    every other i   before   2^-1.00  (exactly the derived 2x margin, never exceeded)
+                    after    2^-1.00
+  ```
+
+  **The re-measure**, every aggregation compared as raw bits against the branch
+  point:
+
+  ```text
+  aggregations   13818 (dim 1/2/64, 14 window counts to 2288, seven embedding
+                 families, three coverage families, all four policies, EMA at
+                 twelve coefficients; plus 588 at the window count each small
+                 coefficient's ladder actually needs to reach the subnormal grid)
+  CoverageWeightedMean   882 compared    0 moved
+  MeanRenormalized       882 compared    0 moved
+  SaliencyWeighted       882 compared    0 moved
+  EmaRenormalized      11172 compared   90 moved, every one Ok -> Err
+  largest displacement   0 (no verdict moved numerically; every move is a verdict)
+  ```
+
+  The `90` are all at `alpha` of `0.02` / `0.05` / `0.1` / `0.125` / `0.15` with
+  `n` at the flush, and only in the window families that put mass on window 0.
+  `0` of the `13230` ordinary rows move, `alpha = 0.5` included.
+
+  **The other direction, stated plainly.** For `alpha` above about `2/3` the
+  oldest window's unit *narrows*, from `2 * 2^-1074` to `1 * 2^-1074`, because
+  `round(D)` is `1` there. No swept row changes verdict on it. A hand-built one
+  does: at `alpha = 0.9, n = 524`, a `2^400`-scale mass on the flushed window 0
+  against a live term of `3.485e-301` was refused and now answers — and that
+  flushed window's ideal contribution is exactly `0`, so the refusal was pure
+  over-rejection, of the same class the `(1 + D)` to `(1 + alpha * D)` correction
+  above removed. Soundness of the narrower unit is not an appeal to smallness: the
+  unit is formed on the subnormal grid, so `coefficient * (MIN_NORMAL * EPSILON)`
+  rounds the *coefficient* to an integer, and what the bound needs is
+  `round(D) >= D / 2` — true for every `D >= 1`, and `D = 1 / (1 - b) >= 1`
+  always.
+
+  **The ledger**, re-run over `aggregate` against this tree: `22` mutations, `20`
+  killed, one equivalent — dropping `ema_formation_slack`'s `error > C::ZERO` skip
+  cannot change an answer, because `0 * ||e_i||` is `0` and `slack + 0.0` is
+  `slack` — and one real survivor, now closed. The determinacy gate's `<=` was
+  unpinned at its own boundary: turning it into `<` passed the whole suite,
+  because every other input clears the threshold by orders or falls under it by
+  orders. The crate promises *at or below*, and
+  `the_gate_refuses_a_residue_exactly_at_the_threshold` now drives a residue that
+  lands on `tau` to the bit — one window of weight `1` on the domain floor
+  `2^-400`, against a `tau` of `2^-48 * 2^-400 + 2^-1000 + (2^-400 - 2^-448)`,
+  both `26f0000000000000`.
+
 - **The `aggregate` fold's Neumaier compensation and `l2_renorm`'s two-step
   division are pinned bit for bit**, closing four mutants the ledger had left
   standing. Found by re-running that ledger for the work above rather than

@@ -2106,6 +2106,78 @@ fn the_weight_underflow_slack_is_what_gates_the_witness() {
   );
 }
 
+/// A residue that lands exactly on the threshold is refused, not answered.
+///
+/// MUTATION-LEDGER pin for the comparison itself. The gate is
+/// `l2_norm(&acc) <= tau`, and the crate promises that `<=` in two places: the
+/// module note and [`weighted_sum_renorm`]'s own comment both say a result *at or
+/// below* the fold's rounding floor is reported as [`WinditError::NonFinite`].
+/// Nothing here pinned the boundary — turning that `<=` into `<` passed every
+/// other test in this file, because every other input clears the threshold by
+/// orders or falls under it by orders. The contract is not an accident of which
+/// side a float landed on: a residue sitting exactly on its own rounding floor is
+/// indistinguishable from that floor, and has no direction either.
+///
+/// Landing on it *exactly* is what the slack closure buys. `tau` is
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD + S`, and `S` is the only term a
+/// caller chooses, so it is the only knob that can put `tau` on a representable
+/// `acc` from inside the input domain. One window, weight `1`, and the domain's
+/// own floor as the component:
+///
+/// ```text
+/// 16 * EPSILON * ||M||    2^-48 * 2^-400   ->  2^-448
+/// + MIN_GATE_THRESHOLD    2^-1000              absorbed, far under 2^-448's ulp
+/// + S                     2^-400 - 2^-448  ->  2^-400  exactly
+/// acc                                          2^-400
+/// ```
+///
+/// Both sides come out `26f0000000000000`.
+#[test]
+fn the_gate_refuses_a_residue_exactly_at_the_threshold() {
+  // The domain's own lower bound, so the input is in range by construction and
+  // the component is an exact power of two the arithmetic below can land on.
+  let component = f64::MIN_AGG_MAGNITUDE;
+  assert_eq!(
+    component,
+    libm::ldexp(1.0, -400),
+    "the domain floor is 2^-400"
+  );
+
+  // `2^-448` is sixteen ulps of `2^-400`, so the difference is representable and
+  // the slack is not itself a rounding the boundary could drift on.
+  let slack = component - libm::ldexp(1.0, -448);
+  assert_eq!(
+    slack + libm::ldexp(1.0, -448),
+    component,
+    "the slack is exact, so `tau` lands on `acc` rather than near it"
+  );
+
+  // Recomputed the way `weighted_sum_renorm` forms them, in its order: one window
+  // of weight `1` makes the accumulator and the magnitude sum the same vector.
+  let emb = [component];
+  let acc_norm = l2_norm(&emb);
+  let tau = 16.0 * f64::EPSILON * l2_norm(&emb) + f64::MIN_GATE_THRESHOLD + slack;
+  assert_eq!(
+    acc_norm.to_bits(),
+    tau.to_bits(),
+    "the residue must land on the threshold to the bit: {acc_norm:e} against \
+     {tau:e}"
+  );
+  assert_eq!(
+    acc_norm.to_bits(),
+    0x26f0_0000_0000_0000,
+    "and the boundary is the domain floor itself"
+  );
+
+  let refs: &[&[f64]] = &[&emb];
+  let got = weighted_sum_renorm(refs, &[1.0], 1, |_, _| 1.0, |_| slack);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a residue exactly at the threshold is *at or below* it, so it is refused; \
+     got {got:?}"
+  );
+}
+
 /// The two degenerate ladders owe the gate nothing; the one that never decays
 /// owes it the complement's whole rounding, and `powi` reaches the same zero.
 ///
