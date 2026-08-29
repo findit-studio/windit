@@ -271,3 +271,41 @@ fn bf16_widens_exactly_and_lands_in_domain() {
   assert!(min_subnormal >= <f64 as Real>::MIN_AGG_MAGNITUDE);
   assert!(max <= <f64 as Real>::MAX_AGG_MAGNITUDE);
 }
+
+/// [`Real::MIN_NORMAL`] is the boundary where a rounding stops being relative,
+/// and `MIN_NORMAL * EPSILON` is the absolute grid below it.
+///
+/// Both are pinned rather than trusted: the `aggregate` module's weight-underflow
+/// slack is written in the second and decides which weights owe the first, so a
+/// constant off by a binade would move a verdict. `f64::MIN_POSITIVE` is the same
+/// value under a name that says the wrong thing — the smallest positive `f64` is
+/// `2^-1074`, a subnormal, and it is exactly the spacing this constant's product
+/// with `EPSILON` reproduces.
+#[test]
+fn min_normal_is_where_rounding_stops_being_relative() {
+  assert_eq!(<f64 as Real>::MIN_NORMAL, f64::MIN_POSITIVE);
+  assert_eq!(<f64 as Real>::MIN_NORMAL, libm::ldexp(1.0, -1022));
+  assert!(
+    <f64 as Real>::MIN_NORMAL.is_normal(),
+    "the boundary itself is normal"
+  );
+  let below = f64::from_bits(<f64 as Real>::MIN_NORMAL.to_bits() - 1);
+  assert!(
+    !below.is_normal() && below > 0.0,
+    "and the value one step under it is not: {below:e}"
+  );
+
+  // The absolute grid below the boundary, which is the unit the slack is written
+  // in. It is the spacing between adjacent subnormals, so half of it is the
+  // largest error an absolute rounding can make — and that half is not itself an
+  // `f64`, which is why the shipped term uses the whole spacing and gains a
+  // binade of headroom for its own arithmetic.
+  let spacing = <f64 as Real>::MIN_NORMAL * <f64 as Real>::EPSILON;
+  assert_eq!(spacing, libm::ldexp(1.0, -1074));
+  assert_eq!(spacing, f64::from_bits(1), "the smallest positive f64");
+  assert_eq!(
+    libm::ldexp(spacing, -1),
+    0.0,
+    "and half of it has no f64 at all, which is the whole of #17's mechanism"
+  );
+}

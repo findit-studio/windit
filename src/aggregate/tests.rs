@@ -3,9 +3,9 @@ use std::{vec, vec::Vec};
 #[cfg(feature = "serde")]
 use super::AggregatePolicyKind;
 use super::{
-  aggregate, keep_separate, l2_renorm, max_magnitude, normalizing_shift, weighted_sum_renorm,
-  AggregatePolicy, CoverageWeightedMean, EmaRenormalized, MeanRenormalized, SaliencyWeighted,
-  MIN_NORMAL_EXPONENT,
+  aggregate, ema_underflow_slack, keep_separate, l2_norm, l2_renorm, max_magnitude,
+  normalizing_shift, weighted_sum_renorm, AggregatePolicy, CoverageWeightedMean, EmaRenormalized,
+  MeanRenormalized, SaliencyWeighted, MIN_NORMAL_EXPONENT,
 };
 use crate::{
   plan::Span,
@@ -445,13 +445,21 @@ fn the_weight_lift_is_the_identity_on_every_synthetic_direct_api_slice() {
     dim: usize,
   ) -> Result<Vec<f64>, WinditError> {
     let largest = max_magnitude(coverages);
-    weighted_sum_renorm(embeddings, coverages, dim, move |i, _| {
-      if largest > 0.0 {
-        coverages[i] / largest
-      } else {
-        0.0
-      }
-    })
+    weighted_sum_renorm(
+      embeddings,
+      coverages,
+      dim,
+      move |i, _| {
+        if largest > 0.0 {
+          coverages[i] / largest
+        } else {
+          0.0
+        }
+      },
+      // The comparison is about the lift and nothing else, so the replica owes
+      // the gate the same nothing the policy does.
+      |_| 0.0,
+    )
   }
 
   let ratios: Vec<f64> = (1..=12)
@@ -946,89 +954,546 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
 }
 
 /// A weight whose *ideal* value has left `f64`'s exponent range is rounded
-/// **absolutely**, and the determinacy gate's absolute floor does not cover it.
+/// **absolutely**, and the determinacy gate must carry that error or a fold
+/// whose exact answer is zero comes back as a direction.
 ///
-/// CHARACTERIZATION of a live gap, not a guarantee — see
-/// <https://github.com/findit-studio/windit/issues/17>. The module note used to
-/// claim this regime was sound because a subnormal weight drives the fold's own
-/// products subnormal, leaving `MIN_GATE_THRESHOLD` to gate alone. That holds
-/// only while the components are `O(1)`. The [input domain](super#input-domain)
-/// admits components up to `2^400`, and one of those lifts the product of a
-/// subnormal weight back into the ordinary range, where the floor is nowhere
-/// near it.
+/// FALSIFIER for <https://github.com/findit-studio/windit/issues/17>. Before the
+/// weight-underflow slack this returned `Ok([1.0])` on every row below. The
+/// module note that preceded it claimed the regime was sound because a subnormal
+/// weight drives the fold's own products subnormal, leaving `MIN_GATE_THRESHOLD`
+/// to gate alone. That holds only while the components are `O(1)`. The
+/// [input domain](super#input-domain) admits components up to `2^400`, and one of
+/// those lifts the product of a subnormal weight back into the ordinary range,
+/// where the floor is nowhere near it.
 ///
-/// Nothing here is the repeated multiplication: at `alpha = 0.9` the chain's
-/// accumulated error is a few `u`, and the same input works at `alpha = 0.5`
-/// where every representable weight is exact to the bit. What breaks is that
-/// the ideal ratio between two adjacent weights — `1 / (1 - alpha)`, a factor
-/// of ten here — is not representable at the bottom of the subnormal grid, so
-/// the older weight rounds to zero while the newer one survives. Evaluating
-/// each weight once (`powi`) reaches the same zero: `alpha * 0.1^324` is not an
-/// `f64`, however it is computed.
+/// Nothing here is the repeated multiplication `ema_weight_error_accumulates_but_no_input_can_reach_the_gate`
+/// measures: the `alpha = 0.5` row is exact at every representable chain index,
+/// so it carries none of that error at all. What breaks is that the ideal ratio
+/// between two adjacent weights — `1 / (1 - alpha)` — is not representable at the
+/// bottom of the subnormal grid, so the older weight rounds to zero while the
+/// newer one survives. Evaluating each weight once (`powi`) reaches the same
+/// zero: `alpha * 0.1^324` is not an `f64`, however it is computed.
 #[test]
-fn ema_weights_below_the_exponent_range_fabricate_a_direction() {
-  let alpha = 0.9_f64;
+fn ema_weights_below_the_exponent_range_cannot_fabricate_a_direction() {
+  // Each row: (alpha, chain index of the surviving weight, the newer component).
+  // `c_hi = -c_lo / (1 - alpha)` makes the ideal pair cancel to zero by
+  // construction rather than by luck, so every row's exact answer is the zero
+  // vector and every `Ok` below would be fabricated.
+  let rows: [(f64, usize, f64); 4] = [
+    // The headline witness. `1 - 0.9` is exact (Sterbenz), and `b`'s significand
+    // is `900_719_925_474_099`, so building `c_lo` out of that significand makes
+    // `c_hi` the exact power of two `-2^83`.
+    (0.9, 323, libm::ldexp(900_719_925_474_099.0, 30)),
+    // THE row that identifies the mechanism: at a dyadic alpha the chain is exact
+    // at every representable index, so this witness carries none of the
+    // accumulated multiplication error #16 measured. `0.5 * 2^-1074 = 2^-1075` is
+    // simply not an `f64`, and `powi` reaches the same zero.
+    (0.5, 1073, libm::ldexp(1.0, 399)),
+    (1.0 - libm::ldexp(1.0, -30), 35, libm::ldexp(1.0, 60)),
+    (1.0 - libm::ldexp(1.0, -53), 20, libm::ldexp(1.0, 70)),
+  ];
+
+  for (alpha, k1, c_lo) in rows {
+    let b = 1.0 - alpha;
+    let c_hi = -c_lo / b;
+    assert_eq!(
+      c_lo + c_hi * b,
+      0.0,
+      "alpha {alpha}: the ideal weighted sum must be exactly zero"
+    );
+    assert!(
+      c_lo.abs() >= f64::MIN_AGG_MAGNITUDE
+        && c_lo.abs() <= f64::MAX_AGG_MAGNITUDE
+        && c_hi.abs() >= f64::MIN_AGG_MAGNITUDE
+        && c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+      "alpha {alpha}: both components must be ordinary in-domain values: \
+       {c_lo:e}, {c_hi:e}"
+    );
+
+    let n = k1 + 3;
+    let w = ema_ladder(alpha, n);
+    let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + 1));
+    assert!(
+      w[i1] > 0.0 && w[i1] < f64::MIN_NORMAL,
+      "alpha {alpha}: the surviving weight is a subnormal: {:e}",
+      w[i1]
+    );
+    assert_eq!(
+      w[i2], 0.0,
+      "alpha {alpha}: and its ideal partner has no f64 at all"
+    );
+
+    let mut components = vec![0.0_f64; n];
+    components[i1] = c_lo;
+    components[i2] = c_hi;
+    // The residue the *old* threshold would have judged this against, so the
+    // size of the gap stays on record rather than only its verdict.
+    let ratio = ema_gate_ratio(&w, &components);
+    assert!(
+      ratio > 100.0,
+      "alpha {alpha}: the residue cleared the old gate by {ratio:e}x"
+    );
+
+    let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+    let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+    assert!(
+      matches!(got, Err(WinditError::NonFinite)),
+      "alpha {alpha}, n = {n}: an exactly cancelling in-domain fold has no \
+       direction; got {got:?}"
+    );
+  }
+}
+
+/// The oldest window is in the ladder too, and its weight carries no `alpha`
+/// factor.
+///
+/// FALSIFIER for the one entry the backward pass builds separately.
+/// `weights[0]` is the bare `b^(n - 1)` the recurrence leaves for the window
+/// nothing preceded, so a slack that walked only `weights[1..]` would miss a
+/// cancelling pair straddling it — and that pair is the *worst* one for a
+/// term charged per window, because the ideal ratio across the seam is
+/// `alpha / b` rather than `1 / b`, which at `alpha = 1 - 2^-53` puts a factor
+/// of `2^53` of the mass on the window an off-by-one would drop.
+///
+/// Building the components as `c_1 = b * t` and `c_0 = -alpha * t` makes
+/// `alpha * c_1 + b * c_0` exactly zero by construction, and both of them
+/// exactly representable: `alpha` and `b` are `1 - 2^-53` and `2^-53`, whose
+/// significands fit.
+#[test]
+fn the_oldest_window_is_charged_for_its_own_underflowed_weight() {
+  let alpha = 1.0 - libm::ldexp(1.0, -53);
   let b = 1.0 - alpha;
   assert_eq!(
-    b, 0.099_999_999_999_999_98,
-    "1 - 0.9 is exact (Sterbenz), so the ideal complement is the one the fold \
-     uses and every weight error below is the exponent range and nothing else"
+    b,
+    libm::ldexp(1.0, -53),
+    "the complement is exact (Sterbenz)"
   );
 
-  // `b` is `900_719_925_474_099 * 2^-53`, so building the newer component out of
-  // that significand makes `c_hi = -c_lo / b` the exact power of two `-2^83`,
-  // and the ideal pair cancels to zero by construction rather than by luck.
-  assert_eq!(
-    libm::ldexp(900_719_925_474_099.0, -53),
-    b,
-    "b's significand"
+  // `53 * 20 = 1060`, so at `n = 22` the chain index of window 1 is the last
+  // whose weight survives and window 0's — one step older — is gone.
+  let n = 22_usize;
+  let w = ema_ladder(alpha, n);
+  assert!(
+    w[1] > 0.0 && w[1] < f64::MIN_NORMAL,
+    "window 1's weight is the surviving subnormal: {:e}",
+    w[1]
   );
-  let c_lo = libm::ldexp(900_719_925_474_099.0, 30);
-  let c_hi = -c_lo / b;
-  assert_eq!(c_hi, -libm::ldexp(1.0, 83), "so the quotient is exact");
+  assert_eq!(w[0], 0.0, "and window 0's, `b^(n - 1)`, has no f64 at all");
+
+  let t = libm::ldexp(1.0, 400);
+  let (c_lo, c_hi) = (b * t, -alpha * t);
   assert_eq!(
-    c_lo + c_hi * b,
+    alpha * c_lo + b * c_hi,
     0.0,
-    "the ideal weighted sum must be exactly zero"
+    "the ideal pair must cancel exactly"
   );
   assert!(
-    c_lo.abs() < f64::MAX_AGG_MAGNITUDE && c_hi.abs() < f64::MAX_AGG_MAGNITUDE,
-    "and both components must be ordinary in-domain values: {c_lo:e}, {c_hi:e}"
+    c_lo.abs() >= f64::MIN_AGG_MAGNITUDE && c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+    "and both components stay in domain: {c_lo:e}, {c_hi:e}"
   );
 
-  let k1 = 323_usize;
+  let mut components = vec![0.0_f64; n];
+  components[1] = c_lo;
+  components[0] = c_hi;
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+
+  // The mass window 0 carries, against the mass the rest of the ladder does: an
+  // off-by-one that skipped it would leave the slack four orders under the
+  // residue rather than twelve orders over it.
+  let slack = ema_underflow_slack(&w, &refs, b);
+  let without_zero = ema_underflow_slack(&w[1..], &refs[1..], b);
+  let residue = (w[1] * c_lo + w[0] * c_hi).abs();
+  assert!(
+    slack / residue > 1e12 && without_zero / residue < 1e-3,
+    "window 0 is where this input's mass is: {slack:e} with it, {without_zero:e} \
+     without, against a residue of {residue:e}"
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction; got {got:?}"
+  );
+}
+
+/// The weight-underflow slack is a per-dimension mass, not `n * max |e|`.
+///
+/// FALSIFIER for the *shape* of the term rather than for its presence. #17's
+/// prototype was `tau += n * 2^-1074 * max_ij |e_ij|`, a bound with no `dim` in
+/// it on a residue whose norm carries `sqrt(dim)`: give every dimension the same
+/// component and the residue grows as `sqrt(dim)` while `max |e|` does not move.
+///
+/// The construction is what pins the ratio the prototype has to beat. Cancelling
+/// across one chain step forces `c_hi = -c_lo / b`, so the prototype reads
+/// `max |e| = |c_lo| / b` while the residue rides on `|c_lo|`: with the surviving
+/// weight `w` the two sides are `w * |c_lo| * sqrt(dim)` against
+/// `n * 2^-1074 * |c_lo| / b`, and the flush condition `w * b < 2^-1075` caps
+/// their ratio at `sqrt(dim) / (2 * n)`. Reaching that cap wants the ladder to
+/// step *onto* the flush boundary rather than past it, which is a divisibility
+/// question: at `b = 2^-p` the last chain index is `ceil(1075 / p)` and the
+/// overshoot is `p * ceil(1075 / p) - 1075`, zero exactly when `p` divides
+/// `1075 = 5^2 * 43`. `p = 43` is the largest such `p` inside `f64`'s reach
+/// (`1 - 2^-54` is not an `f64`), and it needs only `n = 27` windows — so an
+/// eight-thousand-wide embedding clears the prototype by `1.68x`.
+///
+/// The slack this crate ships gates it by `4x` at *every* width, because it is
+/// the same norm the residue is.
+#[test]
+fn the_weight_underflow_slack_carries_the_dimension() {
+  let b = libm::ldexp(1.0, -43);
+  let alpha = 1.0 - b;
+  assert_eq!(1.0 - alpha, b, "the complement is exact (Sterbenz)");
+
+  // `43 * 25 = 1075`, so the chain's last nonzero weight is `alpha * 2^-1032`
+  // and its ideal successor is `alpha * 2^-1075` — just under the half-step that
+  // rounds to zero, which is the closest any power-of-two complement gets.
+  let k1 = 24_usize;
   let n = k1 + 3;
   let w = ema_ladder(alpha, n);
   let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + 1));
   assert!(
-    w[i1] > 0.0 && w[i1] < f64::MIN_POSITIVE,
-    "the surviving weight is a subnormal, one step above the flush: {:e}",
+    w[i1] > 0.0 && w[i1] < f64::MIN_NORMAL,
+    "the surviving weight is a subnormal: {:e}",
     w[i1]
   );
-  assert_eq!(
-    w[i2], 0.0,
-    "and its ideal partner, a tenth of it, has no f64 at all"
+  assert_eq!(w[i2], 0.0, "and its ideal partner has no f64 at all");
+
+  let dim = 8192_usize;
+  let c_lo = libm::ldexp(1.0, 300);
+  let c_hi = -c_lo / b;
+  assert_eq!(c_lo + c_hi * b, 0.0, "the ideal pair must cancel exactly");
+  assert!(
+    c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+    "and both components stay in domain: {c_hi:e}"
   );
 
+  let zero = vec![0.0_f64; dim];
+  let lo = vec![c_lo; dim];
+  let hi = vec![c_hi; dim];
+  let mut embeddings: Vec<&[f64]> = vec![zero.as_slice(); n];
+  embeddings[i1] = &lo;
+  embeddings[i2] = &hi;
+
+  // The prototype's term against the residue it has to cover. Measured, so the
+  // reason the shipped term is not the prototype stays on record as a number.
+  let prototype = (n as f64) * libm::ldexp(1.0, -1074) * c_hi.abs();
+  let residue = w[i1] * c_lo * libm::sqrt(dim as f64);
+  assert!(
+    (1.67..1.68).contains(&(residue / prototype)),
+    "the prototype must be the term that misses this: residue {residue:e} \
+     against its {prototype:e}, a ratio of {}",
+    residue / prototype
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &vec![1.0; n], dim);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction; got {:?}",
+    got.map(|v| v[0])
+  );
+}
+
+/// The slack is charged only where a weight actually left the exponent range, so
+/// an ordinary long EMA still answers.
+///
+/// The over-rejection guard, and the reason the term is not `n * 2^-1074 * max |e|`
+/// over the whole slice. At `alpha = 0.9` the ladder flushes to zero past about
+/// `326` windows, so a `400`-window fold has `92` windows whose weight is gone —
+/// and it is still an entirely ordinary EMA, whose answer is the newest windows'.
+/// Charging every window would put the slack at `400 * 2^-1074` against a fold
+/// whose mass is `~1`; charging the underflowed ones puts it at `~2^-1066`, and
+/// either way the answer must survive. What must *not* survive is the same slice
+/// with its mass moved onto the underflowed tail, which is the row above.
+#[test]
+fn an_ordinary_long_ema_still_answers_past_the_underflow_point() {
+  let alpha = 0.9_f64;
+  let n = 400_usize;
+  let w = ema_ladder(alpha, n);
+  let flushed = w.iter().filter(|&&x| x == 0.0).count();
+  assert!(
+    flushed > 70,
+    "the ladder must actually have left the exponent range: {flushed} of {n}"
+  );
+
+  // Unit windows alternating between two axes: an ordinary recency fold whose
+  // answer is dominated by the newest windows.
+  let a: [f64; 2] = [1.0, 0.0];
+  let bvec: [f64; 2] = [0.0, 1.0];
+  let embeddings: Vec<&[f64]> = (0..n)
+    .map(|i| if i % 2 == 0 { &a[..] } else { &bvec[..] })
+    .collect();
+  let got = EmaRenormalized::new(alpha)
+    .aggregate_values(&embeddings, &vec![1.0; n], 2)
+    .expect("an ordinary long EMA has a direction");
+  // The newest window is index 399 (odd), so the answer leans on `[0, 1]`.
+  assert!(
+    got[1] > got[0] && got[0] > 0.0,
+    "and it is the recency answer: {got:?}"
+  );
+
+  // The same ladder, with the whole mass moved onto a window whose weight is
+  // gone, is the regime that must be refused — the contrast that keeps the row
+  // above from being satisfiable by rejecting everything.
+  let zero: [f64; 2] = [0.0, 0.0];
+  let big: [f64; 2] = [libm::ldexp(1.0, 300), 0.0];
+  let mut tail: Vec<&[f64]> = vec![&zero[..]; n];
+  tail[0] = &big;
+  let refused = EmaRenormalized::new(alpha).aggregate_values(&tail, &vec![1.0; n], 2);
+  assert!(
+    matches!(refused, Err(WinditError::NonFinite)),
+    "a fold whose whole mass rides on a flushed weight has no direction, got \
+     {refused:?}"
+  );
+}
+
+/// `alpha = 0.5`'s dyadic weights are exact, and the slack must not touch them.
+///
+/// The published contract: at a dyadic `alpha` every materialized weight is the
+/// ideal one to the bit, so the ladder — and every fold it drives — is exact.
+/// Verified over `n` in `2..=199`, where `0.5^198 = 2^-198` is still a normal
+/// `f64` and nothing underflows, which is why the weight-underflow slack is
+/// exactly `C::ZERO` across the whole range and the fold is bit-identical to the
+/// one that shipped without it.
+#[test]
+fn the_dyadic_alpha_stays_bit_exact_across_the_documented_range() {
+  for n in 2..=199_usize {
+    let w = ema_ladder(0.5, n);
+    // The ideal ladder, built by exact power-of-two scaling rather than by the
+    // chain under test.
+    let mut ideal = vec![0.0_f64; n];
+    for (i, x) in ideal.iter_mut().enumerate().skip(1) {
+      *x = libm::ldexp(1.0, -((n - i) as i32));
+    }
+    ideal[0] = libm::ldexp(1.0, -((n - 1) as i32));
+    assert_eq!(w, ideal, "the dyadic ladder must be exact at n = {n}");
+    let sum = w.iter().fold(0.0_f64, |a, x| a + x);
+    assert_eq!(sum, 1.0, "and it must sum to exactly one at n = {n}");
+    assert!(
+      w[0] >= f64::MIN_NORMAL,
+      "and no weight in the documented range is subnormal at n = {n}: {:e}",
+      w[0]
+    );
+
+    // And the fold itself, through the policy: the standard basis makes the
+    // ladder observable up to the renormalization every policy ends with.
+    let basis: Vec<Vec<f64>> = (0..n)
+      .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+      .collect();
+    let refs: Vec<&[f64]> = basis.iter().map(Vec::as_slice).collect();
+    let folded = EmaRenormalized::new(0.5)
+      .aggregate_values(&refs, &vec![1.0; n], n)
+      .expect("a convex EMA over the basis has a direction");
+    let mut replica = ideal;
+    l2_renorm(&mut replica).expect("the ladder has a direction");
+    assert_eq!(folded, replica, "and the fold reproduces it at n = {n}");
+  }
+}
+
+/// The slack is what gates the witness, and the gate is otherwise untouched.
+///
+/// The attribution test: the same ladder, the same components, the same fold —
+/// only the third term of `tau` differs. With `C::ZERO` in its place the residue
+/// clears the threshold and `l2_renorm` turns it into a unit direction, which is
+/// exactly the `Ok([1.0])` this crate shipped; with the policy's own term it is
+/// refused. Nothing else about `weighted_sum_renorm` changed, so nothing else can
+/// be credited with the fix.
+#[test]
+fn the_weight_underflow_slack_is_what_gates_the_witness() {
+  let alpha = 0.9_f64;
+  let c_lo = libm::ldexp(900_719_925_474_099.0, 30);
+  let c_hi = -c_lo / (1.0 - alpha);
+  let (k1, n) = (323_usize, 326_usize);
+  let w = ema_ladder(alpha, n);
   let mut components = vec![0.0_f64; n];
-  components[i1] = c_lo;
-  components[i2] = c_hi;
-  let ratio = ema_gate_ratio(&w, &components);
+  components[n - 1 - k1] = c_lo;
+  components[n - 2 - k1] = c_hi;
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  let coverages = vec![1.0; n];
+
+  let without = weighted_sum_renorm(&refs, &coverages, 1, |i, _| w[i], |_| 0.0);
   assert!(
-    ratio > 100.0,
-    "the residue clears the gate by two orders of magnitude even with the \
-     absolute floor fully engaged, got {ratio:e}"
+    matches!(without.as_deref(), Ok([1.0])),
+    "with no slack the fold still fabricates, which is what #17 reported: \
+     {without:?}"
   );
 
-  // The verdict this pins is the defect. When #17 is fixed this assertion is
-  // what has to change, and the numbers above are what it has to change to.
-  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
-  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
-  assert!(
-    matches!(got.as_deref(), Ok([1.0])),
-    "TODAY a direction is fabricated from exact cancellation, at n = {n} and \
-     ordinary components; got {got:?}"
+  let with = weighted_sum_renorm(
+    &refs,
+    &coverages,
+    1,
+    |i, _| w[i],
+    |embs| ema_underflow_slack(&w, embs, 1.0 - alpha),
   );
+  assert!(
+    matches!(with, Err(WinditError::NonFinite)),
+    "and the policy's own term is the whole of the difference: {with:?}"
+  );
+
+  // The size of that term against the residue it has to cover, so the margin is
+  // on record rather than only the verdict.
+  let slack = ema_underflow_slack(&w, &refs, 1.0 - alpha);
+  let residue = w[n - 1 - k1] * c_lo;
+  assert!(
+    (11.0..12.0).contains(&(slack / residue)),
+    "the slack covers the residue by {}x",
+    slack / residue
+  );
+}
+
+/// The two exact ladders owe the gate nothing, and `powi` reaches the same zero.
+///
+/// FALSIFIER for the guards in [`ema_underflow_slack`] and for #16's named cure.
+/// Both `b == 0` (`alpha == 1`) and `b == 1` (any `alpha` under `2^-54`,
+/// including a subnormal one) produce a ladder every entry of which is exactly
+/// its ideal — zeros in the first case, a repeated exact `alpha` in the second —
+/// so a slack charged there would be pure over-rejection. Asserted on the helper
+/// rather than through a verdict, because for `b == 0` no in-domain fold can
+/// *show* the difference: the surviving weight is exactly `1`, so the fold's mass
+/// is a whole window's and outruns any term written in `2^-1074`. Removing the
+/// `b == 1` guard is the one that shows: the damping is `1 / (1 - b)`, which is
+/// infinite there, and every such fold would be refused.
+#[test]
+fn the_exact_ladders_owe_the_gate_nothing() {
+  let big = libm::ldexp(1.0, 400);
+  let cols: Vec<[f64; 2]> = vec![[big, 0.0], [0.0, big], [1.0, 1.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0; 3];
+
+  for alpha in [1.0_f64, 0.0, libm::ldexp(1.0, -60), libm::ldexp(1.0, -1074)] {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, 3);
+    assert_eq!(
+      ema_underflow_slack(&w, &embeddings, b),
+      0.0,
+      "alpha {alpha:e} makes an exact ladder {w:?}, which owes nothing"
+    );
+    // And it still answers, which is what the guard is protecting.
+    let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &coverages, 2);
+    assert!(got.is_ok(), "alpha {alpha:e}: {got:?}");
+  }
+  assert_eq!(
+    1.0 - libm::ldexp(1.0, -60),
+    1.0,
+    "and a small enough alpha really does leave the complement at exactly one"
+  );
+
+  // #16's named cure, checked against #17 rather than repeated: evaluating each
+  // weight once reaches the same zero, because the value is not an `f64` however
+  // it is computed. `0.9^324` underflows whichever way it is raised.
+  let alpha = 0.9_f64;
+  let b = 1.0 - alpha;
+  assert_eq!(ema_ladder(alpha, 326)[1], 0.0, "the chain reaches zero");
+  assert_eq!(
+    alpha * b.powi(324),
+    0.0,
+    "and so does powi, which is why #16's cure does not touch this"
+  );
+}
+
+/// The three policies whose weights are rounded relatively hand the gate an exact
+/// `C::ZERO`, and would not have moved even if they had not.
+///
+/// Two separate claims, because only one of them is structural. The shipped code
+/// gives [`CoverageWeightedMean`], [`MeanRenormalized`] and [`SaliencyWeighted`]
+/// a literal `C::ZERO`, and `tau + 0.0` is `tau` to the bit, so their verdicts are
+/// unchanged by construction — that is the reason the term is passed beside the
+/// weight function instead of being added to the shared threshold.
+///
+/// The second claim is the measurement that decision did **not** rest on: forcing
+/// an EMA-sized slack into those three folds anyway, over the regimes where it
+/// could plausibly decide something (a coverage ratio past the normal boundary, a
+/// fold whose heaviest window is all zero, components at both ends of the input
+/// domain), changes no verdict either. Their weights are bounded below — the
+/// `2^-1022` [`normalizing_shift`] guarantees, the constant `1`, a norm the domain
+/// puts at `2^-400` — so the mass they accumulate always outruns a term written in
+/// `2^-1074`. Recorded because "narrowing avoids a regression" would have been the
+/// obvious reason to narrow, and it is not the true one.
+#[test]
+fn a_forced_slack_would_change_no_relative_weight_policy_verdict() {
+  /// One row: a name, its two-dimensional windows, and their coverages.
+  type Case = (&'static str, Vec<[f64; 2]>, Vec<f64>);
+
+  let big = libm::ldexp(1.0, 400);
+  let small = libm::ldexp(1.0, -400);
+  let cases: [Case; 5] = [
+    (
+      "the heaviest window is all zero",
+      vec![[0.0, 0.0], [big, 0.0], [0.0, big]],
+      vec![1.0, libm::ldexp(1.0, -1021), libm::ldexp(1.0, -1021)],
+    ),
+    (
+      "a coverage ratio past the normal boundary",
+      vec![[big, 0.0], [0.0, big]],
+      vec![1.0, libm::ldexp(1.0, -1074)],
+    ),
+    (
+      "components at the domain floor",
+      vec![[small, 0.0], [0.0, small]],
+      vec![1.0, 1.0],
+    ),
+    (
+      "exact cancellation, which must stay refused",
+      vec![[big, small], [-big, small]],
+      vec![1.0, 1.0],
+    ),
+    (
+      "one heavy window against a far lighter one",
+      vec![[big, big], [small, -small]],
+      vec![1.0, libm::ldexp(1.0, -1000)],
+    ),
+  ];
+
+  for (name, cols, coverages) in cases {
+    let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+    // The largest slack any EMA ladder could hand this slice: every window
+    // charged, at the loosest damping the bound admits.
+    let mass = embeddings
+      .iter()
+      .map(|e| l2_norm(e))
+      .fold(0.0_f64, |a, x| a + x);
+    let forced: f64 = mass * (1.0 + coverages.len() as f64) * (f64::MIN_NORMAL * f64::EPSILON);
+    assert!(
+      forced > 0.0 || mass < 1.0,
+      "{name}: a slack that underflows to zero must be one that could not have \
+       mattered — mass {mass:e}, so the term is under 2^-1074 and the \
+       MIN_GATE_THRESHOLD floor carries it"
+    );
+
+    // Each policy's weight function verbatim, driven through the shared fold
+    // twice: once with the zero it is given and once with the forced slack.
+    let largest = max_magnitude(&coverages);
+    let shift = normalizing_shift(&coverages, largest);
+    let coverage_weight = |i: usize, _: &[f64]| {
+      if largest > 0.0 {
+        coverages[i].ldexp(shift) / largest
+      } else {
+        0.0
+      }
+    };
+    let mut norms = Vec::new();
+    for e in &embeddings {
+      norms.push(l2_norm(e));
+    }
+    let saliency_weight = |i: usize, _: &[f64]| norms[i];
+
+    let mut compared = 0;
+    macro_rules! both {
+      ($policy:literal, $w:expr) => {{
+        let shipped = weighted_sum_renorm(&embeddings, &coverages, 2, $w, |_| 0.0);
+        let taxed = weighted_sum_renorm(&embeddings, &coverages, 2, $w, |_| forced);
+        assert_eq!(
+          shipped, taxed,
+          "{name} / {}: a forced slack must decide nothing",
+          $policy
+        );
+        compared += 1;
+      }};
+    }
+    both!("CoverageWeightedMean", &coverage_weight);
+    both!("MeanRenormalized", |_: usize, _: &[f64]| 1.0);
+    both!("SaliencyWeighted", &saliency_weight);
+    assert_eq!(compared, 3, "{name}: all three policies must be driven");
+  }
 }
 
 #[test]
@@ -1567,6 +2032,136 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
   let mut out = Vec::new();
   recur(&mut a, n, &mut out);
   out
+}
+
+/// [`l2_renorm`](super::l2_renorm) divides by the scale and by the unit
+/// separately, and never forms the norm.
+///
+/// FALSIFIER for the other pair the ledger left standing. Both properties are
+/// claimed in the module note and neither was pinned: folding the two divisions
+/// into `x / (scale * unit)`, and deleting the `unit.is_finite()` guard, each
+/// passed the whole suite while moving nothing on a `1876`-row sweep — because
+/// [`check_inputs`](super::check_inputs)' `2^400` ceiling puts both regimes out
+/// of an aggregation's reach. `l2_renorm` is `pub(crate)` and
+/// [`VectorEma`](crate::smooth::VectorEma) renormalizes through it without that
+/// ceiling, so the properties are real; they are pinned here, at the routine,
+/// rather than left to a caller that cannot exercise them.
+#[test]
+fn the_renormalization_survives_a_norm_it_cannot_represent() {
+  // `sqrt(2) * f64::MAX` overflows, so `scale * unit` does too and a single
+  // combined division returns the zero vector. Two divisions by exact
+  // power-of-two relatives return the direction.
+  let mut diagonal = [f64::MAX, f64::MAX];
+  l2_renorm(&mut diagonal).expect("an ordinary diagonal has a direction");
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(
+    diagonal,
+    [want, want],
+    "the diagonal's direction must survive a norm that does not"
+  );
+
+  // And the sum of squares leaving the range in the other direction.
+  let mut tiny = [f64::MIN_POSITIVE, f64::MIN_POSITIVE];
+  l2_renorm(&mut tiny).expect("a subnormal-square diagonal has a direction");
+  assert_eq!(tiny, [want, want], "and so must its mirror image");
+
+  // A NaN never becomes the maximum, so it passes the scale check and surfaces
+  // in the sum of squares instead: the `unit.is_finite()` guard is the only
+  // thing between it and a vector of NaNs reported as `Ok`.
+  let mut poisoned = [1.0, f64::NAN];
+  assert!(
+    matches!(l2_renorm(&mut poisoned), Err(WinditError::NonFinite)),
+    "a NaN component must be refused, not divided by"
+  );
+  assert_eq!(
+    poisoned[0], 1.0,
+    "and a refused vector is left exactly as it was"
+  );
+}
+
+/// The fold is compensated, and the compensation is what the answer is made of.
+///
+/// FALSIFIER for [`neumaier_add`](super::neumaier_add), and a mutant the ledger
+/// had left standing: deleting the compensation, or its fold-back, or the
+/// magnitude branch inside it, **passed the whole suite** while moving `830` of
+/// `1876` swept aggregations by up to `2.1e-15`. Every existing row that could
+/// have seen it compares with a tolerance, and `2e-15` is inside all of them.
+/// This one compares bits.
+///
+/// Three windows at `alpha`-free uniform weight: `[1, 0]`, `[2^-60, 1]`,
+/// `[-1, 0]`. A naive left fold absorbs the `2^-60` into the partial sum `1` —
+/// `fl(1 + 2^-60) = 1` — and the later `-1` then cancels it away entirely, so
+/// dimension 0 comes back exactly zero and the answer is `[0, 1]`. The
+/// compensation is carrying that `2^-60` in `comp`, and folding it back is what
+/// puts it in the result. The gate sees the same `||M||` either way, so nothing
+/// but the compensation decides this.
+#[test]
+fn the_compensated_fold_keeps_a_term_a_naive_one_loses() {
+  let tiny = libm::ldexp(1.0, -60);
+  let cols: [[f64; 2]; 3] = [[1.0, 0.0], [tiny, 1.0], [-1.0, 0.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0; 3];
+
+  // The naive left fold, spelled out, so "what a naive one loses" is measured
+  // rather than asserted.
+  let mut naive = [0.0_f64; 2];
+  for e in &embeddings {
+    for (a, x) in naive.iter_mut().zip(*e) {
+      *a += *x;
+    }
+  }
+  assert_eq!(
+    naive,
+    [0.0, 1.0],
+    "a naive fold loses the term entirely, which is the point"
+  );
+
+  for (name, got) in [
+    (
+      "MeanRenormalized",
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .expect("in-domain fold"),
+    ),
+    (
+      "CoverageWeightedMean",
+      CoverageWeightedMean
+        .aggregate_values(&embeddings, &coverages, 2)
+        .expect("in-domain fold"),
+    ),
+  ] {
+    // Bit-for-bit: the surviving term is exactly `2^-60`, and the norm it is
+    // divided by is exactly one, so both components are exact.
+    assert_eq!(
+      (got[0].to_bits(), got[1].to_bits()),
+      (tiny.to_bits(), 1.0_f64.to_bits()),
+      "{name} must keep the compensated term: {got:?}"
+    );
+  }
+}
+
+/// The compensation's magnitude branch is load-bearing too.
+///
+/// The companion falsifier, for the half of [`neumaier_add`](super::neumaier_add)
+/// that chooses which operand to subtract from the new sum. `(acc - sum) + term`
+/// is the exact correction only while `|acc| >= |term|`; with the inequality the
+/// other way it is `(term - sum) + acc`, and a branchless fold that always takes
+/// the first form is wrong precisely when a large term lands on a small
+/// accumulator. Ordering the same three windows so the tiny one arrives *first*
+/// puts every subsequent add in that case.
+#[test]
+fn the_compensations_magnitude_branch_decides_the_answer() {
+  let tiny = libm::ldexp(1.0, -60);
+  let cols: [[f64; 2]; 4] = [[tiny, 0.0], [1.0, 1.0], [tiny, 0.0], [-1.0, 0.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let got = MeanRenormalized
+    .aggregate_values(&embeddings, &[1.0; 4], 2)
+    .expect("in-domain fold");
+  assert_eq!(
+    (got[0].to_bits(), got[1].to_bits()),
+    ((2.0 * tiny).to_bits(), 1.0_f64.to_bits()),
+    "both tiny terms must survive a fold that starts under them: {got:?}"
+  );
 }
 
 #[test]

@@ -6,6 +6,157 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- **`aggregate::EmaRenormalized` no longer fabricates a direction once its weight
+  ladder leaves `f64`'s exponent range** ([#17]). *(A fourth re-measure, and the
+  narrowest of the four: `0` of `1056` downstream aggregations move.)*
+
+  `EmaRenormalized` is the only built-in policy whose weight **range**, not merely
+  whose ratio, is unbounded. Past a window count of about
+  `1074 / log2(1 / (1 - alpha))` the ideal weight `alpha * (1 - alpha)^k` falls
+  under `Real::MIN_NORMAL` and then under half the subnormal spacing, where it is
+  rounded **absolutely** — and the ratio between two adjacent ideal weights,
+  `1 / (1 - alpha)`, cannot be represented at the bottom of that grid at all, so
+  the older of a cancelling pair rounds to zero while the newer survives. The
+  determinacy gate carried no term for that, and an exactly cancelling in-domain
+  fold came back as a direction:
+
+  ```text
+  alpha = 0.9, n = 326, dim = 1, two ordinary components near 1e24
+    exact ideal weighted sum   0
+    materialized w[323]        9.88e-324  a subnormal, one step above the flush
+    materialized w[324]        0          its ideal partner, a tenth of it
+    residue / threshold        102x       with MIN_GATE_THRESHOLD fully engaged
+    before                     Ok([1.0])  a direction fabricated from cancellation
+    now                        Err(NonFinite)
+  ```
+
+  The same input works at `alpha = 0.5` (`n = 1076`), `1 - 2^-30` (`n = 38`) and
+  `1 - 2^-53` (`n = 23`). **The `alpha = 0.5` row is what identifies the
+  mechanism**: that chain is exact at every representable index, so it carries
+  none of [#16]'s accumulated multiplication error — `0.5 * 2^-1074 = 2^-1075` is
+  simply not an `f64`, and `powi`, [#16]'s named cure, reaches the same zero.
+
+  **The threshold gains a third term, and the policy supplies it:**
+
+  ```text
+  tau = 16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD + S
+  S   = MIN_NORMAL * EPSILON * (1 + D) * sum_i ||e_i||   over the windows whose
+                                                         weight is below MIN_NORMAL
+  D   = 1 / (1 - fl(1 - alpha))                          the chain's own damping
+  ```
+
+  Where a weight's error is absolute the residue of an exactly cancelling fold is
+  `R_j = sum_i (w_i - W_i) * e_ij` against the **ideal** weights, so
+  `||R|| <= sum_i |w_i - W_i| * ||e_i||`: the *unweighted* window norms, a
+  quantity `||M||` does not contain.
+
+  Three things about that shape, each of which is a departure from the candidate
+  the issue prototyped (`tau += n * 2^-1074 * max_ij |e_ij|`):
+
+  - **It belongs to the policy, not to the shared gate.** `MIN_GATE_THRESHOLD`'s
+    soundness argument is "about products rather than about which policy formed
+    them"; **that framing does not survive a term about weights**, because a
+    weight's formation error is a property of whatever formed the weight. So `S`
+    is passed in beside the weight function. `MeanRenormalized` (an exact
+    constant `1`), `CoverageWeightedMean` (one correctly rounded division of a
+    lifted coverage) and `SaliencyWeighted` (a norm the input domain bounds
+    below) each hand in a literal `C::ZERO`, and `tau + 0.0` is `tau` to the bit,
+    so their verdicts are unchanged **by construction** rather than by argument.
+    Measured anyway, against `fix/16-ema-weights`, over ordinary plan-shaped
+    folds, ladders past the exponent range, subnormal-product folds and coverage
+    ratios past the normal boundary:
+
+    ```text
+    aggregations compared    1876     largest displacement   0
+    CoverageWeightedMean      469 compared    0 moved
+    MeanRenormalized          469 compared    0 moved
+    SaliencyWeighted          469 compared    0 moved
+    EmaRenormalized           469 compared   46 moved, every one Ok -> Err
+    ```
+
+    Forcing an EMA-sized slack into the other three anyway changes no verdict
+    either — their weights are bounded below, so the mass they accumulate always
+    outruns a term written in `2^-1074`. Recorded because "narrowing avoids a
+    regression" would have been the obvious reason to narrow, and it is not the
+    true one.
+  - **It is a norm, and the prototype was a scalar.** `n * max |e|` carries no
+    `dim`, and the residue's bound does: give every dimension the same component
+    and `||R||` grows as `sqrt(dim)` while `max |e|` does not move. The flush
+    condition caps the ratio between the two at `sqrt(dim) / (2 * n)`, and
+    reaching that cap is a divisibility question — at `b = 2^-p` the overshoot is
+    `p * ceil(1075 / p) - 1075`, zero exactly when `p` divides `1075 = 5^2 * 43`.
+    `p = 43` is the largest such `p` an `f64` complement can hold and needs only
+    `n = 27` windows, so an eight-thousand-wide embedding clears the prototype by
+    **1.68x** while the shipped term gates it by `4x` at every width.
+  - **It is charged only where a weight actually left the range.** A `400`-window
+    EMA at `alpha = 0.9` has `92` weights at or under the boundary and is an
+    entirely ordinary fold; `S` sits some `10^-321` under its own mass and decides
+    nothing. What is refused is the same slice with its mass moved onto the
+    underflowed tail.
+
+  Three alternatives lost, each for a measured reason rather than a preference.
+  **Refusing the fold when a weight underflows** turns every long EMA into an
+  error — at `alpha = 0.9` any `n` past `326`, which is ordinary use.
+  **Bounding `n` per `alpha`** is the same rejection wearing a precondition, and
+  it also mis-rejects `alpha = 1`, whose zero weights are exact.
+  **Lifting the ladder** the way [#14] lifted a coverage quotient does not
+  transfer, and the issue's claim was verified rather than accepted: a shared lift
+  needs `w_max / w_min <= 2^1646` to keep every weight normal *and* every product
+  finite under the domain's `2^400` ceiling, against an underflow onset at
+  `2^1074` — half as much reach again, bought by moving every fold in the regime
+  it does not fix; and a lifted accumulator is no longer in the embedding's units,
+  so it would have to un-scale before the gate besides.
+
+  **The re-measure a shared-gate change obliges**, against the consumer that
+  drives this surface — coremlit's `embeddings::clap::aggregate`, a pass-through
+  to `aggregate` over plan-produced spans and unit `f32` embeddings — run against
+  `fix/16-ema-weights` and against this branch and compared bit for bit. The sweep
+  deliberately crosses the underflow point (at `alpha = 0.99, n = 400`, `246` of
+  the `400` weights are gone):
+
+  ```text
+  aggregations   1056 (dim 512, three window families, 22 window counts to 400,
+                 full and ragged tails, CoverageWeightedMean, MeanRenormalized,
+                 EmaRenormalized at alpha 0.1 / 0.3 / 0.5 / 0.9 / 0.99 / 1-2^-6)
+  components     540 672 compared as raw bits
+  slices moved   0 of 1056
+  largest displacement   0
+  ```
+
+  What this does **not** claim is that the regime is now accurate. The verdict is
+  a refusal: past the point its ladder leaves the exponent range, a fold whose
+  whole mass rides on the underflowed windows has no direction at working
+  precision, and now says so.
+
+- **The `aggregate` fold's Neumaier compensation and `l2_renorm`'s two-step
+  division are pinned bit for bit**, closing four mutants the ledger had left
+  standing. Found by re-running that ledger for the work above rather than
+  inheriting its adjudication, which a change to what the gate compares does not
+  allow. Deleting the compensation, its fold-back, or the magnitude branch inside
+  it each **passed the whole suite** while moving `830` of `1876` swept
+  aggregations by up to `2.1e-15` — inside every tolerance the existing rows
+  compare with. Folding `l2_renorm`'s two divisions into one, and deleting its
+  `unit.is_finite()` guard, each passed while moving `0` of `1876`, because
+  `check_inputs`' `2^400` ceiling puts both regimes out of an aggregation's reach;
+  they are real for `smooth::VectorEma`, which renormalizes through the same
+  `pub(crate)` routine without that ceiling, so they are pinned at the routine.
+  Every mutant in the ledger is now killed.
+
+### Added
+
+- **`scalar::Real::MIN_NORMAL`**, the smallest positive normal value (`2^-1022`
+  for `f64`). The boundary at which a rounding stops being relative, which is the
+  one question the weight-underflow slack asks of a materialized weight; its
+  product with `EPSILON` is the absolute grid below it (`2^-1074`), the unit the
+  slack is written in. Named for the property rather than after
+  `f64::MIN_POSITIVE`, which is that property under a misleading name — the
+  smallest positive `f64` is `2^-1074`, not this. Additive on a sealed trait, so
+  no downstream implementation can break; the ambiguity hazard the trait's own
+  *Not purely additive* note describes applies to it as it does to every other
+  associated item.
+
 ### Documented
 
 - **`aggregate::EmaRenormalized`'s accumulated weight error is a bound with no
@@ -86,13 +237,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     exact ideal weighted sum   0
     materialized w[323]        9.88e-324  a subnormal, one step above the flush
     materialized w[324]        0          its ideal partner has no f64 at all
-    today                      Ok([1.0])  a direction fabricated from cancellation
+    before                     Ok([1.0])  a direction fabricated from cancellation
   ```
 
   Nothing there is the repeated multiplication: the same input works at
   `alpha = 0.5`, where every representable weight is exact to the bit, and
-  `powi` reaches the same zero. `0.3.0` ships with the gap open and pinned; #17
-  carries the candidate cure and the re-measure a shared-gate change obliges.
+  `powi` reaches the same zero. That gap was pinned as a characterization here and
+  is **closed under Fixed above**, in its own round with the re-measure a
+  gate-shaped change obliges; the note this entry corrects now reads as the
+  statement of a term the threshold carries rather than of a limit it does not.
 
   The "not a re-measure" claim above is measured rather than asserted, against
   the consumer that actually drives this surface — coremlit's
@@ -169,26 +322,38 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
-- **Two `aggregate` rows for the EMA weight ladder, one a falsifier and one a
-  characterization of a live gap** ([#16], [#17]).
+- **`aggregate` rows for the EMA weight ladder: one falsifier for a bound with no
+  reach, and six for the one that had one** ([#16], [#17]).
   `ema_weight_error_accumulates_but_no_input_can_reach_the_gate` measures the
   accumulated error against a double-double reference — the complement carried
   as an exact `hi + lo` pair, because `1 - alpha` is generally not an `f64` and
   rounding it once and raising it is the larger half of the error — then drives
   the strongest exactly cancelling pair the lever admits and pins its residue at
-  a sixth of the threshold. `ema_weights_below_the_exponent_range_fabricate_a_direction`
-  pins today's `Ok([1.0])` on the #17 witness, with the mechanism asserted
-  (surviving weight subnormal, its ideal partner exactly zero) rather than the
-  output alone.
+  a sixth of the threshold.
 
-  Both were written against the mutations they have to catch. Dropping the gate's
+  The #17 row began as a characterization pinning today's `Ok([1.0])` and is now
+  the falsifier
+  `ema_weights_below_the_exponent_range_cannot_fabricate_a_direction`, over four
+  coefficients, with the mechanism asserted (surviving weight subnormal, its ideal
+  partner exactly zero) rather than the output alone. Beside it:
+  `the_weight_underflow_slack_is_what_gates_the_witness` attributes the change to
+  the threshold's third term and to nothing else in the fold;
+  `the_weight_underflow_slack_carries_the_dimension` and
+  `the_oldest_window_is_charged_for_its_own_underflowed_weight` are the two the
+  candidate cure's shape would have failed;
+  `an_ordinary_long_ema_still_answers_past_the_underflow_point` and
+  `the_dyadic_alpha_stays_bit_exact_across_the_documented_range` are the
+  over-rejection guards; `the_exact_ladders_owe_the_gate_nothing` pins the two
+  coefficients whose zero weights are exact, and re-checks that `powi` reaches the
+  same zero the chain does — the record that #16's named cure does not fix #17.
+  `a_forced_slack_would_change_no_relative_weight_policy_verdict` drives the other
+  three policies with the term forced in.
+
+  Every one was written against the mutation it has to catch. Dropping the gate's
   constant from `16` to `2` reds the first; replacing the chain with
   `powi` reds it too (through a bit-for-bit basis fold that ties the test's
   replica ladder to the policy's own — without that tie the `powi` mutation
-  **passed**); and adding the missing absolute term to the threshold reds the
-  second while leaving all 310 other rows green, which is the evidence #17's
-  candidate cure rests on. The `powi` mutation leaving the second row green is
-  the record that #16's named cure does not fix #17.
+  **passed**).
 
 - **The vector smoother is reachable without `Clone`, from outside the crate, and
   returns the identical stream that way.** `tests/genericity.rs` gains an
@@ -213,6 +378,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   about and the harness it needed was already in the repository.
 
 [#13]: https://github.com/findit-studio/windit/issues/13
+[#14]: https://github.com/findit-studio/windit/issues/14
 [#16]: https://github.com/findit-studio/windit/issues/16
 [#17]: https://github.com/findit-studio/windit/issues/17
 
