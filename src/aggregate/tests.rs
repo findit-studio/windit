@@ -664,6 +664,373 @@ fn ema_weights_are_the_split_the_recurrence_produces() {
   assert_eq!(sum(&materialized(0.3, 4)), 0.999_999_999_999_999_8);
 }
 
+/// `a * b` as an exact unevaluated `product + error` pair.
+///
+/// Dekker's exact product: splitting each operand at 27 bits makes the four
+/// partial products exact, so `e` is the part of `a * b` that the rounded
+/// product dropped. Carrying that alongside the product gives about 106 bits,
+/// which is what it takes to see an error of tens of `u` for what it is. Only
+/// ever called on `|b| < 1` and its own shrinking powers, so no split overflows.
+fn two_product(a: f64, b: f64) -> (f64, f64) {
+  let split = |x: f64| {
+    let c = 134_217_729.0 * x;
+    let hi = c - (c - x);
+    (hi, x - hi)
+  };
+  let p = a * b;
+  let (ah, al) = split(a);
+  let (bh, bl) = split(b);
+  (p, (((ah * bh - p) + ah * bl) + al * bh) + al * bl)
+}
+
+/// `(1 - alpha)^k` as a `hi + lo` pair, from the complement carried the same
+/// way.
+///
+/// The complement must be a pair and not an `f64`: `1 - alpha` is *not*
+/// generally representable (`1 - 0.46` is not), and the documented ideal weight
+/// is `alpha * (1 - alpha)^k` at the exact difference. Rounding the complement
+/// once and then raising it multiplies that single rounding by `k`, which is the
+/// larger half of the error this whole test is about. `Fast2Sum` splits it
+/// exactly: `1` dominates `alpha`, so `(1 - hi) - alpha` is the part `hi` could
+/// not hold.
+fn dd_complement(alpha: f64) -> (f64, f64) {
+  let hi = 1.0 - alpha;
+  (hi, (1.0 - hi) - alpha)
+}
+
+fn dd_power(bhi: f64, blo: f64, k: usize) -> (f64, f64) {
+  let (mut hi, mut lo) = (1.0_f64, 0.0_f64);
+  for _ in 0..k {
+    let (p, e) = two_product(hi, bhi);
+    let t = ((e + hi * blo) + lo * bhi) + lo * blo;
+    // Renormalize so `hi` stays the leading term.
+    let s = p + t;
+    lo = (p - s) + t;
+    hi = s;
+  }
+  (hi, lo)
+}
+
+/// The EMA weight ladder, and the fold it drives, replicated so the two tests
+/// below measure the numbers the policy actually carries rather than a model of
+/// them.
+///
+/// `ema_ladder` is `EmaRenormalized::aggregate_values`' backward pass;
+/// `ema_gate_ratio` is [`weighted_sum_renorm`]'s Neumaier fold and determinacy
+/// threshold at `dim == 1`, returning the residue over the threshold that judges
+/// it. A ratio at or under `1` is the verdict [`WinditError::NonFinite`].
+fn ema_ladder(alpha: f64, n: usize) -> Vec<f64> {
+  let complement = 1.0 - alpha;
+  let mut w = vec![0.0; n];
+  let mut power = 1.0;
+  for i in (1..n).rev() {
+    w[i] = alpha * power;
+    power *= complement;
+  }
+  if n > 0 {
+    w[0] = power;
+  }
+  w
+}
+
+fn ema_gate_ratio(weights: &[f64], components: &[f64]) -> f64 {
+  let (mut acc, mut comp, mut mag) = (0.0_f64, 0.0_f64, 0.0_f64);
+  for (w, e) in weights.iter().zip(components) {
+    let term = w * e;
+    let sum = acc + term;
+    comp += if acc.abs() >= term.abs() {
+      (acc - sum) + term
+    } else {
+      (term - sum) + acc
+    };
+    acc = sum;
+    mag += term.abs();
+  }
+  acc += comp;
+  (acc + 0.0).abs() / (16.0 * f64::EPSILON * mag + f64::MIN_GATE_THRESHOLD)
+}
+
+/// The accumulated weight error is real and **no input can deliver it to the
+/// determinacy gate**. It is a bound, not a defect.
+///
+/// FALSIFIER for the bound's *reach*. The weights are built by repeated
+/// multiplication, so weight `k` carries the error of every multiply before it —
+/// about `0.7 * n * u`, past the gate's own `16 * EPSILON = 32u` somewhere near
+/// `n = 32`. That crossing is what a fold would have to exploit, and the
+/// exploitation is what does not exist.
+///
+/// For any input whose *ideal* weighted sum is exactly zero, write `t_i` for the
+/// ideal terms (`sum_i t_i = 0`) and `d_i` for each weight's relative error. The
+/// residue is `sum_i t_i * d_i`, and the gate measures it against
+/// `32u * sum_i |t_i|`; because the `t_i` sum to zero, any constant may be
+/// subtracted from `d`, so
+///
+/// ```text
+/// residue / mass <= (max_i d_i - min_i d_i) / 2
+/// ```
+///
+/// — the *spread* of the weight error over the input's support, never its size.
+/// So a witness needs a support carrying a spread above `64u`, and an exact
+/// cancellation across it.
+///
+/// A two-window pair at chain distance `d` cancels exactly only when its ideal
+/// weight ratio `(1 - alpha)^d` is an exact ratio of two `f64` significands.
+/// Writing the complement as `B * 2^-q` with `B` odd, that ratio's odd part is
+/// `B^d`, so it needs `B^d < 2^53` — a lever capped at `d <= 53 / log2(B)`. The
+/// same `B` that buys a long lever makes `(1 - alpha)^k` exactly representable
+/// for `k` up to that same cap, which is precisely where the chain has no error
+/// yet. That tension is the whole result, and it was measured rather than
+/// argued: over every complement `B * 2^-q` with `B` odd up to `2^40 - 1` and
+/// every `q` in `1..=53`, at every chain index whose materialized weight is a
+/// normal `f64`, the largest reachable `|d_k - d_{k+d}|` with `d` inside the
+/// lever cap is **10.0u** — against the `64u` a witness needs. The complement
+/// whose *whole* error spread does clear `64u` needs a support spanning 131 to
+/// 7609 chain steps to realize it, 65 to 1300 times its own lever cap; and a
+/// three-window chain, which is how a support reaches past its own lever,
+/// extends it by a measured **2.2x** and no further, so closing that gap takes
+/// on the order of 30 to 600 support windows whose interior terms all vanish
+/// against the two carrying the mass.
+///
+/// Driving the fold rather than the arithmetic says the same thing: **5 072 311**
+/// exactly cancelling pairs, every short-mantissa complement at every chain
+/// index whose weights are both normal, and the largest residue any of them
+/// leaves is **0.162** of the threshold. This pins that maximum.
+/// `alpha = 0.625` puts the complement at `3/8`, the odd part that buys the
+/// longest lever (`3^33 < 2^53`), and chain indices 651 and 684 are where the
+/// accumulated error between two such indices is widest.
+#[test]
+fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
+  // The measured growth first, so the bound is on record as a number rather
+  // than a claim. It is against the *ideal* `(1 - alpha)^k`, so it needs a
+  // reference wider than the `f64` under test: `dd_power` carries the power as
+  // an unevaluated `hi + lo` pair (about 106 bits), which the self-check below
+  // pins against the one case where the plain chain is exact.
+  assert_eq!(
+    dd_complement(0.5),
+    (0.5, 0.0),
+    "a dyadic complement is exact"
+  );
+  let (dhi, dlo) = dd_power(0.5, 0.0, 40);
+  assert_eq!(
+    (dhi, dlo),
+    (libm::ldexp(1.0, -40), 0.0),
+    "and a dyadic power is exact, which is what pins the reference"
+  );
+
+  let n = 64_usize;
+  let alpha = 0.46_f64;
+
+  // The replica is only evidence while it is the policy's own ladder. Folding
+  // the standard basis makes the weight vector observable up to the L2
+  // normalization every policy ends with, and the comparison is bit-for-bit:
+  // each product is `w_i * 1` or `w_i * 0`, so the fold reproduces the ladder
+  // exactly and `l2_renorm` is then the same call on the same values. Any change
+  // to how the policy forms its weights parts the two.
+  let basis: Vec<Vec<f64>> = (0..n)
+    .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+    .collect();
+  let refs: Vec<&[f64]> = basis.iter().map(Vec::as_slice).collect();
+  let folded = EmaRenormalized::new(alpha)
+    .aggregate_values(&refs, &vec![1.0; n], n)
+    .expect("a convex EMA over the basis has a direction");
+  let mut replica = ema_ladder(alpha, n);
+  l2_renorm(&mut replica).expect("the ladder has a direction");
+  assert_eq!(
+    folded, replica,
+    "the replica must be the ladder the policy actually builds"
+  );
+
+  let (bhi, blo) = dd_complement(alpha);
+  assert!(
+    blo != 0.0,
+    "1 - 0.46 is not an f64, and that rounding is the larger half of the error"
+  );
+  let w = ema_ladder(alpha, n);
+  let mut worst = 0.0_f64;
+  let mut worst_powi = 0.0_f64;
+  for k in 0..n - 1 {
+    let (hi, lo) = dd_power(bhi, blo, k);
+    // `alpha * hi` and `alpha * lo` scale the pair; the relative error of the
+    // materialized weight against it is `((w - a*hi) - a*lo) / (a*hi)`.
+    let (rhi, rlo) = (alpha * hi, alpha * lo);
+    worst = worst.max((((w[n - 1 - k] - rhi) - rlo) / rhi).abs());
+    let by_powi = alpha * (1.0 - alpha).powi(k as i32);
+    worst_powi = worst_powi.max((((by_powi - rhi) - rlo) / rhi).abs());
+  }
+  let u = f64::EPSILON / 2.0;
+  assert!(
+    (58.0..60.0).contains(&(worst / u)),
+    "repeated multiplication reaches tens of u by n = 64, got {} u",
+    worst / u
+  );
+
+  // And the cure the issue named, measured rather than repeated.
+  // `alpha * (1 - alpha).powi(k)` is *not* "one rounding instead of k". `powi`
+  // is exponentiation by squaring, so it is `O(log k)` roundings and not
+  // correctly rounded; and, decisively, it raises the same `fl(1 - alpha)` the
+  // chain does. That single complement rounding, multiplied by `k`, is the
+  // larger part of the error, and `powi` does not touch it. It buys 18% here,
+  // not `k -> 1`. At a dyadic alpha, where the complement is exact, both are
+  // exact and there is nothing to buy.
+  assert!(
+    (47.0..50.0).contains(&(worst_powi / u)),
+    "powi is O(log k) roundings on top of the complement's, not one: {} u",
+    worst_powi / u
+  );
+  assert!(
+    worst / worst_powi > 1.20 && worst / worst_powi < 1.25,
+    "so it improves the weights by about a fifth, not by a factor of k: {}x",
+    worst / worst_powi
+  );
+  for k in [4_usize, 64, 199] {
+    let (hi, lo) = dd_power(0.5, 0.0, k);
+    assert_eq!(
+      (ema_ladder(0.5, k + 2)[1], 0.0),
+      (0.5 * hi, 0.5 * lo),
+      "and at the dyadic alpha the chain is already exact, at k = {k}"
+    );
+  }
+
+  // And the reach. `3^33 < 2^53`, so `(3/8)^33 = 3^33 / 2^99` is an exact `f64`
+  // and `c_hi = -c_lo / (3/8)^33` is exactly `-2^399`; the pair then cancels to
+  // zero in exact arithmetic, the terms being
+  // `alpha * b^651 * (c_lo + b^33 * c_hi)` with the bracket exactly zero. Both
+  // components sit inside the input domain's `2^400`.
+  let alpha = 0.625_f64;
+  let b = 1.0 - alpha;
+  assert_eq!(
+    b, 0.375,
+    "the complement must be exact, or the ideal is not b"
+  );
+  let (k1, d) = (651_usize, 33_usize);
+  let n = k1 + d + 2;
+  let c_lo = libm::ldexp(3.0_f64.powi(33), 300);
+  assert_eq!(
+    3.0_f64.powi(33),
+    5_559_060_566_555_523.0,
+    "3^33 must be an exact f64, or the lever is not exact"
+  );
+  let ratio = b.powi(d as i32);
+  let c_hi = -c_lo / ratio;
+  assert_eq!(
+    c_lo + c_hi * ratio,
+    0.0,
+    "the ideal weighted sum must be exactly zero"
+  );
+
+  let w = ema_ladder(alpha, n);
+  let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + d));
+  assert!(
+    w[i1] >= f64::MIN_POSITIVE && w[i2] >= f64::MIN_POSITIVE,
+    "both weights must be normal, or this is the underflow regime and not this \
+     one: {:e}, {:e}",
+    w[i1],
+    w[i2]
+  );
+  let mut components = vec![0.0_f64; n];
+  components[i1] = c_lo;
+  components[i2] = c_hi;
+
+  let ratio = ema_gate_ratio(&w, &components);
+  assert!(
+    (0.16..0.17).contains(&ratio),
+    "the accumulated error's strongest reachable residue is a sixth of the \
+     gate, got {ratio}"
+  );
+  let lever: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  let got = EmaRenormalized::new(alpha).aggregate_values(&lever, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction, got {got:?}"
+  );
+}
+
+/// A weight whose *ideal* value has left `f64`'s exponent range is rounded
+/// **absolutely**, and the determinacy gate's absolute floor does not cover it.
+///
+/// CHARACTERIZATION of a live gap, not a guarantee — see
+/// <https://github.com/findit-studio/windit/issues/17>. The module note used to
+/// claim this regime was sound because a subnormal weight drives the fold's own
+/// products subnormal, leaving `MIN_GATE_THRESHOLD` to gate alone. That holds
+/// only while the components are `O(1)`. The [input domain](super#input-domain)
+/// admits components up to `2^400`, and one of those lifts the product of a
+/// subnormal weight back into the ordinary range, where the floor is nowhere
+/// near it.
+///
+/// Nothing here is the repeated multiplication: at `alpha = 0.9` the chain's
+/// accumulated error is a few `u`, and the same input works at `alpha = 0.5`
+/// where every representable weight is exact to the bit. What breaks is that
+/// the ideal ratio between two adjacent weights — `1 / (1 - alpha)`, a factor
+/// of ten here — is not representable at the bottom of the subnormal grid, so
+/// the older weight rounds to zero while the newer one survives. Evaluating
+/// each weight once (`powi`) reaches the same zero: `alpha * 0.1^324` is not an
+/// `f64`, however it is computed.
+#[test]
+fn ema_weights_below_the_exponent_range_fabricate_a_direction() {
+  let alpha = 0.9_f64;
+  let b = 1.0 - alpha;
+  assert_eq!(
+    b, 0.099_999_999_999_999_98,
+    "1 - 0.9 is exact (Sterbenz), so the ideal complement is the one the fold \
+     uses and every weight error below is the exponent range and nothing else"
+  );
+
+  // `b` is `900_719_925_474_099 * 2^-53`, so building the newer component out of
+  // that significand makes `c_hi = -c_lo / b` the exact power of two `-2^83`,
+  // and the ideal pair cancels to zero by construction rather than by luck.
+  assert_eq!(
+    libm::ldexp(900_719_925_474_099.0, -53),
+    b,
+    "b's significand"
+  );
+  let c_lo = libm::ldexp(900_719_925_474_099.0, 30);
+  let c_hi = -c_lo / b;
+  assert_eq!(c_hi, -libm::ldexp(1.0, 83), "so the quotient is exact");
+  assert_eq!(
+    c_lo + c_hi * b,
+    0.0,
+    "the ideal weighted sum must be exactly zero"
+  );
+  assert!(
+    c_lo.abs() < f64::MAX_AGG_MAGNITUDE && c_hi.abs() < f64::MAX_AGG_MAGNITUDE,
+    "and both components must be ordinary in-domain values: {c_lo:e}, {c_hi:e}"
+  );
+
+  let k1 = 323_usize;
+  let n = k1 + 3;
+  let w = ema_ladder(alpha, n);
+  let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + 1));
+  assert!(
+    w[i1] > 0.0 && w[i1] < f64::MIN_POSITIVE,
+    "the surviving weight is a subnormal, one step above the flush: {:e}",
+    w[i1]
+  );
+  assert_eq!(
+    w[i2], 0.0,
+    "and its ideal partner, a tenth of it, has no f64 at all"
+  );
+
+  let mut components = vec![0.0_f64; n];
+  components[i1] = c_lo;
+  components[i2] = c_hi;
+  let ratio = ema_gate_ratio(&w, &components);
+  assert!(
+    ratio > 100.0,
+    "the residue clears the gate by two orders of magnitude even with the \
+     absolute floor fully engaged, got {ratio:e}"
+  );
+
+  // The verdict this pins is the defect. When #17 is fixed this assertion is
+  // what has to change, and the numbers above are what it has to change to.
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got.as_deref(), Ok([1.0])),
+    "TODAY a direction is fabricated from exact cancellation, at n = {n} and \
+     ordinary components; got {got:?}"
+  );
+}
+
 #[test]
 fn ema_alpha_range_is_rejected_at_f64() {
   // The alpha range check runs on the configuration field, which is now the

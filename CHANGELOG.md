@@ -8,6 +8,106 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documented
 
+- **`aggregate::EmaRenormalized`'s accumulated weight error is a bound with no
+  reach, and the note that claimed its underflow regime was gated was wrong**
+  ([#16], [#17]). *(No arithmetic changed, so this is not a fourth re-measure:
+  every aggregation is bit-identical to `main`.)*
+
+  #16 measured the weights' relative error growing at about `0.7 * n * u`,
+  crossing the determinacy gate's own `16 * EPSILON = 32u` near `n = 32`, and
+  asked for a witness before calling it a defect. There is no witness, and the
+  reason is structural rather than a failure to search hard enough.
+
+  For any input whose ideal weighted sum is exactly zero the ideal terms `t_i`
+  sum to zero, so any constant may be subtracted from the weights' relative
+  errors `d_i` and the residue the gate sees obeys
+
+  ```text
+  |sum_i t_i d_i| / sum_i |t_i|  <=  (max_i d_i - min_i d_i) / 2
+  ```
+
+  A witness therefore needs the error's **spread over its own support** above
+  `64u`, never its size. And two windows cancel exactly only when their ideal
+  weight ratio `(1 - alpha)^d` is an exact ratio of two `f64` significands:
+  writing the complement as `B * 2^-q` with `B` odd, that needs `B^d < 2^53`, a
+  lever capped at `d <= 53 / log2(B)`. The same small `B` that buys a long lever
+  is what makes `(1 - alpha)^k` exactly representable, and so the chain exact,
+  over that very range. The two requirements pull against each other, and the
+  measurement is what settles it:
+
+  ```text
+  every complement B * 2^-q, B odd up to 2^40 - 1, q in 1..=53,
+  at every chain index whose materialized weight is a normal f64:
+    widest reachable |d_k - d_{k+d}| within the lever cap   10.0 u
+    needed to clear the gate                                64.0 u
+  driving the fold over the same space:
+    exactly cancelling two-window pairs evaluated           5 072 311
+    largest residue any of them leaves                      0.162 * threshold
+    plus 56 736 adjacent pairs at arbitrary alpha           0.038 * threshold
+  complements whose whole error spread does clear 64u:
+    support span they would need                            131 to 7609 chain steps
+    their own two-window lever cap                          2 to 13
+    reach a three-window chain adds                         2.2x, measured
+  ```
+
+  So closing that gap needs a support of 30 to 600 windows whose interior terms
+  all vanish against the two carrying the mass, each interior step buying its
+  reach from a separate modular coincidence. That is the part not proved — it is
+  a counting argument and a search, not a theorem — and it is what
+  "measured, and therefore not changed" rests on here.
+
+  The cure #16 named was checked rather than repeated.
+  `alpha * (1 - alpha).powi(k)` is **not** "one rounding instead of `k`": `powi`
+  is exponentiation by squaring, so `O(log k)` roundings and not correctly
+  rounded, and — decisively — it raises the same `fl(1 - alpha)` the chain does.
+  That single complement rounding, multiplied by `k`, is the larger part of the
+  error, and `powi` does not touch it. At `alpha = 0.46, n = 64`: `58.75u` for
+  the chain against `48.15u` for `powi`, a fifth, not a factor of `k`. At a
+  dyadic `alpha`, where the complement is exact, both are exact and there is
+  nothing to buy — so the documented bit-exactness at `alpha = 0.5` was never in
+  question either way.
+
+  Looking for that witness found a different one, in the same class and with a
+  different mechanism, now tracked as [#17]. The module note claimed a subnormal
+  weight drives the fold's own products subnormal, leaving `MIN_GATE_THRESHOLD`
+  to gate alone. That holds only while the components are `O(1)`; the input
+  domain admits `2^400`, and a large component lifts the product of a subnormal
+  weight back into the ordinary range where the floor is nowhere near it. The
+  note is corrected — in three places, since `Real::MIN_GATE_THRESHOLD`'s own
+  doc carried the same incomplete `K_abs` derivation (it covers the *product*
+  rounding, `sqrt(dim) * n * 2^-1075`, and not the *weight* rounding,
+  `2^-1075 * sum_i |e_ij|`, which the input domain's `2^400` ceiling takes to
+  `n * 2^-675`) and `Real::MIN_AGG_MAGNITUDE`'s pointed at it. The `aggregate`
+  module gains an *A weight below the exponent range* section stating where the
+  gate's guarantee stops:
+
+  ```text
+  alpha = 0.9, n = 326, two ordinary components near 1e24
+    exact ideal weighted sum   0
+    materialized w[323]        9.88e-324  a subnormal, one step above the flush
+    materialized w[324]        0          its ideal partner has no f64 at all
+    today                      Ok([1.0])  a direction fabricated from cancellation
+  ```
+
+  Nothing there is the repeated multiplication: the same input works at
+  `alpha = 0.5`, where every representable weight is exact to the bit, and
+  `powi` reaches the same zero. `0.3.0` ships with the gap open and pinned; #17
+  carries the candidate cure and the re-measure a shared-gate change obliges.
+
+  The "not a re-measure" claim above is measured rather than asserted, against
+  the consumer that actually drives this surface — coremlit's
+  `embeddings::clap::aggregate`, a pass-through to `aggregate` over
+  plan-produced spans and unit `f32` embeddings — run against `main` and against
+  this branch and compared bit for bit:
+
+  ```text
+  aggregations   2304 (dim 64 and 512, 1..64 windows, all four policies,
+                 EmaRenormalized at alpha 0.1 / 0.5 / 0.9)
+  components     663 552 compared as raw bits
+  slices moved   0 of 2304
+  largest displacement   0
+  ```
+
 - **`SmoothPolicy::smooth`'s `V: Clone` is kept, and the reason is now a number
   rather than an argument about the bound's shape** ([#13]). `Smoother::push`
   takes its window by value, so the batch convenience clones each one out of the
@@ -69,6 +169,27 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
+- **Two `aggregate` rows for the EMA weight ladder, one a falsifier and one a
+  characterization of a live gap** ([#16], [#17]).
+  `ema_weight_error_accumulates_but_no_input_can_reach_the_gate` measures the
+  accumulated error against a double-double reference — the complement carried
+  as an exact `hi + lo` pair, because `1 - alpha` is generally not an `f64` and
+  rounding it once and raising it is the larger half of the error — then drives
+  the strongest exactly cancelling pair the lever admits and pins its residue at
+  a sixth of the threshold. `ema_weights_below_the_exponent_range_fabricate_a_direction`
+  pins today's `Ok([1.0])` on the #17 witness, with the mechanism asserted
+  (surviving weight subnormal, its ideal partner exactly zero) rather than the
+  output alone.
+
+  Both were written against the mutations they have to catch. Dropping the gate's
+  constant from `16` to `2` reds the first; replacing the chain with
+  `powi` reds it too (through a bit-for-bit basis fold that ties the test's
+  replica ladder to the policy's own — without that tie the `powi` mutation
+  **passed**); and adding the missing absolute term to the threshold reds the
+  second while leaving all 310 other rows green, which is the evidence #17's
+  candidate cure rests on. The `powi` mutation leaving the second row green is
+  the record that #16's named cure does not fix #17.
+
 - **The vector smoother is reachable without `Clone`, from outside the crate, and
   returns the identical stream that way.** `tests/genericity.rs` gains an
   embedding double with no `Clone` and a `smooth_owned_any` helper bounded by
@@ -92,6 +213,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   about and the harness it needed was already in the repository.
 
 [#13]: https://github.com/findit-studio/windit/issues/13
+[#16]: https://github.com/findit-studio/windit/issues/16
+[#17]: https://github.com/findit-studio/windit/issues/17
 
 ## 0.3.0
 
