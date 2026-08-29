@@ -213,6 +213,28 @@ pub trait SmoothPolicy<V> {
   ///   built-ins only [`CadenceEma`] can raise one, and only
   ///   [`WinditError::NonMonotonicSpan`]; [`VectorEma`] has an error set of its
   ///   own, enumerated on its own documentation.
+  ///
+  /// The batch call is not a quieter path than the streaming one: a descending
+  /// start reaches the caller here exactly as it would from
+  /// [`Smoother::push`], so this convenience is fallible for a reason.
+  ///
+  /// ```
+  /// use windit::{prelude::*, WinditError};
+  ///
+  /// // Spans must ascend by `start`; these descend.
+  /// let backward = [
+  ///     Windowed::new(0.5_f32, Span::new(10, 1, 1)),
+  ///     Windowed::new(0.5, Span::new(9, 1, 1)),
+  /// ];
+  ///
+  /// assert_eq!(
+  ///     CadenceEma::new(8.0).smooth(&backward),
+  ///     Err(WinditError::NonMonotonicSpan { prev_start: 10, start: 9 }),
+  /// );
+  ///
+  /// // `Ema` and `Identity` read no spans, so the same input is fine for them.
+  /// assert!(Ema::new(0.5).smooth(&backward).is_ok());
+  /// ```
   #[cfg(any(feature = "std", feature = "alloc"))]
   #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
   fn smooth(&self, seq: &[Windowed<V>]) -> Result<Vec<Windowed<V>>, WinditError>
@@ -305,9 +327,12 @@ impl<V> SmoothPolicy<V> for Identity {
 /// what survives.
 ///
 /// This policy is infallible, so [`Ema::new`] clamps `alpha` into `[0, 1]`
-/// deterministically: a non-finite (NaN) `alpha` clamps to `0.0` (hold the
-/// seed). With a clamped alpha and finite inputs, the recurrence introduces no
-/// NaN.
+/// deterministically. The three non-finite coefficients do **not** share one
+/// answer, and the clamp is an ordering rule rather than a finiteness test:
+/// `NaN` fails both comparisons and falls through to `0.0` (hold the seed),
+/// `-inf` is below the floor and also clamps to `0.0`, and `+inf` is above the
+/// ceiling so it clamps to `1.0` (follow the input). With a clamped alpha and
+/// finite inputs, the recurrence introduces no NaN.
 ///
 /// `Ema` does not sanitize inputs: a non-finite input (`NaN` or `+inf`/`-inf`)
 /// enters the recurrence and poisons the state — every output from that index on
@@ -332,6 +357,20 @@ impl Ema {
   /// above `1.0` clamps to `1.0`, below `0.0` clamps to `0.0`, and a NaN becomes
   /// `0.0` (hold the seed). [`alpha`](Ema::alpha) reports the clamped value the
   /// recurrence actually uses.
+  ///
+  /// The infinities follow from that ordering rule and land on *different*
+  /// answers, which is worth spelling out because "non-finite" reads as one
+  /// case:
+  ///
+  /// ```
+  /// use windit::smooth::Ema;
+  ///
+  /// assert_eq!(Ema::new(2.0).alpha(), 1.0);
+  /// assert_eq!(Ema::new(-1.0).alpha(), 0.0);
+  /// assert_eq!(Ema::new(f32::NAN).alpha(), 0.0);            // holds the seed
+  /// assert_eq!(Ema::new(f32::NEG_INFINITY).alpha(), 0.0);   // holds the seed
+  /// assert_eq!(Ema::new(f32::INFINITY).alpha(), 1.0);       // follows the input
+  /// ```
   #[must_use]
   pub const fn new(alpha: f32) -> Self {
     // A NaN fails both comparisons and falls through to `0.0`; `f32::clamp`
@@ -1101,12 +1140,14 @@ impl SmoothPolicy<f32> for CadenceEma {
 ///   apart were the same filter.
 ///
 /// [`new`](VectorEma::new) clamps `alpha` into `[0, 1]` exactly as
-/// [`Ema::new`] does, NaN included (it clamps to `0.0`, holding the seed
-/// direction). The smoothing path is therefore total in its coefficient, and
-/// `alpha` never reaches the error channel — the smoother idiom, not the
-/// aggregate's deferred [`AlphaOutOfRange`](WinditError::AlphaOutOfRange)
-/// check. Clamping costs `new` its `const`: the comparisons are
-/// [`Real`]'s `PartialOrd`, and a trait method cannot run in a `const fn`.
+/// [`Ema::new`] does, non-finite coefficients included and with the same
+/// three-way answer: `NaN` and `-inf` clamp to `0.0` (hold the seed direction),
+/// `+inf` clamps to `1.0`. The smoothing path is therefore total in its
+/// coefficient, and `alpha` never reaches the error channel — the smoother
+/// idiom, not the aggregate's deferred
+/// [`AlphaOutOfRange`](WinditError::AlphaOutOfRange) check. Clamping costs `new`
+/// its `const`: the comparisons are [`Real`]'s `PartialOrd`, and a trait method
+/// cannot run in a `const fn`.
 ///
 /// # Allocation
 ///
@@ -1187,9 +1228,10 @@ impl<C: Real> VectorEma<C> {
   /// `[0, 1]`.
   ///
   /// Clamping at construction is what keeps the coefficient out of the error
-  /// channel: above `1.0` clamps to `1.0`, below `0.0` clamps to `0.0`, and a
-  /// NaN becomes `0.0` (hold the seed direction). [`alpha`](VectorEma::alpha)
-  /// reports the clamped value the recurrence actually uses. This is
+  /// channel: above `1.0` clamps to `1.0` (so does `+inf`), below `0.0` clamps
+  /// to `0.0` (so does `-inf`), and a NaN becomes `0.0` (hold the seed
+  /// direction). [`alpha`](VectorEma::alpha) reports the clamped value the
+  /// recurrence actually uses. This is
   /// [`Ema::new`]'s rule verbatim, not the aggregate
   /// [`EmaRenormalized`](crate::aggregate::EmaRenormalized)'s deferred
   /// rejection: a smoother's `push` must stay total in its configuration.

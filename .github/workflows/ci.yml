@@ -5,17 +5,13 @@ on:
     branches:
       - main
     paths-ignore:
-      - 'README'
       - 'COPYRIGHT'
       - 'LICENSE-*'
-      - '**.md'
       - '**.txt'
   pull_request:
     paths-ignore:
-      - 'README'
       - 'COPYRIGHT'
       - 'LICENSE-*'
-      - '**.md'
       - '**.txt'
   workflow_dispatch:
   schedule: 
@@ -55,8 +51,12 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
     - name: Install cargo-hack
       run: cargo install cargo-hack
+    # `--all-targets` so tests, benches and the integration suites are linted too.
+    # Without it this job lints the library alone: every other target is compiled
+    # somewhere in CI but never linted, so a lint regression can land in
+    # `tests/`, `src/**/tests.rs` or `benches/windit.rs` unseen.
     - name: Apply clippy lints
-      run: cargo hack clippy --each-feature
+      run: cargo hack clippy --each-feature --all-targets
 
   # Run tests on some extra platforms
   cross:
@@ -172,6 +172,28 @@ jobs:
         run: cargo hack doc --each-feature --no-deps
       - name: cargo doc --all-features
         run: cargo doc --all-features --no-deps
+      # Building rustdoc is not running it. `src/lib.rs` includes `README.md` as
+      # the crate documentation on every `alloc`/`std` row, so the front page's
+      # worked examples ARE doctests: a Markdown-only edit can replace one with a
+      # call to an item that does not exist, and only executing them catches it.
+      # Both rows the README is included on are covered — `--all-features` and the
+      # bare default — because the two differ in which items the examples may name.
+      - name: cargo test --doc --all-features
+        run: cargo test --doc --all-features
+      - name: cargo test --doc (default features)
+        run: cargo test --doc
+      # The doctests above only protect the README while this workflow still runs
+      # on a README-only change. `paths-ignore: '**.md'` used to silence every job
+      # here for exactly that change — the hole this step keeps closed. It runs on
+      # any code change, so a re-added ignore is caught on the next commit even
+      # though the ignored commit itself would not have run it.
+      - name: The README is crate documentation, so Markdown must not skip CI
+        run: |
+          set -euo pipefail
+          if grep -nE "^\s*-\s*'?\*\*\.md'?\s*$" .github/workflows/ci.yml; then
+            echo "::error file=.github/workflows/ci.yml::'**.md' is back in paths-ignore. src/lib.rs includes README.md as crate documentation, so its examples are doctests and a Markdown-only change must run this workflow." >&2
+            exit 1
+          fi
 
   build:
     name: build
@@ -335,6 +357,71 @@ jobs:
   #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
   #     #   working-directory: integration
 
+  # Prove what will actually be published, before it is published. Every other
+  # job here builds the working tree; none of them builds the *tarball*, whose
+  # contents are decided by `exclude` in Cargo.toml. A file the acceptance suite
+  # needs and `exclude` drops leaves the published crate broken for every consumer
+  # while CI stays green — which is precisely the class of failure that only
+  # shows up after `cargo publish`.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install cargo-hack
+        run: cargo install cargo-hack
+      # Builds the tarball and compiles it from its own contents.
+      - name: cargo package
+        run: cargo package
+      # Compiling the package is not exercising it: unpack the tarball and run
+      # the acceptance suite from inside it, over the feature rows, so the
+      # published source is proven to pass the same tests the repository does.
+      - name: Test the unpacked package across the feature rows
+        run: |
+          set -euo pipefail
+          mkdir -p target/unpacked
+          tar -xzf target/package/*.crate -C target/unpacked
+          cd target/unpacked/*/
+          cargo hack test --each-feature
+      # Registry-side validation the local package step does not perform. Note it
+      # is not a metadata check: a dry run does not validate `keywords` or
+      # `categories`, which the registry only rejects on a real publish.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run
+
+  # Execute the benchmarks. Criterion's `--test` runs every benchmark once
+  # without measuring, which is what makes the equivalence claims in
+  # `benches/windit.rs` enforceable: each comparable arm asserts its output
+  # against its partner arm outside the timed loop, so a pair that stops
+  # measuring the same work fails this job instead of quietly reporting two
+  # numbers about different computations.
+  #
+  # Deliberately a correctness gate and nothing else. No timing threshold is
+  # asserted anywhere here — a shared CI runner cannot support one, and mixing a
+  # machine-dependent performance bound into a parity gate would make both
+  # useless.
+  bench-parity:
+    name: bench parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache cargo build and registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bench-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: cargo bench --bench windit -- --test
+        run: cargo bench --bench windit -- --test
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest
@@ -346,6 +433,8 @@ jobs:
       - test
       - sanitizer
       - msrv
+      - package
+      - bench-parity
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
