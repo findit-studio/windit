@@ -356,20 +356,57 @@
 //! over `326` windows, with two ordinary components near `10^24` whose ideal
 //! weighted sum is exactly zero, [`aggregate`] returned a unit vector.
 //!
-//! So `E_i` gains an absolute part alongside its relative one, bounded by
-//! `MIN_NORMAL * EPSILON` times `(1 + alpha * D)`, with
-//! `D <= 1 / (1 - fl(1 - alpha))` the geometric damping of the chain's own
-//! roundings, and charged only where the materialized weight is under
-//! `MIN_NORMAL`. **The coefficient keeps its `alpha`.** A previous revision dropped
-//! it for `alpha <= 1` and charged `(1 + D)`, which is a valid inequality and a bad
-//! bound: `D` is about `1 / alpha`, so the derived `(1 + alpha * D)` is about `2`
-//! at every coefficient while `(1 + D)` grows without limit as the coefficient
-//! shrinks. At `alpha = 0.05, n = 14471`, one `2^400` component on a flushed weight
-//! and one `2^-400` on a normal one, the dropped-`alpha` term came to `5.185x` the
-//! accumulator and decided [`WinditError::NonFinite`] by itself — where the
-//! flushed window's ideal contribution is `0.12` of the live term, so even
-//! reversing it leaves a direction. `the_underflow_slack_does_not_charge_1_over_alpha`
-//! drives that. Four consequences worth stating plainly:
+//! So `E_i` gains an absolute part alongside its relative one, written in units of
+//! `MIN_NORMAL * EPSILON`, charged only where the materialized weight is under
+//! `MIN_NORMAL`, and carrying **two coefficients, one per position**:
+//! `(1 + alpha * D)` for the general weight `fl(alpha * p_k)` and the bare `D` for
+//! `w_0`, with `D <= 1 / (1 - fl(1 - alpha))` the geometric damping of the chain's
+//! own roundings that both are written over.
+//!
+//! **The general term's coefficient keeps its `alpha`.** A previous revision
+//! dropped it for `alpha <= 1` and charged `(1 + D)`, which is a valid inequality
+//! and a bad bound: `D` is about `1 / alpha`, so the derived `(1 + alpha * D)` is
+//! about `2` at every coefficient while `(1 + D)` grows without limit as the
+//! coefficient shrinks. At `alpha = 0.05, n = 14471`, one `2^400` component on a
+//! flushed weight and one `2^-400` on a normal one, the dropped-`alpha` term came
+//! to `5.185x` the accumulator and decided [`WinditError::NonFinite`] by itself —
+//! where the flushed window's ideal contribution is `0.12` of the live term, so
+//! even reversing it leaves a direction.
+//! `the_underflow_slack_does_not_charge_1_over_alpha` drives that.
+//!
+//! **The oldest window is the exception the recurrence's own convex form already
+//! names.** [Input domain](self#input-domain) writes the weights as
+//! `w_0 = (1 - alpha)^(n - 1)` and `w_i = alpha * (1 - alpha)^(n - 1 - i)`, and
+//! the ladder builds them that way — `weights[0]` is the bare chain value with no
+//! `alpha` factor at all. The `1` in `(1 + alpha * D)` is the final `alpha *`
+//! multiplication's own rounding and the `alpha * D` is every chain rounding
+//! damped by it, so neither half of that coefficient is window 0's: its chain
+//! roundings arrive undamped and its unit is `D`. The gap is `1 / (2 * alpha)`,
+//! and it is reachable because past the flush point the ladder does not decay to
+//! zero but **stalls** — `fl(p * b) == p` once `(1 - b) * p <= 2^-1075`, a fixed
+//! point of the subnormal grid sitting at exactly the derived `2^-1075 * D`.
+//!
+//! ```text
+//! alpha = 0.05, n = 20000, dim = 1, one 2^400 component on window 0, zeros elsewhere
+//!   the ladder stalls at   9 * 2^-1074     w[0] * b == w[0]
+//!   the relative charge    underflows to zero
+//!   the absolute charge    2 * 2^-1074     derived for a weight window 0 is not
+//!   derived for w[0]      20 * 2^-1074     D = 1 / (1 - fl(0.95))
+//!   acc                    0x1.2p-671      an ordinary normal f64
+//!   tau                    0x1.0000000000048p-673
+//!   before                 Ok([1.0])       against an ideal contribution of
+//!                                          2^-1079.94, eighty binary orders under
+//!                                          the 2^-1000 floor
+//!   now                    Err(NonFinite)
+//! ```
+//!
+//! The two coefficients coincide at `alpha = 1/2` (`D = 2`, and `1 + 0.5 * 2 = 2`),
+//! so no dyadic verdict moves.
+//! `the_oldest_weights_charge_is_not_damped_by_alpha` drives it, and
+//! `every_windows_charge_bounds_that_windows_own_weight_error` pins the
+//! per-position invariant the whole class of defect on this seam violates.
+//!
+//! Four consequences worth stating plainly:
 //!
 //! - **`S` belongs to the policy, not to the fold.** A weight's formation error
 //!   is a property of whatever formed the weight, so the fold cannot derive it
@@ -980,16 +1017,38 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 /// `EPSILON` is exact (a power of two), and what is left is one rounding per
 /// multiply and one per accumulation, at most `(n + dim) * u` all told.
 ///
-/// **The absolute part**, charged only where `w_i < MIN_NORMAL`:
+/// **The absolute part**, charged only where `w_i < MIN_NORMAL`, and **two
+/// formulas rather than one**: the ladder builds `weights[0]` differently from
+/// every other entry, so a unit derived at one position is not a bound at the
+/// other.
 ///
 /// ```text
-/// |w_i - W_i|_absolute  <=  (EPSILON/2) * MIN_NORMAL * (1 + alpha * D),
-///     D = sum_{j<k} b^j <= 1 / (1 - b)
+/// eta = MIN_NORMAL * EPSILON = 2^-1074,   D = sum_{j<k} b^j <= 1 / (1 - b)
+///
+/// |w_i - W_i|_absolute  <=  (eta/2) * (1 + alpha * D)   i >= 1, w_i = fl(alpha * p_k)
+/// |w_0 - W_0|_absolute  <=  (eta/2) * D                 w_0 = p_(n-1), no alpha factor
 /// ```
 ///
-/// — each earlier rounding damped by every multiplication after it, plus one for
-/// the final `alpha * p_k`. **`alpha` stays in.** Dropping it for `alpha <= 1`
-/// leaves `(1 + D)`, which is about `1 / alpha` where the derived coefficient is
+/// Both come off the same chain. In the subnormal range every rounding is
+/// absolute, at most `eta / 2`, and the one at step `j` is damped by the
+/// `K - 1 - j` multiplications after it, so
+/// `|p_K - b^K| <= (eta/2) * sum_{m<K} b^m <= (eta/2) * D` — and the leading `1`
+/// of that geometric sum **is** the last chain step's own rounding, undamped.
+///
+/// - For `i >= 1` the weight is `fl(alpha * p_k)`. That final multiplication adds
+///   one further undamped `eta/2` — the `1` — and damps every chain rounding by
+///   `alpha` — the `alpha * D`.
+/// - For `i == 0` the weight is the bare `p_(n-1)`. There is no final
+///   multiplication, so it contributes no rounding of its own and damps none of
+///   the chain's: the unit is `D`, which already carries the last chain step as
+///   its own leading term.
+///
+/// The two **coincide exactly at `alpha = 1/2`** (`D = 2`, and `1 + 0.5 * 2 = 2`),
+/// which is why splitting them does not move the published dyadic contract by a
+/// bit.
+///
+/// **`alpha` stays in the general term.** Dropping it for `alpha <= 1` leaves
+/// `(1 + D)`, which is about `1 / alpha` where the derived coefficient is
 /// about `2`, so the term grows as the coefficient shrinks and refuses folds
 /// whose direction is not in doubt: at `alpha = 0.05, n = 14471`, one `2^400`
 /// component on a zero weight and one `2^-400` component on a normal one, the
@@ -1000,10 +1059,40 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 /// half-spacing, and the smallest quantity of this shape that *is* representable
 /// — which leaves the same factor of two for the roundings in `D` and the mass.
 ///
-/// A `w_i` that flushed to zero is covered by the same line rather than by a case
-/// of its own: `fl(alpha * p_k) == 0` means `alpha * p_k` was under half the
-/// spacing, so `W_i` itself is under `(EPSILON/2) * MIN_NORMAL * (1 + alpha * D)`
-/// up to the relative factor already charged.
+/// **Nothing smaller than `D` will do at window 0**, because the ladder does not
+/// decay to zero: past the flush point it **stalls**. `fl(p * b) == p` as soon as
+/// `(1 - b) * p <= eta / 2`, that is `p <= (eta/2) * D`, so the chain lands on a
+/// fixed point of the subnormal grid that attains the derived bound. Measured,
+/// with `n` chosen just past the flush and `w[0]` in units of `eta`:
+///
+/// ```text
+/// alpha      0.02  0.05   0.1  0.125  0.15   0.2   0.25   0.3   0.4  0.5  0.75   0.9
+/// w[0]/eta     24     9     5      4     3     2      2     1     1    0     0     0
+/// D          50.0  20.0  10.0    8.0  6.67   5.0    4.0  3.33   2.5  2.0  1.33  1.11
+/// ```
+///
+/// against a `(1 + alpha * D)` that is a flat `2` at every one of those
+/// coefficients. `alpha = 0.05` stalls at `9 * eta` where the general unit charges
+/// `2 * eta`, so the oldest weight sits at `4.5x` its own supposed bound and one
+/// `2^400` component on it clears the gate;
+/// `the_oldest_weights_charge_is_not_damped_by_alpha` drives that.
+///
+/// **The unit quantizes the coefficient, not the product.** `MIN_NORMAL *
+/// EPSILON` is `2^-1074`, the smallest positive `C` there is, so
+/// `coefficient * (MIN_NORMAL * EPSILON)` rounds the *coefficient* to the nearest
+/// integer. Soundness therefore needs `round(D) >= D / 2`, which holds for every
+/// `D >= 1` — and `D = 1 / (1 - b) >= 1` always. It is also why the general
+/// term's `(1 + alpha * D)` is a flat `2 * 2^-1074` at **every** coefficient
+/// (`alpha * D` is about `1` by construction) and so could never have tracked a
+/// stall that grows as `D / 2`. `b < 1` implies `1 - b >= 2^-53`, so `D <= 2^53` and
+/// `D * (MIN_NORMAL * EPSILON) <= 2^-1021`: always finite, never overflowing, and
+/// normal for any coefficient small enough to matter.
+///
+/// A `w_i` that flushed to zero is covered by its own position's line rather than
+/// by a case of its own: `fl(alpha * p_k) == 0` means `alpha * p_k` was under half
+/// the spacing, so `W_i` is under `(eta/2) * (1 + alpha * D)` up to the relative
+/// factor already charged; and `p_(n-1) == 0` means `b^(n-1)` was under
+/// `(eta/2) * D` by the chain bound above, which is `W_0` up to the same factor.
 ///
 /// # Zero wherever the ladder is exact
 ///
@@ -1014,8 +1103,8 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 ///   ladders. The first keeps the newest window at an exact `1` and every other
 ///   weight at an exact zero; the second keeps the oldest at an exact `1` and does
 ///   the same to the rest. Both are answered before anything is read — charging
-///   the absolute unit against a `2^400` component sitting on one of `alpha == 1`'s
-///   exact zeros would refuse an entirely determined fold.
+///   either absolute unit against a `2^400` component sitting on one of
+///   `alpha == 1`'s exact zeros would refuse an entirely determined fold.
 /// - **`alpha >= 1/2` with a power-of-two `b`**: Sterbenz makes `1 - alpha` exact
 ///   for `alpha >= 1/2`, so `b` *is* the ideal complement rather than a rounding
 ///   of it, and multiplying by a power of two moves only the exponent — so every
@@ -1027,21 +1116,26 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 ///   in the ladder, and it is why `alpha = 1 - 2^-43`'s subnormal witness is
 ///   unchanged to the bit.
 ///
-/// The absolute part survives a power-of-two `b`, and must: the ladder is exact
-/// only while its value is representable, and `alpha = 1 - 2^-43` walks straight
-/// onto the flush boundary.
+/// The absolute part survives a power-of-two `b` at both positions, and must: the
+/// ladder is exact only while its value is representable, and `alpha = 1 - 2^-43`
+/// walks straight onto the flush boundary. It is the two *coefficients* that
+/// differ there, never the certificate — the relative part is zero at every index
+/// and the absolute one is charged at every index that flushed, window 0 by its
+/// own line.
 ///
 /// `b == 1` — the chain that never decays, reached by every `alpha <= 2^-54` — is
 /// **not** a third certificate, and the note that once called it one was wrong.
-/// Nothing is ever *formed* in the subnormal range there, so the absolute part is
-/// zero by its own condition; but the *ideal* ladder does still decay, by about
-/// `alpha` per step, while every materialized weight stays an identical `alpha`.
+/// Nothing is ever *formed* in the subnormal range there, so both absolute units
+/// are zero by their own condition; but the *ideal* ladder does still decay, by
+/// about `alpha` per step, while every materialized weight stays an identical
+/// `alpha`.
 /// That is the complement rounding at its largest, and the relative part charges
 /// it `k` times over, as it must.
 ///
-/// `D` is bounded by the geometric sum alone and not also by the window count,
-/// because the count can never be the smaller of the two *here*: it binds only
-/// when `n < 1 / (1 - b) ~ 1 / alpha`, while reaching this regime at all needs
+/// `D` — the damping both units are written over — is bounded by the geometric
+/// sum alone and not also by the window count, because the count can never be
+/// the smaller of the two *here*: it binds only when
+/// `n < 1 / (1 - b) ~ 1 / alpha`, while reaching this regime at all needs
 /// `n * log2(1 / b) > 1022`, and `log2(1 / b) ~ 1.4427 * alpha` turns that into
 /// `n > 708 / alpha > 708 * n`. A cap that cannot bind would read as
 /// load-bearing while being unreachable, which is the same reason
@@ -1061,16 +1155,31 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
   // representable index, so only the flush below the exponent range is left.
   let half = C::from_f32(0.5);
   let exact_chain = alpha >= half && C::ONE.ldexp(b.exponent()) == b;
-  // The absolute unit, `(EPSILON/2) * MIN_NORMAL * (1 + alpha * D)` charged at
-  // twice its derived size, in the one grouping that keeps it representable:
-  // `MIN_NORMAL * EPSILON` is `2^-1074` exactly and `(1 + alpha * D)` keeps it
-  // normal. `b == C::ONE` is the chain that never decays, so no weight is ever
-  // formed in the subnormal range — and it is the one value at which the damping
-  // would divide by zero.
-  let absolute = if b < C::ONE {
-    (C::ONE + alpha * (C::ONE / (C::ONE - b))) * (C::MIN_NORMAL * C::EPSILON)
+  // Two absolute units over one damping, because the ladder builds `weights[0]`
+  // differently from every other entry and a unit derived for one position is not
+  // a bound at the other. `w_i = fl(alpha * p_k)` for `i >= 1`: that last
+  // multiplication rounds once undamped (the `1`) and damps every chain rounding
+  // by `alpha` (the `alpha * D`). `w_0 = p_(n-1)` has no such multiplication, so
+  // its chain roundings arrive undamped and its unit is the bare `D`, whose own
+  // leading term is the last chain step. Both are `(EPSILON/2) * MIN_NORMAL`
+  // times their coefficient charged at twice that size, in the one grouping that
+  // keeps them representable: `MIN_NORMAL * EPSILON` is `2^-1074` exactly, and
+  // every coefficient here is at least `1`. They coincide at `alpha = 1/2`
+  // (`D = 2`), which is why splitting them moves no dyadic verdict.
+  //
+  // `b == C::ONE` is the chain that never decays, so no weight is ever formed in
+  // the subnormal range — and it is the one value at which the damping would
+  // divide by zero.
+  let (absolute, absolute_oldest) = if b < C::ONE {
+    let damping = C::ONE / (C::ONE - b);
+    (
+      // Grouped exactly as it was before the oldest window got a unit of its
+      // own, so the general term stays bit-identical.
+      (C::ONE + alpha * damping) * (C::MIN_NORMAL * C::EPSILON),
+      damping * (C::MIN_NORMAL * C::EPSILON),
+    )
   } else {
-    C::ZERO
+    (C::ZERO, C::ZERO)
   };
   let mut slack = C::ZERO;
   for (i, (&w, emb)) in weights.iter().zip(embeddings).enumerate() {
@@ -1085,7 +1194,9 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
       C::from_f64(2.0 * ((n - 1 - i) as f64) + 2.0) * C::EPSILON * w
     };
     if w < C::MIN_NORMAL {
-      error = error + absolute;
+      // The oldest window is the one the backward pass leaves without an `alpha`
+      // factor, so it is the one the general unit does not bound.
+      error = error + if i == 0 { absolute_oldest } else { absolute };
     }
     // `l2_norm` rather than a componentwise sum: it is the norm the residue is
     // bounded by, and it is the same scale-aware spelling the gate measures

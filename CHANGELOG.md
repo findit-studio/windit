@@ -844,10 +844,19 @@ public names:
 
   ```text
   tau = 16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD + S
-  S   = MIN_NORMAL * EPSILON * (1 + D) * sum_i ||e_i||   over the windows whose
+  S   = MIN_NORMAL * EPSILON * sum_i c_i * ||e_i||       over the windows whose
                                                          weight is below MIN_NORMAL
+  c_i = 1 + alpha * D   for i >= 1                       w_i = fl(alpha * p_k)
+  c_0 = D                                                w_0 = p_(n-1), no alpha
   D   = 1 / (1 - fl(1 - alpha))                          the chain's own damping
   ```
+
+  The oldest window is the exception the recurrence's own convex form already
+  names: `w_0` is the bare `(1 - alpha)^(n - 1)`, so the `1 + alpha * D` derived
+  from the general weight's final `alpha *` multiplication — the `1` is that
+  multiplication's own rounding, the `alpha * D` is every chain rounding damped by
+  it — is not a bound on it, and the undamped `D` is. The two coincide at
+  `alpha = 1/2`, so no dyadic verdict moves.
 
   Where a weight's error is absolute the residue of an exactly cancelling fold is
   `R_j = sum_i (w_i - W_i) * e_ij` against the **ideal** weights, so

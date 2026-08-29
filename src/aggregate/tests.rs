@@ -1297,12 +1297,17 @@ fn the_oldest_window_is_charged_for_its_own_underflowed_weight() {
 
   // The mass window 0 carries, against the mass the rest of the ladder does: an
   // off-by-one that skipped it would leave the slack four orders under the
-  // residue rather than twelve orders over it.
+  // residue rather than eleven orders over it. The margin halved when the oldest
+  // window's absolute unit stopped being borrowed from the general one: its unit
+  // is the bare `D`, which at `alpha = 1 - 2^-53` is `1 + 2^-53` and quantizes to
+  // one `2^-1074` where the general `(1 + alpha * D)` quantizes to two. Against
+  // an error of `2^-1113` that still over-bounds by `2^39`, and the separation
+  // between "with window 0" and "without" it is unchanged.
   let slack = ema_formation_slack(&w, &refs, alpha, b);
   let without_zero = ema_formation_slack(&w[1..], &refs[1..], alpha, b);
   let residue = (w[1] * c_lo + w[0] * c_hi).abs();
   assert!(
-    slack / residue > 1e12 && without_zero / residue < 1e-3,
+    (5.4e11..5.6e11).contains(&(slack / residue)) && without_zero / residue < 1e-3,
     "window 0 is where this input's mass is: {slack:e} with it, {without_zero:e} \
      without, against a residue of {residue:e}"
   );
@@ -1312,6 +1317,298 @@ fn the_oldest_window_is_charged_for_its_own_underflowed_weight() {
     matches!(got, Err(WinditError::NonFinite)),
     "an exactly cancelling in-domain fold has no direction; got {got:?}"
   );
+}
+
+/// The oldest weight is not `alpha` times anything, so the charge that damps by
+/// `alpha` is not its charge.
+///
+/// FALSIFIER for the fourth defect on this seam, and the same shape as the three
+/// before it: a bound derived for the general term, applied to the element the
+/// module's own text names as the exception. `weights[0]` is the bare ladder
+/// value `p_(n-1)`; every other weight is `fl(alpha * p_k)`. The absolute unit
+/// `(1 + alpha * D)` is derived from that final multiplication — the `1` is its
+/// own rounding and the `alpha * D` is every chain rounding *damped by it*.
+/// Window 0 has no such multiplication, so its chain roundings arrive undamped
+/// and its unit is the bare `D`.
+///
+/// The gap is `1 / (2 * alpha)`, and it is reachable because the ladder does not
+/// decay to zero: past the flush point `fl(p * b) == p` and the chain **stalls**
+/// at a fixed point of the subnormal grid, at `m` ulps with
+/// `(1 - b) * m <= 1/2` — that is `m <= D / 2`, exactly the derived bound and
+/// tight against it. `alpha = 0.05` stalls at `9 * 2^-1074` against a shipped
+/// charge of `2 * 2^-1074`, so the oldest weight is `4.5x` its own error bound
+/// and one `2^400` component on it clears the gate.
+///
+/// What the fold then returns is entirely an artifact of that fixed point: the
+/// ideal `(1 - alpha)^19999 * 2^400` is about `2^-1080`, eighty binary orders
+/// below the `2^-1000` determinacy floor, so no direction is determined at
+/// working precision and `Ok([1.0])` is a fabrication.
+#[test]
+fn the_oldest_weights_charge_is_not_damped_by_alpha() {
+  // The stall, over the coefficients that reach it. `w[0]` is the fixed point
+  // the chain lands on, `D / 2` is the bound it is tight against, and the
+  // shipped `(1 + alpha * D)` unit is a flat `2 * 2^-1074` at every coefficient
+  // — which is the whole of the defect: the unit does not grow as the ladder's
+  // stall does.
+  let eta = libm::ldexp(1.0, -1074);
+  for (alpha, n, stall) in [
+    (0.02_f64, 37_049_usize, 24.0_f64),
+    (0.05, 20_000, 9.0),
+    (0.1, 7_266, 5.0),
+    (0.125, 5_776, 4.0),
+    (0.15, 4_781, 3.0),
+  ] {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, n);
+    assert_eq!(
+      w[0],
+      stall * eta,
+      "alpha {alpha}: the oldest weight is the ladder's subnormal fixed point"
+    );
+    assert_eq!(
+      w[0] * b,
+      w[0],
+      "alpha {alpha}: and it is a fixed point — the chain has stopped decaying"
+    );
+    let damping = 1.0 / (1.0 - b);
+    assert!(
+      stall <= damping / 2.0 && stall > damping / 2.0 - 1.0,
+      "alpha {alpha}: the stall is tight against the derived `(eta/2) * D`: \
+       {stall} against {}",
+      damping / 2.0
+    );
+
+    // The charge the slack assigns window 0, read off the production function:
+    // a unit window there and zeros everywhere else leave `S = E_0 * 1`.
+    let mut components = vec![0.0_f64; n];
+    components[0] = 1.0;
+    let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+    let charge = ema_formation_slack(&w, &refs, alpha, b);
+    assert!(
+      charge >= w[0],
+      "alpha {alpha}: window 0's charge must bound window 0's own weight, which \
+       is the whole of its error where the ideal has left the range — \
+       {charge:e} against {:e}",
+      w[0]
+    );
+  }
+
+  // The verdict, on the production path, at the reviewer's row.
+  let (alpha, n) = (0.05_f64, 20_000_usize);
+  let w = ema_ladder(alpha, n);
+  // The ideal weight this stall stands in for, in the only arithmetic that can
+  // hold it: `(n - 1) * log2(1 - alpha)`. Below `2^-1400`, so the ideal
+  // contribution of a `2^400` component is below `2^-1000` — the determinacy
+  // floor — and there is no direction to return.
+  let log2_ideal = (n as f64 - 1.0) * libm::log2(1.0 - alpha);
+  assert!(
+    log2_ideal < -1400.0,
+    "the ideal weight is {log2_ideal} binary orders down, far past any f64"
+  );
+
+  let mut components = vec![0.0_f64; n];
+  components[0] = libm::ldexp(1.0, 400);
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  // What the fold accumulates is the stall times that component — an ordinary
+  // normal `f64`, nowhere near the floor, which is why neither the floor nor
+  // `16 * EPSILON * ||M||` can gate it.
+  let acc = w[0] * components[0];
+  assert_eq!(acc, libm::ldexp(1.125, -671), "the accumulator is normal");
+  assert!(
+    16.0 * f64::EPSILON * acc + f64::MIN_GATE_THRESHOLD < acc,
+    "and the gate's own two terms are nowhere near it"
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a fold whose whole mass rides on a stalled subnormal weight has no \
+     direction at working precision; got {got:?}"
+  );
+}
+
+/// Every window's charge bounds *that* window's own weight error.
+///
+/// The audit made executable, and the one shape a summed assertion cannot see.
+/// `E_i` is a bound on `|w_i - W_i|` at each position *separately*, so the moment
+/// the check is `sum_i E_i * ||e_i|| >= sum_i |w_i - W_i| * ||e_i||` — which is
+/// what `the_formation_slack_bounds_the_actual_weight_error` next door measures —
+/// a term that is too large at one index pays for a term that is too small at
+/// another. All four defects on this seam were the same shape: a bound derived
+/// for the general term applied to an element the crate already knew was special.
+/// `weights[0]` is the bare `p_(n - 1)` the recurrence leaves for the window
+/// nothing preceded, and it carries no `alpha` factor for `(1 + alpha * D)` to
+/// have been derived from.
+///
+/// The charge is *read off* the production function rather than re-derived: a
+/// unit embedding at window `i` and the zero vector everywhere else leaves
+/// `S = E_i * l2_norm([1.0])`, and `l2_norm([1.0])` is exactly `1`.
+///
+/// The reference `W_i` has to be carried where `f64` cannot follow — at
+/// `alpha = 0.05, n = 20000` the ideal weight is about `2^-1480` — so it is a
+/// double-double `(hi, lo)` over an `i32` exponent of its own, renormalized with
+/// `frexp` at every step, and both sides of the comparison stay in that
+/// representation rather than in a scalar that would flush the ideal to zero.
+#[test]
+fn every_windows_charge_bounds_that_windows_own_weight_error() {
+  // `(hi + lo) * 2^e` with `hi` in `[0.5, 1)`, so a comparison is an exponent and
+  // then a mantissa, and never an `f64` that has to hold the value.
+  fn renorm(hi: f64, lo: f64, e: i32) -> (f64, f64, i32) {
+    let (m, ex) = libm::frexp(hi);
+    (m, libm::ldexp(lo, -ex), e + ex)
+  }
+
+  // `a >= b` for two normalized non-negative scaled values.
+  fn at_least(a: (f64, i32), b: (f64, i32)) -> bool {
+    if b.0 == 0.0 {
+      true
+    } else if a.0 == 0.0 {
+      false
+    } else if a.1 == b.1 {
+      a.0 >= b.0
+    } else {
+      a.1 > b.1
+    }
+  }
+
+  // `|w - W|`, normalized. The two can be thousands of binary orders apart, so
+  // the smaller is dropped past `200` bits — which over-states the difference and
+  // so only ever makes the assertion harder to satisfy.
+  fn distance(w: f64, ideal: (f64, f64, i32)) -> (f64, i32) {
+    let (ihi, ilo, ie) = ideal;
+    if w == 0.0 {
+      return (ihi, ie);
+    }
+    let (wm, we) = libm::frexp(w);
+    let e = we.max(ie);
+    let a = if we - e < -200 {
+      0.0
+    } else {
+      libm::ldexp(wm, we - e)
+    };
+    let (bhi, blo) = if ie - e < -200 {
+      (0.0, 0.0)
+    } else {
+      (libm::ldexp(ihi, ie - e), libm::ldexp(ilo, ie - e))
+    };
+    let d = ((a - bhi) - blo).abs();
+    if d == 0.0 {
+      (0.0, 0)
+    } else {
+      let (m, ex) = libm::frexp(d);
+      (m, e + ex)
+    }
+  }
+
+  // Returns how many of the checked positions had actually left the exponent
+  // range, so no row can pass by never reaching the regime it is here for.
+  fn check(alpha: f64, n: usize, full: bool) -> usize {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, n);
+    let mut checked = vec![full; n];
+    if !full {
+      // Ends, quarters, and the two indices that bracket the flushed run: the
+      // positions where a bound derived for one place can differ from the bound
+      // that place is owed.
+      for i in [0, 1, 2, 3, n / 4, n / 2, 3 * n / 4, n - 3, n - 2, n - 1] {
+        checked[i] = true;
+      }
+      if let Some(i) = w.iter().position(|&x| x < f64::MIN_NORMAL) {
+        checked[i] = true;
+      }
+      if let Some(i) = w.iter().rposition(|&x| x < f64::MIN_NORMAL) {
+        checked[i] = true;
+      }
+    }
+
+    // One slice per window, switched between the unit and the zero vector, so the
+    // sweep allocates once rather than once per position.
+    let one = [1.0_f64];
+    let zero = [0.0_f64];
+    let mut refs: Vec<&[f64]> = vec![&zero[..]; n];
+
+    let (bhi, blo) = dd_complement(alpha);
+    let (mut hi, mut lo, mut e) = renorm(1.0, 0.0, 0);
+    let mut flushed = 0_usize;
+    for k in 0..n {
+      // Window `n - 1 - k` carries `alpha * p_k`, except window 0, whose weight
+      // is the bare `p_(n - 1)`.
+      let i = n - 1 - k;
+      let ideal = if i == 0 {
+        renorm(hi, lo, e)
+      } else {
+        let (p, err) = two_product(alpha, hi);
+        let t = err + alpha * lo;
+        let s = p + t;
+        renorm(s, (p - s) + t, e)
+      };
+      if checked[i] {
+        refs[i] = &one[..];
+        let charge = ema_formation_slack(&w, &refs, alpha, b);
+        refs[i] = &zero[..];
+        let scaled = if charge == 0.0 {
+          (0.0, 0)
+        } else {
+          libm::frexp(charge)
+        };
+        let want = distance(w[i], ideal);
+        assert!(
+          at_least(scaled, want),
+          "alpha {alpha}, n {n}, window {i}: the charge must bound this window's \
+           own weight error — {charge:e} against {:e} * 2^{}, where the weight is \
+           {:e} and its ideal is {:e} * 2^{}",
+          want.0,
+          want.1,
+          w[i],
+          ideal.0 + ideal.1,
+          ideal.2
+        );
+        flushed += usize::from(w[i] < f64::MIN_NORMAL);
+      }
+      // `p_(k + 1) = p_k * b`.
+      let (p, err) = two_product(hi, bhi);
+      let t = ((err + hi * blo) + lo * bhi) + lo * blo;
+      let s = p + t;
+      (hi, lo, e) = renorm(s, (p - s) + t, e);
+    }
+    flushed
+  }
+
+  assert_eq!(
+    l2_norm(&[1.0_f64]),
+    1.0,
+    "the charge is read off the production function, so a unit window must weigh \
+     exactly one"
+  );
+
+  // Every position, over ladders short enough for an O(n^2) sweep. The first
+  // three reach the flush; `alpha = 0.4, n = 1000` is the control that stays
+  // inside the exponent range from end to end, where only the relative half is
+  // charged and window 0 is a normal `f64` like every other.
+  for (alpha, n, flushes) in [
+    (0.9_f64, 524_usize, true),
+    (0.75, 737, true),
+    (0.5, 1274, true),
+    (0.4, 1000, false),
+  ] {
+    let flushed = check(alpha, n, true);
+    assert_eq!(
+      flushed > 0,
+      flushes,
+      "alpha {alpha}, n {n}: the sweep must reach the regime it is here for — \
+       {flushed} flushed weights checked"
+    );
+  }
+
+  // The small coefficients, whose flush needs an `n` no full sweep can afford.
+  // These are the rows where the two coefficients differ most: `D` is `20` at
+  // `alpha = 0.05` against a general term that is a flat `2`.
+  for (alpha, n) in [(0.05_f64, 20_000_usize), (0.1, 7_266), (0.15, 4_781)] {
+    assert!(
+      check(alpha, n, false) > 0,
+      "alpha {alpha}, n {n}: the sample must include a flushed weight"
+    );
+  }
 }
 
 /// The weight-underflow slack is a per-dimension mass, not `n * max |e|`.
