@@ -134,9 +134,17 @@ passes. A [`Decoder`] threads them in order — smoother, then gate, then
 [`Segmenter`] — and reports both output planes per window: `active`, the gate's
 immediate causal decision, and `finalized`, a [`Range`] no later input can
 change. Concatenating the finalized ranges with the `finish` tail reproduces the
-batch composition exactly, so a live decode and an offline one agree by
-construction. The pipeline itself allocates nothing and needs no feature — only
-the `Vec` collecting its output below does.
+batch composition exactly, so an incremental — including chunked — decode agrees
+with the offline one by construction, under the documented span contract
+(ascending `span.start`; a genuine timeline break is declared with
+`discontinuity`) and the documented lifecycle (a batch call starts from fresh
+state; a streaming state carries across pushes until it is reset). That parity,
+chunk-partition invariance included, is what the crate tests. It is not a claim
+about VAD or endpointing *quality*, about detecting a break the caller has not
+declared, or about conversational turn semantics — those depend on the scores fed
+in and on the consumer's own epoch bookkeeping, and windit measures none of them.
+The pipeline itself allocates nothing and needs no feature — only the `Vec`
+collecting its output below does.
 
 ```rust
 use windit::prelude::*;
@@ -289,9 +297,9 @@ Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
 dual licensed as above, without any additional terms or conditions.
 
-[Github-url]: https://github.com/Findit-AI/windit
-[CI-url]: https://github.com/Findit-AI/windit/actions/workflows/ci.yml
-[codecov-url]: https://app.codecov.io/gh/Findit-AI/windit/
+[Github-url]: https://github.com/findit-studio/windit
+[CI-url]: https://github.com/findit-studio/windit/actions/workflows/ci.yml
+[codecov-url]: https://app.codecov.io/gh/findit-studio/windit/
 [crates-url]: https://crates.io/crates/windit
 [doc-url]: https://docs.rs/windit
 [license-url]: https://github.com/findit-studio/windit#license

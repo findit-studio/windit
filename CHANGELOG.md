@@ -6,217 +6,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
-### Documented
-
-- **`aggregate::EmaRenormalized`'s accumulated weight error is a bound with no
-  reach, and the note that claimed its underflow regime was gated was wrong**
-  ([#16], [#17]). *(No arithmetic changed, so this is not a fourth re-measure:
-  every aggregation is bit-identical to `main`.)*
-
-  #16 measured the weights' relative error growing at about `0.7 * n * u`,
-  crossing the determinacy gate's own `16 * EPSILON = 32u` near `n = 32`, and
-  asked for a witness before calling it a defect. There is no witness, and the
-  reason is structural rather than a failure to search hard enough.
-
-  For any input whose ideal weighted sum is exactly zero the ideal terms `t_i`
-  sum to zero, so any constant may be subtracted from the weights' relative
-  errors `d_i` and the residue the gate sees obeys
-
-  ```text
-  |sum_i t_i d_i| / sum_i |t_i|  <=  (max_i d_i - min_i d_i) / 2
-  ```
-
-  A witness therefore needs the error's **spread over its own support** above
-  `64u`, never its size. And two windows cancel exactly only when their ideal
-  weight ratio `(1 - alpha)^d` is an exact ratio of two `f64` significands:
-  writing the complement as `B * 2^-q` with `B` odd, that needs `B^d < 2^53`, a
-  lever capped at `d <= 53 / log2(B)`. The same small `B` that buys a long lever
-  is what makes `(1 - alpha)^k` exactly representable, and so the chain exact,
-  over that very range. The two requirements pull against each other, and the
-  measurement is what settles it:
-
-  ```text
-  every complement B * 2^-q, B odd up to 2^40 - 1, q in 1..=53,
-  at every chain index whose materialized weight is a normal f64:
-    widest reachable |d_k - d_{k+d}| within the lever cap   10.0 u
-    needed to clear the gate                                64.0 u
-  driving the fold over the same space:
-    exactly cancelling two-window pairs evaluated           5 072 311
-    largest residue any of them leaves                      0.162 * threshold
-    plus 56 736 adjacent pairs at arbitrary alpha           0.038 * threshold
-  complements whose whole error spread does clear 64u:
-    support span they would need                            131 to 7609 chain steps
-    their own two-window lever cap                          2 to 13
-    reach a three-window chain adds                         2.2x, measured
-  ```
-
-  So closing that gap needs a support of 30 to 600 windows whose interior terms
-  all vanish against the two carrying the mass, each interior step buying its
-  reach from a separate modular coincidence. That is the part not proved — it is
-  a counting argument and a search, not a theorem — and it is what
-  "measured, and therefore not changed" rests on here.
-
-  The cure #16 named was checked rather than repeated.
-  `alpha * (1 - alpha).powi(k)` is **not** "one rounding instead of `k`": `powi`
-  is exponentiation by squaring, so `O(log k)` roundings and not correctly
-  rounded, and — decisively — it raises the same `fl(1 - alpha)` the chain does.
-  That single complement rounding, multiplied by `k`, is the larger part of the
-  error, and `powi` does not touch it. At `alpha = 0.46, n = 64`: `58.75u` for
-  the chain against `48.15u` for `powi`, a fifth, not a factor of `k`. At a
-  dyadic `alpha`, where the complement is exact, both are exact and there is
-  nothing to buy — so the documented bit-exactness at `alpha = 0.5` was never in
-  question either way.
-
-  Looking for that witness found a different one, in the same class and with a
-  different mechanism, now tracked as [#17]. The module note claimed a subnormal
-  weight drives the fold's own products subnormal, leaving `MIN_GATE_THRESHOLD`
-  to gate alone. That holds only while the components are `O(1)`; the input
-  domain admits `2^400`, and a large component lifts the product of a subnormal
-  weight back into the ordinary range where the floor is nowhere near it. The
-  note is corrected — in three places, since `Real::MIN_GATE_THRESHOLD`'s own
-  doc carried the same incomplete `K_abs` derivation (it covers the *product*
-  rounding, `sqrt(dim) * n * 2^-1075`, and not the *weight* rounding,
-  `2^-1075 * sum_i |e_ij|`, which the input domain's `2^400` ceiling takes to
-  `n * 2^-675`) and `Real::MIN_AGG_MAGNITUDE`'s pointed at it. The `aggregate`
-  module gains an *A weight below the exponent range* section stating where the
-  gate's guarantee stops:
-
-  ```text
-  alpha = 0.9, n = 326, two ordinary components near 1e24
-    exact ideal weighted sum   0
-    materialized w[323]        9.88e-324  a subnormal, one step above the flush
-    materialized w[324]        0          its ideal partner has no f64 at all
-    today                      Ok([1.0])  a direction fabricated from cancellation
-  ```
-
-  Nothing there is the repeated multiplication: the same input works at
-  `alpha = 0.5`, where every representable weight is exact to the bit, and
-  `powi` reaches the same zero. `0.3.0` ships with the gap open and pinned; #17
-  carries the candidate cure and the re-measure a shared-gate change obliges.
-
-  The "not a re-measure" claim above is measured rather than asserted, against
-  the consumer that actually drives this surface — coremlit's
-  `embeddings::clap::aggregate`, a pass-through to `aggregate` over
-  plan-produced spans and unit `f32` embeddings — run against `main` and against
-  this branch and compared bit for bit:
-
-  ```text
-  aggregations   2304 (dim 64 and 512, 1..64 windows, all four policies,
-                 EmaRenormalized at alpha 0.1 / 0.5 / 0.9)
-  components     663 552 compared as raw bits
-  slices moved   0 of 2304
-  largest displacement   0
-  ```
-
-- **`SmoothPolicy::smooth`'s `V: Clone` is kept, and the reason is now a number
-  rather than an argument about the bound's shape** ([#13]). `Smoother::push`
-  takes its window by value, so the batch convenience clones each one out of the
-  borrowed slice — four bytes for a score, a whole vector for an embedding. Three
-  ways out were considered and two rejected:
-
-  - **Taking `&Windowed<V>` in `Smoother::push`** would drop the bound from
-    `smooth` entirely, and it is the option that moves the cost rather than
-    routing around it. It also moves a bound: `IdentityState` can no longer
-    return `Ok(w)`, because there is no owned `V` behind a borrow, so `Identity`
-    — today generic over *every* `V` — would gain `V: Clone` on its streaming
-    path and cascade it to the `SmoothPolicy` impl. That is not a trade between
-    two costs. The embeddings it helps already have a bound-free path (drive the
-    `Smoother`); the value-free pipeline it breaks would have none left, and
-    `Decoder` threads `Identity` over exactly such a payload in
-    `tests/genericity.rs`. Verified with the compiler rather than argued:
-    `Ok(Windowed::new(w.value().clone(), w.span()))` fails with ``expected type
-    parameter `V`, found `&V` `` and the note ``V` does not implement `Clone`, so
-    `&V` was cloned instead``, and completing the change reds the acceptance
-    suite with ``the trait bound `V: Clone` is not satisfied``.
-  - **A second, by-reference batch method** leaves two entry points to justify
-    against a saving measured below.
-
-  What the clone actually costs, against the vector EMA at 512 components —
-  the widest smoother the crate ships and the case that raised the question:
-  **under 2%** of the batch call. 50 ns of a 5.63 µs window at `f32` storage,
-  70 ns of 5.39 µs at `f64`, stable across four (width, length) shapes. The
-  recurrence renormalizes every window — several passes and two divisions per
-  component — against the clone's one allocation and one copy. Its share of the
-  *allocation traffic* is the larger figure and is stated too: one of three
-  allocations per window, a quarter of the bytes (exact counts, not timings).
-
-  The timings are interleaved minima against a counting allocator rather than
-  benchmark means, because a sub-2% difference is under what criterion resolves
-  on a machine that is doing anything else — which is itself part of the answer.
-
-  So the bound stays, on the method where it already was. What changes is that
-  the cost is written down beside it, with the bound-free alternative and a
-  runnable example, and that both are now checkable rather than claimed.
-
-- The `smooth` module note points at that discussion from the batch-convenience
-  paragraph, and `test_support::TestVec` records that its *absence* of `Clone` is
-  load-bearing.
-
-### Added
-
-- **`smooth/vector_ema` and `smooth/vector_ema_streaming` benchmarks**, at 64 and
-  512 components over 256- and 4096-window sequences. The pair is the crate's
-  fourth deliberately comparable one: both arms run one recurrence per window and
-  allocate one output vector, and the streaming arm takes its input copy in
-  untimed setup, so the gap between them is the batch method's per-window clone
-  and nothing else — a bound on it rather than a sharp figure, for the reason the
-  streaming arm's own note gives: that setup churns the allocator between timed
-  regions, biasing against the arm that does less work.
-
-  Until now the bench file covered the scalar smoothers only, so the vector
-  smoother's cost — the one that made the bound worth re-examining — could not be
-  measured from inside the repository at all.
-
-### Tested
-
-- **Two `aggregate` rows for the EMA weight ladder, one a falsifier and one a
-  characterization of a live gap** ([#16], [#17]).
-  `ema_weight_error_accumulates_but_no_input_can_reach_the_gate` measures the
-  accumulated error against a double-double reference — the complement carried
-  as an exact `hi + lo` pair, because `1 - alpha` is generally not an `f64` and
-  rounding it once and raising it is the larger half of the error — then drives
-  the strongest exactly cancelling pair the lever admits and pins its residue at
-  a sixth of the threshold. `ema_weights_below_the_exponent_range_fabricate_a_direction`
-  pins today's `Ok([1.0])` on the #17 witness, with the mechanism asserted
-  (surviving weight subnormal, its ideal partner exactly zero) rather than the
-  output alone.
-
-  Both were written against the mutations they have to catch. Dropping the gate's
-  constant from `16` to `2` reds the first; replacing the chain with
-  `powi` reds it too (through a bit-for-bit basis fold that ties the test's
-  replica ladder to the policy's own — without that tie the `powi` mutation
-  **passed**); and adding the missing absolute term to the threshold reds the
-  second while leaving all 310 other rows green, which is the evidence #17's
-  candidate cure rests on. The `powi` mutation leaving the second row green is
-  the record that #16's named cure does not fix #17.
-
-- **The vector smoother is reachable without `Clone`, from outside the crate, and
-  returns the identical stream that way.** `tests/genericity.rs` gains an
-  embedding double with no `Clone` and a `smooth_owned_any` helper bounded by
-  `E: Vector` alone, asserted component for component and span for span against
-  the batch path over the same components. This is the escape hatch the decision
-  above rests on, and it was unexercised: a mutation adding `Clone` to
-  `VectorEmaState`'s `Smoother` impl and its `SmoothPolicy` cascade **passed the
-  acceptance suite** before this test (16 passed, 0 failed) and fails to compile
-  after it.
-- **`tests/smooth_alloc.rs`: `SmoothPolicy::smooth` reports a refused output
-  vector rather than aborting.** The fifth refusing-allocator suite, beside the
-  aggregation, chunking, segmentation and decoding ones. Found by re-running the
-  mutation ledger for the work above: deleting the `try_reserve_exact` that backs
-  the method's documented `AllocFailed` passed the whole suite, so the error
-  variant was documented and unreachable. `Ema` over `f32` allocates nothing but
-  the output, which makes the case exact — the refusal can come from nowhere
-  else, and the reported `elements` is pinned to the input length. With the
-  reservation deleted the suite now aborts through `handle_alloc_error`
-  (`SIGABRT`, `memory allocation of 262144 bytes failed`) instead of returning.
-  A pre-existing gap, closed here because it is on the very method this entry is
-  about and the harness it needed was already in the repository.
-
-[#13]: https://github.com/findit-studio/windit/issues/13
-[#16]: https://github.com/findit-studio/windit/issues/16
-[#17]: https://github.com/findit-studio/windit/issues/17
-
-## 0.3.0
+## 0.3.0 - 2026-08-29
 
 One new smoother — the streaming sibling of an aggregation policy that already
 existed — and **two breaking changes of one class**: a number the fold multiplies
@@ -234,12 +24,13 @@ silently different number. The coverage change alters the signature of an
 *object-safe trait method*, so **every downstream `AggregatePolicy` stops
 compiling**, and it moves `CoverageWeightedMean`'s output for every caller.
 
-**Three numeric re-measures, not two** — and a fourth change to
-`CoverageWeightedMean` that is deliberately not one, because it moves only the
-answers that were wrong (20736 of 20736 synthetic four-window coverage slices
-fold bit-identically across it). Reviewing the coverage change turned up
-two more defects it had inherited rather than introduced, both fixed here and
-both listed below with measured numbers. `Span::coverage` was rounding each
+**Four numeric re-measures, not the two the breaks by themselves imply** — and a
+further change to `CoverageWeightedMean` that is deliberately not one, because it
+moves only the answers that were wrong (20736 of 20736 synthetic four-window
+coverage slices fold bit-identically across it). Reviewing the coverage change
+turned up two more defects it had inherited rather than introduced, and reviewing
+`EmaRenormalized`'s weight ladder turned up a third ([#16], [#17]); all are fixed
+here and listed below with measured numbers. `Span::coverage` was rounding each
 `usize` into an `f64` *before* dividing — a defect of the operands, not of the
 width, so widening had only moved the first geometry that shows it from `2^24 + 1`
 to `2^53 + 1`. And `CoverageWeightedMean` was reading the *scale* of a coverage
@@ -534,7 +325,7 @@ consumer against this crate:
 
 - **`aggregate::CoverageWeightedMean` lifts its coverage slice by a shared power
   of two before dividing, so no weight is ever formed in the subnormal range.**
-  *(Not a fourth re-measure: it moves only the answers that were wrong.)*
+  *(Not a re-measure: it moves only the answers that were wrong.)*
 
   Normalizing by the largest coverage made the fold's weights `c_i / max_j c_j`,
   and materializing each of those independently is sound only while the quotient
@@ -641,7 +432,7 @@ consumer against this crate:
   not jointly achievable — the second requires dividing by `max`, and that
   division is exact only when `max` is a power of two — so the choice is which to
   keep. A relative `u` on the weight costs the fold nothing the bound does not
-  already carry, and a fourth wholesale re-measure costs every caller who has
+  already carry, and another wholesale re-measure costs every caller who has
   pinned an output. The division stays.
 
 - **`scalar::Real` gains `from_f64`, a `'static` bound, and a `Debug`
@@ -883,11 +674,647 @@ public names:
   epoch and reused by every push after it; `reset` keeps their capacity, so a
   discontinuity costs no allocation.
 
+- **`scalar::Real::MIN_NORMAL`**, the smallest positive normal value (`2^-1022`
+  for `f64`). The boundary at which a rounding stops being relative, which is the
+  one question the weight-underflow slack asks of a materialized weight; its
+  product with `EPSILON` is the absolute grid below it (`2^-1074`), the unit the
+  slack is written in. Named for the property rather than after
+  `f64::MIN_POSITIVE`, which is that property under a misleading name — the
+  smallest positive `f64` is `2^-1074`, not this. Additive on a sealed trait, so
+  no downstream implementation can break; the ambiguity hazard the trait's own
+  *Not purely additive* note describes applies to it as it does to every other
+  associated item.
+
+- **`smooth/vector_ema` and `smooth/vector_ema_streaming` benchmarks**, at 64 and
+  512 components over 256- and 4096-window sequences. The pair is the crate's
+  fourth deliberately comparable one: both arms run one recurrence per window and
+  allocate one output vector, and the streaming arm takes its input copy in
+  untimed setup, so the gap between them is the batch method's per-window clone
+  and nothing else — a bound on it rather than a sharp figure, for the reason the
+  streaming arm's own note gives: that setup churns the allocator between timed
+  regions, biasing against the arm that does less work.
+
+  Until now the bench file covered the scalar smoothers only, so the vector
+  smoother's cost — the one that made the bound worth re-examining — could not be
+  measured from inside the repository at all.
+
+- **A `package` CI job** ([#11], F7). Every other job builds the working tree;
+  none built the *tarball*, whose contents `exclude` decides. It runs `cargo
+  package`, unpacks the result, and runs `cargo hack test --each-feature` from
+  inside it — so a file the acceptance suite needs and `exclude` drops fails CI
+  instead of the published crate.
+
+  It is a check on the tarball's *contents* and on nothing else, and the job says
+  so, because the name invites more. A `cargo publish --dry-run` step was in it
+  and is not: measured, that command exits `0` on a version already on crates.io
+  (`warning: crate windit@0.2.0 already exists on crates.io index`) and exits `0`
+  on a manifest with neither `description` nor `license` — which `cargo package`
+  also merely warns about — so it could not fail for anything the step above it
+  does not already catch, and paid a second verification build for the
+  privilege. Cargo's own warnings are outside `RUSTFLAGS: -Dwarnings`, so
+  nothing turned them red either.
+
+- **A `bench parity` CI job** ([#11], F1/F7). `cargo bench --bench windit --
+  --test` runs every benchmark once without measuring, which executes the
+  equivalence assertion each comparable arm makes outside its timed loop. The
+  pairs can no longer drift back into measuring different work: restoring the old
+  bare-threshold streaming arm fails this job with the diverging range lists.
+  Correctness only — no timing threshold is asserted anywhere, because a shared
+  runner cannot support one.
+
+- **Annotated tags for the versions that were published without one** ([#11],
+  F3). 0.1.0 through 0.2.0 reached crates.io with no git tag, leaving the
+  tarball as the only record of what shipped — its `.cargo_vcs_info.json` named
+  a commit the repository did not mark. `v0.1.2` (`ece6e46`) and `v0.2.0`
+  (`7aff9cb`) are backfilled as annotated tags against that record.
+
+  The 0.2.0 tarball was re-verified while tagging it: its `.cargo_vcs_info.json`
+  names `7aff9cbef5b8a981180ed70d6a36dd07b1748ac5`, and its sha256 is
+  `7a42d143174fd46d11ecf6be281dc8decf010410ac0f4078fe5292c6d7ce68a2` — **not**
+  the value quoted in [#11], which matches neither the crates.io API nor the
+  downloaded file.
+
+  F3 also asked for a tag-triggered release workflow, and one was written. It is
+  **not** part of this release, and no such workflow exists in the repository:
+  publishing stays a deliberate manual act. The one that was written had never
+  run, and reviewing it found it could not have: it wrote its release notes into
+  the package root as an untracked file that `exclude` did not drop, so the
+  `cargo publish` at the end refused the tree it had just dirtied — reproduced
+  here, `error: 1 files in the working directory contain changes that were not
+  yet committed into git`, exit `101` — and it did so only after the GitHub
+  Release for the tag had already been created. Rather than repair a release
+  path that no one had exercised, the automation is removed and the manual one
+  kept.
+
+- **`tests/segment_longest_run_alloc.rs`**, the sixth allocation suite: a
+  counting global allocator armed around `longest_run` alone, asserting zero
+  calls and zero bytes over a million-window, half-a-million-run input.
+
+### Changed
+
+- **The declared benchmark pairs each change exactly one variable** ([#11], F1).
+  Three of them changed two, so none could support the comparison its comment
+  claimed:
+
+  - `segment/hysteresis_batch` latched on `Hysteresis(0.6, 0.3)` and returned
+    `Vec<Range>`; `segment/streaming` applied a bare `>= 0.5` and returned a
+    count — different gate semantics *and* different output work. The streaming
+    arm is now `segment/hysteresis_streaming`, on the same gate and the same
+    `Vec<Range>` sink, and `segment/hysteresis_two_pass` joins them as the
+    materialized reference that prices the O(n) intermediate decision vector the
+    fused driver avoids.
+  - `smooth/cadence_ema_streaming` folded to a count against a batch arm that
+    built a vector; it now collects the same `Vec<Windowed<f32>>`.
+  - `decode/identity_threshold` versus `decode/hangover_dwell_vote` changed both
+    the smoother and the gate. `decode/cadence_threshold` is added as the hinge:
+    against `identity_threshold` it changes the smoother alone, against
+    `hangover_dwell_vote` the gate alone.
+
+  The streaming arms collecting output does not weaken the zero-allocation
+  claims: those were never what the benchmarks proved. They are asserted exactly,
+  under refusing global allocators, in `tests/segment_alloc.rs`,
+  `tests/smooth_alloc.rs` and `tests/decode_alloc.rs` — an exact integer where a
+  benchmark mean is a machine-dependent estimate.
+
+  `segment/longest_run_fold` and `segment/longest_run_materialized` are added for
+  the entry above, on the same high-run-count corpora.
+
+- **`Segmenter`'s state size is qualified by pointer width** ([#11], F5). The
+  type documentation and `tests/segment_alloc.rs` called it "a fixed 80 bytes"
+  without saying on what. Every field is `usize`-shaped: it is 80 bytes on a
+  64-bit target and **40 on a 32-bit one**. The field count and the O(1) bound
+  are architecture-independent and unchanged. Both numbers are now `const`
+  assertions in `src/segment/mod.rs`, so they are checked on the `wasm32-*`,
+  `i686-*` and `thumbv7em-none-eabihf` targets CI builds but never runs tests on.
+
+- **The README's streaming claim is bounded to what is tested** ([#11], F2). "A
+  live decode and an offline one agree by construction" is now stated as
+  incremental — including chunked — decoding agreeing with the batch composition
+  under the documented span and lifecycle contract, which is the parity the suite
+  actually establishes, with VAD/endpointing quality, undeclared discontinuities
+  and turn semantics named as out of scope.
+
+- **Documentation reconciled with three implemented contracts** ([#11], F8).
+  `Ema`'s type documentation said a "non-finite (NaN)" alpha clamps to `0.0`.
+  The clamp is an ordering rule, not a finiteness test, and the three non-finite
+  coefficients do not share an answer: `NaN` and `-inf` clamp to `0.0`, `+inf`
+  clamps to `1.0`. Stated exactly on `Ema`, on `VectorEma`, and pinned by a
+  doctest on `Ema::new`. The other two items in F8 were **already fixed** before
+  this branch and are recorded here as verified rather than reopened:
+  `SmoothPolicy::smooth` has named `CadenceEma`'s `NonMonotonicSpan` since
+  [#12], and the `aggregate` module introduction has said `f64` since [#14].
+  Each gains the executable pin F8 asked for: a doctest driving a descending
+  span through the batch smoother, and a type-identity assignment in
+  `tests/genericity.rs` that stops compiling if the `AggregatePolicy` default
+  scalar ever moves off `f64`.
+
+### Fixed
+
+- **`aggregate::EmaRenormalized` no longer fabricates a direction once its weight
+  ladder leaves `f64`'s exponent range** ([#17]). *(A fourth re-measure, and the
+  narrowest of the four: `0` of `1056` downstream aggregations move.)*
+
+  `EmaRenormalized` is the only built-in policy whose weight **range**, not merely
+  whose ratio, is unbounded. Past a window count of about
+  `1074 / log2(1 / (1 - alpha))` the ideal weight `alpha * (1 - alpha)^k` falls
+  under `Real::MIN_NORMAL` and then under half the subnormal spacing, where it is
+  rounded **absolutely** — and the ratio between two adjacent ideal weights,
+  `1 / (1 - alpha)`, cannot be represented at the bottom of that grid at all, so
+  the older of a cancelling pair rounds to zero while the newer survives. The
+  determinacy gate carried no term for that, and an exactly cancelling in-domain
+  fold came back as a direction:
+
+  ```text
+  alpha = 0.9, n = 326, dim = 1, two ordinary components near 1e24
+    exact ideal weighted sum   0
+    materialized w[323]        9.88e-324  a subnormal, one step above the flush
+    materialized w[324]        0          its ideal partner, a tenth of it
+    residue / threshold        102x       with MIN_GATE_THRESHOLD fully engaged
+    before                     Ok([1.0])  a direction fabricated from cancellation
+    now                        Err(NonFinite)
+  ```
+
+  The same input works at `alpha = 0.5` (`n = 1076`), `1 - 2^-30` (`n = 38`) and
+  `1 - 2^-53` (`n = 23`). **The `alpha = 0.5` row is what identifies the
+  mechanism**: that chain is exact at every representable index, so it carries
+  none of [#16]'s accumulated multiplication error — `0.5 * 2^-1074 = 2^-1075` is
+  simply not an `f64`, and `powi`, [#16]'s named cure, reaches the same zero.
+
+  **The threshold gains a third term, and the policy supplies it:**
+
+  ```text
+  tau = 16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD + S
+  S   = MIN_NORMAL * EPSILON * sum_i c_i * ||e_i||       over the windows whose
+                                                         weight is below MIN_NORMAL
+  c_i = 1 + alpha * D   for i >= 1                       w_i = fl(alpha * p_k)
+  c_0 = D                                                w_0 = p_(n-1), no alpha
+  D   = 1 / (1 - fl(1 - alpha))                          the chain's own damping
+  ```
+
+  The oldest window is the exception the recurrence's own convex form already
+  names: `w_0` is the bare `(1 - alpha)^(n - 1)`, so the `1 + alpha * D` derived
+  from the general weight's final `alpha *` multiplication — the `1` is that
+  multiplication's own rounding, the `alpha * D` is every chain rounding damped by
+  it — is not a bound on it, and the undamped `D` is. The two coincide at
+  `alpha = 1/2`, so no dyadic verdict moves.
+
+  Where a weight's error is absolute the residue of an exactly cancelling fold is
+  `R_j = sum_i (w_i - W_i) * e_ij` against the **ideal** weights, so
+  `||R|| <= sum_i |w_i - W_i| * ||e_i||`: the *unweighted* window norms, a
+  quantity `||M||` does not contain.
+
+  Three things about that shape, each of which is a departure from the candidate
+  the issue prototyped (`tau += n * 2^-1074 * max_ij |e_ij|`):
+
+  - **It belongs to the policy, not to the shared gate.** `MIN_GATE_THRESHOLD`'s
+    soundness argument is "about products rather than about which policy formed
+    them"; **that framing does not survive a term about weights**, because a
+    weight's formation error is a property of whatever formed the weight. So `S`
+    is passed in beside the weight function. `MeanRenormalized` (an exact
+    constant `1`), `CoverageWeightedMean` (one correctly rounded division of a
+    lifted coverage) and `SaliencyWeighted` (a norm the input domain bounds
+    below) each hand in a literal `C::ZERO`, and `tau + 0.0` is `tau` to the bit,
+    so their verdicts are unchanged **by construction** rather than by argument.
+    Measured anyway, against `fix/16-ema-weights`, over ordinary plan-shaped
+    folds, ladders past the exponent range, subnormal-product folds and coverage
+    ratios past the normal boundary:
+
+    ```text
+    aggregations compared    1876     largest displacement   0
+    CoverageWeightedMean      469 compared    0 moved
+    MeanRenormalized          469 compared    0 moved
+    SaliencyWeighted          469 compared    0 moved
+    EmaRenormalized           469 compared   46 moved, every one Ok -> Err
+    ```
+
+    Forcing an EMA-sized slack into the other three anyway changes no verdict
+    either — their weights are bounded below, so the mass they accumulate always
+    outruns a term written in `2^-1074`. Recorded because "narrowing avoids a
+    regression" would have been the obvious reason to narrow, and it is not the
+    true one.
+  - **It is a norm, and the prototype was a scalar.** `n * max |e|` carries no
+    `dim`, and the residue's bound does: give every dimension the same component
+    and `||R||` grows as `sqrt(dim)` while `max |e|` does not move. The flush
+    condition caps the ratio between the two at `sqrt(dim) / (2 * n)`, and
+    reaching that cap is a divisibility question — at `b = 2^-p` the overshoot is
+    `p * ceil(1075 / p) - 1075`, zero exactly when `p` divides `1075 = 5^2 * 43`.
+    `p = 43` is the largest such `p` an `f64` complement can hold and needs only
+    `n = 27` windows, so an eight-thousand-wide embedding clears the prototype by
+    **1.68x** while the shipped term gates it by `4x` at every width.
+  - **It is charged only where a weight actually left the range.** A `400`-window
+    EMA at `alpha = 0.9` has `92` weights at or under the boundary and is an
+    entirely ordinary fold; `S` sits some `10^-321` under its own mass and decides
+    nothing. What is refused is the same slice with its mass moved onto the
+    underflowed tail.
+
+  Three alternatives lost, each for a measured reason rather than a preference.
+  **Refusing the fold when a weight underflows** turns every long EMA into an
+  error — at `alpha = 0.9` any `n` past `326`, which is ordinary use.
+  **Bounding `n` per `alpha`** is the same rejection wearing a precondition, and
+  it also mis-rejects `alpha = 1`, whose zero weights are exact.
+  **Lifting the ladder** the way [#14] lifted a coverage quotient does not
+  transfer, and the issue's claim was verified rather than accepted: a shared lift
+  needs `w_max / w_min <= 2^1646` to keep every weight normal *and* every product
+  finite under the domain's `2^400` ceiling, against an underflow onset at
+  `2^1074` — half as much reach again, bought by moving every fold in the regime
+  it does not fix; and a lifted accumulator is no longer in the embedding's units,
+  so it would have to un-scale before the gate besides.
+
+  **The re-measure a shared-gate change obliges**, against the consumer that
+  drives this surface — coremlit's `embeddings::clap::aggregate`, a pass-through
+  to `aggregate` over plan-produced spans and unit `f32` embeddings — run against
+  `fix/16-ema-weights` and against this branch and compared bit for bit. The sweep
+  deliberately crosses the underflow point (at `alpha = 0.99, n = 400`, `246` of
+  the `400` weights are gone):
+
+  ```text
+  aggregations   1056 (dim 512, three window families, 22 window counts to 400,
+                 full and ragged tails, CoverageWeightedMean, MeanRenormalized,
+                 EmaRenormalized at alpha 0.1 / 0.3 / 0.5 / 0.9 / 0.99 / 1-2^-6)
+  components     540 672 compared as raw bits
+  slices moved   0 of 1056
+  largest displacement   0
+  ```
+
+  What this does **not** claim is that the regime is now accurate. The verdict is
+  a refusal: past the point its ladder leaves the exponent range, a fold whose
+  whole mass rides on the underflowed windows has no direction at working
+  precision, and now says so.
+
+- **`aggregate::EmaRenormalized`'s *oldest* weight is charged the bound derived
+  for it** (the fourth round of the release review). *(A fifth re-measure: `90` of
+  `13818` swept aggregations move, every one `Ok -> Err`.)* `weights[0]` is the
+  bare ladder value `p_(n-1)`; every later weight is `fl(alpha * p_k)`. The
+  absolute unit `(1 + alpha * D)` the entry above added is derived from that final
+  multiplication — the `1` is its own rounding, the `alpha * D` is every chain
+  rounding damped by it — so **neither half of it is window 0's**, and window 0's
+  unit is the bare `D`. This is the fourth defect on this seam with the same
+  shape: a bound derived for the general term, applied to the element the module's
+  own text names as the exception.
+
+  It is reachable because past the flush the ladder does not decay to zero, it
+  **stalls**: `fl(p * b) == p` while `(1 - b) * p <= 2^-1075`, so the chain lands
+  on a fixed point of the subnormal grid at `floor(D / 2)` ulps of `2^-1074` —
+  within one grid step *below* the derived `2^-1075 * D` rather than on it, which
+  is still what makes `D` tight.
+
+  ```text
+  alpha      0.02  0.05   0.1  0.125  0.15   0.2   0.25   0.3   0.4  0.5  0.75   0.9
+  w[0]/eta     24     9     5      4     3     2      2     1     1    0     0     0
+  D          50.0  20.0  10.0    8.0  6.67   5.0    4.0  3.33   2.5  2.0  1.33  1.11
+  D/2        25.0  10.0   5.0    4.0  3.33   2.5    2.0  1.67  1.25  1.0  0.67  0.56
+  ```
+
+  `alpha = 0.5` is the one column where `w[0]/eta` is not `floor(D/2)`, and it is
+  the tie-break rather than an exception: where `b` is a power of two the last
+  representable step is exactly `b` ulps, at `b = 1/2` exactly the half-ulp
+  rounding point, so round-half-to-even reaches an exact zero instead of a fixed
+  point. Against all of that, a `(1 + alpha * D)` that quantizes to a flat `2` at
+  every one of them.
+
+  ```text
+  alpha = 0.05, n = 20000, dim = 1, one 2^400 component on window 0, zeros elsewhere
+    the ladder stalls at   9 * 2^-1074
+    the absolute charge    2 * 2^-1074    against a derived 20 * 2^-1074
+    acc                    0x1.2p-671     tau  0x1.0000000000048p-673
+    before                 Ok([1.0])      ideal contribution 2^-1079.94, eighty
+                                          binary orders under the 2^-1000 floor
+    now                    Err(NonFinite)
+  ```
+
+  **Nothing else on this seam is borrowed**, and that is measured rather than
+  argued: every position and every degenerate ladder against a scaled
+  double-double reference, over `425` coefficients — `25` named, `300`
+  pseudorandom, `2^-e` and `1 - 2^-e` for `e` in `1..=40`, and `1/k` for `k` in
+  `1..=40` — at every window count that straddles the flush.
+
+  ```text
+                            worst |w_i - W_i| / E_i
+    window 0        before   2^3.45   (undercharged by 10.9x, at alpha ~ 0.0223)
+                    after    2^-0.64
+    every other i   before   2^-1.00  (exactly the derived 2x margin, never exceeded)
+                    after    2^-1.00
+  ```
+
+  **The re-measure**, every aggregation compared as raw bits against the branch
+  point:
+
+  ```text
+  aggregations   13818 (dim 1/2/64, 14 window counts to 2288, seven embedding
+                 families, three coverage families, all four policies, EMA at
+                 twelve coefficients; plus 588 at the window count each small
+                 coefficient's ladder actually needs to reach the subnormal grid)
+  CoverageWeightedMean   882 compared    0 moved
+  MeanRenormalized       882 compared    0 moved
+  SaliencyWeighted       882 compared    0 moved
+  EmaRenormalized      11172 compared   90 moved, every one Ok -> Err
+  largest displacement   0 (no verdict moved numerically; every move is a verdict)
+  ```
+
+  The `90` are all at `alpha` of `0.02` / `0.05` / `0.1` / `0.125` / `0.15` with
+  `n` at the flush, and only in the window families that put mass on window 0.
+  `0` of the `13230` ordinary rows move, `alpha = 0.5` included.
+
+  **The other direction, stated plainly.** For `alpha` above about `2/3` the
+  oldest window's unit *narrows*, from `2 * 2^-1074` to `1 * 2^-1074`, because
+  `round(D)` is `1` there. No swept row changes verdict on it. A hand-built one
+  does: at `alpha = 0.9, n = 524`, a `2^400`-scale mass on the flushed window 0
+  against a live term of `3.485e-301` was refused and now answers — and that
+  flushed window's ideal contribution is exactly `0`, so the refusal was pure
+  over-rejection, of the same class the `(1 + D)` to `(1 + alpha * D)` correction
+  above removed. Soundness of the narrower unit is not an appeal to smallness: the
+  unit is formed on the subnormal grid, so `coefficient * (MIN_NORMAL * EPSILON)`
+  rounds the *coefficient* to an integer, and what the bound needs is
+  `round(D) >= D / 2` — true for every `D >= 1`, and `D = 1 / (1 - b) >= 1`
+  always.
+
+  **The ledger**, re-run over `aggregate` against this tree: `22` mutations, `20`
+  killed, one equivalent — dropping `ema_formation_slack`'s `error > C::ZERO` skip
+  cannot change an answer, because `0 * ||e_i||` is `0` and `slack + 0.0` is
+  `slack` — and one real survivor, now closed. The determinacy gate's `<=` was
+  unpinned at its own boundary: turning it into `<` passed the whole suite,
+  because every other input clears the threshold by orders or falls under it by
+  orders. The crate promises *at or below*, and
+  `the_gate_refuses_a_residue_exactly_at_the_threshold` now drives a residue that
+  lands on `tau` to the bit — one window of weight `1` on the domain floor
+  `2^-400`, against a `tau` of `2^-48 * 2^-400 + 2^-1000 + (2^-400 - 2^-448)`,
+  both `26f0000000000000`.
+
+- **The `aggregate` fold's Neumaier compensation and `l2_renorm`'s two-step
+  division are pinned bit for bit**, closing four mutants the ledger had left
+  standing. Found by re-running that ledger for the work above rather than
+  inheriting its adjudication, which a change to what the gate compares does not
+  allow. Deleting the compensation, its fold-back, or the magnitude branch inside
+  it each **passed the whole suite** while moving `830` of `1876` swept
+  aggregations by up to `2.1e-15` — inside every tolerance the existing rows
+  compare with. Folding `l2_renorm`'s two divisions into one, and deleting its
+  `unit.is_finite()` guard, each passed while moving `0` of `1876`, because
+  `check_inputs`' `2^400` ceiling puts both regimes out of an aggregation's reach;
+  they are real for `smooth::VectorEma`, which renormalizes through the same
+  `pub(crate)` routine without that ceiling, so they are pinned at the routine.
+  Every mutant in the ledger is now killed.
+
+- **`longest_run` is O(1) in the number of output runs, not O(runs)** ([#11],
+  F4). It called `runs`, materialized every finalized `Range` into a `Vec`, and
+  only then scanned for the longest — storing an answer it discards. It now
+  drives the same `Segmenter` and folds each emission into one incumbent range,
+  `finish` tail included. Same ranges, same earliest-on-tie rule, same
+  `min_len` / `merge_gap` behaviour, same `NonMonotonicSpan`; a differential
+  assertion inside the existing 200-case randomized oracle loop pins the two
+  definitions together over every geometry and both `merge_gap` extremes.
+
+  Measured on a million unit spans alternating accepted/rejected (~500,000
+  one-element runs), with a counting global allocator armed around the call
+  alone: **18 allocation calls / 16,777,152 bytes before, 0 / 0 after**. The
+  count is the evidence rather than a timing, because the property is space and
+  a loaded machine cannot resolve the difference in wall clock.
+
+  Consequence for callers: `longest_run` can no longer return `AllocFailed` — it
+  asks for no memory to fail. `runs` and `runs_sorted` are unchanged; both return
+  every range and so must still collect.
+
+- **The `clippy` CI job lints every target** ([#9]). It ran `cargo hack clippy
+  --each-feature` without `--all-targets`, so it linted the library alone: the
+  test, integration and bench targets were compiled elsewhere in CI and never
+  linted. The flag lands green — `cargo hack clippy --each-feature --all-targets
+  -- -D warnings` was clean on all eight feature rows before the switch, so the
+  accumulated-warning backlog the issue anticipated does not exist.
+
+- **A Markdown-only change no longer skips CI** ([#11], F6). `paths-ignore`
+  carried `'**.md'`, while `src/lib.rs` includes `README.md` as the crate
+  documentation on every `alloc`/`std` row — so the front page's worked examples
+  are doctests, and a README-only pull request could replace one with a call to
+  an item that does not exist while every job stayed unrun. Demonstrated:
+  renaming `longest_run` to a nonexistent `longest_speech_run` in the README
+  fails `cargo test --doc --all-features` with ``cannot find function
+  `longest_speech_run` in this scope``. The ignore is gone, the `docs` job now
+  *executes* the doctests on both README-carrying rows instead of only building
+  rustdoc, and a step in that job fails if `'**.md'` is ever put back.
+
+- **One canonical repository identity** ([#11], F9). The README's GitHub, CI and
+  Codecov link definitions pointed at `Findit-AI/windit` while the badge images,
+  the licence link and `Cargo.toml` used `findit-studio/windit`. Those three were
+  not merely non-canonical, they were broken: `github.com/Findit-AI/windit`
+  answers `404` with no redirect. All six now use `findit-studio`, and each was
+  re-fetched — GitHub, the CI workflow page, Codecov, crates.io, docs.rs and the
+  licence anchor all answer `200`.
+
 ### Documented
 
 - `Smoother::push`'s error note no longer implies that reading no spans makes a
   stage infallible, and `SmoothPolicy::smooth`'s "none for the shipped built-ins"
   is corrected. Both statements predate a fallible smoother existing.
+
+- **`aggregate::EmaRenormalized`'s accumulated weight error is a bound with no
+  reach, and the note that claimed its underflow regime was gated was wrong**
+  ([#16], [#17]). *(No arithmetic changed, so this is not a re-measure: every
+  aggregation is bit-identical to `main`.)*
+
+  #16 measured the weights' relative error growing at about `0.7 * n * u`,
+  crossing the determinacy gate's own `16 * EPSILON = 32u` near `n = 32`, and
+  asked for a witness before calling it a defect. There is no witness, and the
+  reason is structural rather than a failure to search hard enough.
+
+  For any input whose ideal weighted sum is exactly zero the ideal terms `t_i`
+  sum to zero, so any constant may be subtracted from the weights' relative
+  errors `d_i` and the residue the gate sees obeys
+
+  ```text
+  |sum_i t_i d_i| / sum_i |t_i|  <=  (max_i d_i - min_i d_i) / 2
+  ```
+
+  A witness therefore needs the error's **spread over its own support** above
+  `64u`, never its size. And two windows cancel exactly only when their ideal
+  weight ratio `(1 - alpha)^d` is an exact ratio of two `f64` significands:
+  writing the complement as `B * 2^-q` with `B` odd, that needs `B^d < 2^53`, a
+  lever capped at `d <= 53 / log2(B)`. The same small `B` that buys a long lever
+  is what makes `(1 - alpha)^k` exactly representable, and so the chain exact,
+  over that very range. The two requirements pull against each other, and the
+  measurement is what settles it:
+
+  ```text
+  every complement B * 2^-q, B odd up to 2^40 - 1, q in 1..=53,
+  at every chain index whose materialized weight is a normal f64:
+    widest reachable |d_k - d_{k+d}| within the lever cap   10.0 u
+    needed to clear the gate                                64.0 u
+  driving the fold over the same space:
+    exactly cancelling two-window pairs evaluated           5 072 311
+    largest residue any of them leaves                      0.162 * threshold
+    plus 56 736 adjacent pairs at arbitrary alpha           0.038 * threshold
+  complements whose whole error spread does clear 64u:
+    support span they would need                            131 to 7609 chain steps
+    their own two-window lever cap                          2 to 13
+    reach a three-window chain adds                         2.2x, measured
+  ```
+
+  So closing that gap needs a support of 30 to 600 windows whose interior terms
+  all vanish against the two carrying the mass, each interior step buying its
+  reach from a separate modular coincidence. That is the part not proved — it is
+  a counting argument and a search, not a theorem — and it is what
+  "measured, and therefore not changed" rests on here.
+
+  The cure #16 named was checked rather than repeated.
+  `alpha * (1 - alpha).powi(k)` is **not** "one rounding instead of `k`": `powi`
+  is exponentiation by squaring, so `O(log k)` roundings and not correctly
+  rounded, and — decisively — it raises the same `fl(1 - alpha)` the chain does.
+  That single complement rounding, multiplied by `k`, is the larger part of the
+  error, and `powi` does not touch it. At `alpha = 0.46, n = 64`: `58.75u` for
+  the chain against `48.15u` for `powi`, a fifth, not a factor of `k`. At a
+  dyadic `alpha`, where the complement is exact, both are exact and there is
+  nothing to buy — so the documented bit-exactness at `alpha = 0.5` was never in
+  question either way.
+
+  Looking for that witness found a different one, in the same class and with a
+  different mechanism, now tracked as [#17]. The module note claimed a subnormal
+  weight drives the fold's own products subnormal, leaving `MIN_GATE_THRESHOLD`
+  to gate alone. That holds only while the components are `O(1)`; the input
+  domain admits `2^400`, and a large component lifts the product of a subnormal
+  weight back into the ordinary range where the floor is nowhere near it. The
+  note is corrected — in three places, since `Real::MIN_GATE_THRESHOLD`'s own
+  doc carried the same incomplete `K_abs` derivation (it covers the *product*
+  rounding, `sqrt(dim) * n * 2^-1075`, and not the *weight* rounding,
+  `2^-1075 * sum_i |e_ij|`, which the input domain's `2^400` ceiling takes to
+  `n * 2^-675`) and `Real::MIN_AGG_MAGNITUDE`'s pointed at it. The `aggregate`
+  module gains an *A weight below the exponent range* section stating where the
+  gate's guarantee stops:
+
+  ```text
+  alpha = 0.9, n = 326, two ordinary components near 1e24
+    exact ideal weighted sum   0
+    materialized w[323]        9.88e-324  a subnormal, one step above the flush
+    materialized w[324]        0          its ideal partner has no f64 at all
+    before                     Ok([1.0])  a direction fabricated from cancellation
+  ```
+
+  Nothing there is the repeated multiplication: the same input works at
+  `alpha = 0.5`, where every representable weight is exact to the bit, and
+  `powi` reaches the same zero. That gap was pinned as a characterization here and
+  is **closed under Fixed above**, in its own round with the re-measure a
+  gate-shaped change obliges; the note this entry corrects now reads as the
+  statement of a term the threshold carries rather than of a limit it does not.
+
+  The "not a re-measure" claim above is measured rather than asserted, against
+  the consumer that actually drives this surface — coremlit's
+  `embeddings::clap::aggregate`, a pass-through to `aggregate` over
+  plan-produced spans and unit `f32` embeddings — run against `main` and against
+  this branch and compared bit for bit:
+
+  ```text
+  aggregations   2304 (dim 64 and 512, 1..64 windows, all four policies,
+                 EmaRenormalized at alpha 0.1 / 0.5 / 0.9)
+  components     663 552 compared as raw bits
+  slices moved   0 of 2304
+  largest displacement   0
+  ```
+
+- **`SmoothPolicy::smooth`'s `V: Clone` is kept, and the reason is now a number
+  rather than an argument about the bound's shape** ([#13]). `Smoother::push`
+  takes its window by value, so the batch convenience clones each one out of the
+  borrowed slice — four bytes for a score, a whole vector for an embedding. Three
+  ways out were considered and two rejected:
+
+  - **Taking `&Windowed<V>` in `Smoother::push`** would drop the bound from
+    `smooth` entirely, and it is the option that moves the cost rather than
+    routing around it. It also moves a bound: `IdentityState` can no longer
+    return `Ok(w)`, because there is no owned `V` behind a borrow, so `Identity`
+    — today generic over *every* `V` — would gain `V: Clone` on its streaming
+    path and cascade it to the `SmoothPolicy` impl. That is not a trade between
+    two costs. The embeddings it helps already have a bound-free path (drive the
+    `Smoother`); the value-free pipeline it breaks would have none left, and
+    `Decoder` threads `Identity` over exactly such a payload in
+    `tests/genericity.rs`. Verified with the compiler rather than argued:
+    `Ok(Windowed::new(w.value().clone(), w.span()))` fails with ``expected type
+    parameter `V`, found `&V` `` and the note ``V` does not implement `Clone`, so
+    `&V` was cloned instead``, and completing the change reds the acceptance
+    suite with ``the trait bound `V: Clone` is not satisfied``.
+  - **A second, by-reference batch method** leaves two entry points to justify
+    against a saving measured below.
+
+  What the clone actually costs, against the vector EMA at 512 components —
+  the widest smoother the crate ships and the case that raised the question:
+  **under 2%** of the batch call. 50 ns of a 5.63 µs window at `f32` storage,
+  70 ns of 5.39 µs at `f64`, stable across four (width, length) shapes. The
+  recurrence renormalizes every window — several passes and two divisions per
+  component — against the clone's one allocation and one copy. Its share of the
+  *allocation traffic* is the larger figure and is stated too: one of three
+  allocations per window, a quarter of the bytes (exact counts, not timings).
+
+  The timings are interleaved minima against a counting allocator rather than
+  benchmark means, because a sub-2% difference is under what criterion resolves
+  on a machine that is doing anything else — which is itself part of the answer.
+
+  So the bound stays, on the method where it already was. What changes is that
+  the cost is written down beside it, with the bound-free alternative and a
+  runnable example, and that both are now checkable rather than claimed.
+
+- The `smooth` module note points at that discussion from the batch-convenience
+  paragraph, and `test_support::TestVec` records that its *absence* of `Clone` is
+  load-bearing.
+
+### Tested
+
+- **`aggregate` rows for the EMA weight ladder: one falsifier for a bound with no
+  reach, and six for the one that had one** ([#16], [#17]).
+  `ema_weight_error_accumulates_but_no_input_can_reach_the_gate` measures the
+  accumulated error against a double-double reference — the complement carried
+  as an exact `hi + lo` pair, because `1 - alpha` is generally not an `f64` and
+  rounding it once and raising it is the larger half of the error — then drives
+  the strongest exactly cancelling pair the lever admits and pins its residue at
+  a sixth of the threshold.
+
+  The #17 row began as a characterization pinning today's `Ok([1.0])` and is now
+  the falsifier
+  `ema_weights_below_the_exponent_range_cannot_fabricate_a_direction`, over four
+  coefficients, with the mechanism asserted (surviving weight subnormal, its ideal
+  partner exactly zero) rather than the output alone. Beside it:
+  `the_weight_underflow_slack_is_what_gates_the_witness` attributes the change to
+  the threshold's third term and to nothing else in the fold;
+  `the_weight_underflow_slack_carries_the_dimension` and
+  `the_oldest_window_is_charged_for_its_own_underflowed_weight` are the two the
+  candidate cure's shape would have failed;
+  `an_ordinary_long_ema_still_answers_past_the_underflow_point` and
+  `the_dyadic_alpha_stays_bit_exact_across_the_documented_range` are the
+  over-rejection guards; `the_exact_ladders_owe_the_gate_nothing` pins the two
+  coefficients whose zero weights are exact, and re-checks that `powi` reaches the
+  same zero the chain does — the record that #16's named cure does not fix #17.
+  `a_forced_slack_would_change_no_relative_weight_policy_verdict` drives the other
+  three policies with the term forced in.
+
+  Every one was written against the mutation it has to catch. Dropping the gate's
+  constant from `16` to `2` reds the first; replacing the chain with
+  `powi` reds it too (through a bit-for-bit basis fold that ties the test's
+  replica ladder to the policy's own — without that tie the `powi` mutation
+  **passed**).
+
+- **The vector smoother is reachable without `Clone`, from outside the crate, and
+  returns the identical stream that way.** `tests/genericity.rs` gains an
+  embedding double with no `Clone` and a `smooth_owned_any` helper bounded by
+  `E: Vector` alone, asserted component for component and span for span against
+  the batch path over the same components. This is the escape hatch the decision
+  above rests on, and it was unexercised: a mutation adding `Clone` to
+  `VectorEmaState`'s `Smoother` impl and its `SmoothPolicy` cascade **passed the
+  acceptance suite** before this test (16 passed, 0 failed) and fails to compile
+  after it.
+- **`tests/smooth_alloc.rs`: `SmoothPolicy::smooth` reports a refused output
+  vector rather than aborting.** The fifth refusing-allocator suite, beside the
+  aggregation, chunking, segmentation and decoding ones. Found by re-running the
+  mutation ledger for the work above: deleting the `try_reserve_exact` that backs
+  the method's documented `AllocFailed` passed the whole suite, so the error
+  variant was documented and unreachable. `Ema` over `f32` allocates nothing but
+  the output, which makes the case exact — the refusal can come from nowhere
+  else, and the reported `elements` is pinned to the input length. With the
+  reservation deleted the suite now aborts through `handle_alloc_error`
+  (`SIGABRT`, `memory allocation of 262144 bytes failed`) instead of returning.
+  A pre-existing gap, closed here because it is on the very method this entry is
+  about and the harness it needed was already in the repository.
+
+[#9]: https://github.com/findit-studio/windit/issues/9
+[#11]: https://github.com/findit-studio/windit/issues/11
+[#12]: https://github.com/findit-studio/windit/pull/12
+[#13]: https://github.com/findit-studio/windit/issues/13
+[#14]: https://github.com/findit-studio/windit/pull/14
+[#16]: https://github.com/findit-studio/windit/issues/16
+[#17]: https://github.com/findit-studio/windit/issues/17
 
 ## 0.2.0 - 2026-07-25
 

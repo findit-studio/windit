@@ -3284,10 +3284,16 @@ fn vector_ema_can_refuse_a_prefix_the_aggregate_emits() {
   // direction at exact bits.
   //
   // This prefix is the cancelling one above with its third window rotated by
-  // 4e-15, which lifts the residue to ~3.63e-15 — above an ideal fold's
-  // threshold (~3.52e-15) and below the streaming sibling's (~6.30e-15). Those
+  // 1e-14, which lifts the residue to ~4.57e-15 — above an ideal fold's
+  // threshold (~3.52e-15) and below the streaming sibling's (~4.58e-15). Those
   // two figures only POSITION the fixture; both verdicts below are read off the
   // shipped implementations.
+  //
+  // The rotation grew from `4e-15` when `EmaRenormalized` began charging its own
+  // weight-formation error: at `alpha = 0.3f32` over three windows that term is
+  // about `4.4 * EPSILON` of the fold's mass, roughly a quarter again on top of
+  // the gate's own `16 * EPSILON`, and it swallowed the old fixture's residue
+  // whole. The band narrowed; it did not close.
   //
   // The aggregate emits a direction; the recurrence refuses, because at this
   // residue its own propagated rounding is not provably smaller than the
@@ -3295,13 +3301,13 @@ fn vector_ema_can_refuse_a_prefix_the_aggregate_emits() {
   // be claiming an error bound the recurrence does not have — which is the
   // property this case still pins.
   // The `f64` nearest to `0.3f32`, spelled out: the fixture is the cancelling
-  // one above rotated by 4e-15, and it lands in the band only at the
+  // one above rotated by 1e-14, and it lands in the band only at the
   // coefficient it was tuned at. `0.3f64` is a different number.
   const ALPHA: f64 = 0.3_f32 as f64;
   let fixture: Vec<Vec<f64>> = vec![
     vec![1.0, 0.0],
     vec![-0.9436345029127625, 0.33098931238422735],
-    vec![-0.9727890720095554, -0.2316925147232603],
+    vec![-0.972789072009554, -0.23169251472326613],
   ];
   let m = masses(ALPHA, &fixture);
   let residue = l2(&m.state);

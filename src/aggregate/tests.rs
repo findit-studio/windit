@@ -3,9 +3,9 @@ use std::{vec, vec::Vec};
 #[cfg(feature = "serde")]
 use super::AggregatePolicyKind;
 use super::{
-  aggregate, keep_separate, l2_renorm, max_magnitude, normalizing_shift, weighted_sum_renorm,
-  AggregatePolicy, CoverageWeightedMean, EmaRenormalized, MeanRenormalized, SaliencyWeighted,
-  MIN_NORMAL_EXPONENT,
+  aggregate, ema_formation_slack, keep_separate, l2_norm, l2_renorm, max_magnitude,
+  normalizing_shift, weighted_sum_renorm, AggregatePolicy, CoverageWeightedMean, EmaRenormalized,
+  MeanRenormalized, SaliencyWeighted, MIN_NORMAL_EXPONENT,
 };
 use crate::{
   plan::Span,
@@ -445,13 +445,21 @@ fn the_weight_lift_is_the_identity_on_every_synthetic_direct_api_slice() {
     dim: usize,
   ) -> Result<Vec<f64>, WinditError> {
     let largest = max_magnitude(coverages);
-    weighted_sum_renorm(embeddings, coverages, dim, move |i, _| {
-      if largest > 0.0 {
-        coverages[i] / largest
-      } else {
-        0.0
-      }
-    })
+    weighted_sum_renorm(
+      embeddings,
+      coverages,
+      dim,
+      move |i, _| {
+        if largest > 0.0 {
+          coverages[i] / largest
+        } else {
+          0.0
+        }
+      },
+      // The comparison is about the lift and nothing else, so the replica owes
+      // the gate the same nothing the policy does.
+      |_| 0.0,
+    )
   }
 
   let ratios: Vec<f64> = (1..=12)
@@ -698,6 +706,93 @@ fn dd_complement(alpha: f64) -> (f64, f64) {
   (hi, (1.0 - hi) - alpha)
 }
 
+/// An `f64` as the exact pair `(m, e)` with `m * 2^e == x` and `m` an integer.
+///
+/// The polynomial witness needs coefficients that are *exactly* what the
+/// construction says they are, and `6553.0 * f_k` is not: it wants 66 bits. In
+/// `f64` the product rounds by about as much as the coefficient itself is worth,
+/// which turns the witness into noise — 1114 of the 1278 coefficients come out
+/// zero. Integer arithmetic is what makes the construction reproducible.
+fn decompose(x: f64) -> (i128, i32) {
+  assert!(x.is_finite(), "{x} must be finite");
+  if x == 0.0 {
+    return (0, 0);
+  }
+  let bits = x.to_bits();
+  let sign = if bits >> 63 == 1 { -1_i128 } else { 1 };
+  let biased = ((bits >> 52) & 0x7ff) as i32;
+  let frac = (bits & 0x000f_ffff_ffff_ffff) as i128;
+  if biased == 0 {
+    (sign * frac, -1074)
+  } else {
+    (sign * (frac | (1_i128 << 52)), biased - 1075)
+  }
+}
+
+/// `m * 2^e` as an `f64`, asserting the value is exact.
+///
+/// The assertion is the load-bearing part: it is what makes "the coefficients
+/// are exactly representable" a checked fact rather than a claim about
+/// mantissa widths.
+fn compose_exact(m: i128, e: i32) -> f64 {
+  if m == 0 {
+    return 0.0;
+  }
+  let (mut m, mut e) = (m, e);
+  while m % 2 == 0 {
+    m /= 2;
+    e += 1;
+  }
+  assert!(
+    m.unsigned_abs() < (1_u128 << 53),
+    "coefficient needs more than 53 bits: {m}"
+  );
+  let x = (m as f64) * libm::ldexp(1.0, e);
+  let (rm, re) = decompose(x);
+  let (mut rm, mut re) = (rm, re);
+  while rm % 2 == 0 {
+    rm /= 2;
+    re += 1;
+  }
+  assert_eq!((rm, re), (m, e), "the coefficient must round-trip exactly");
+  x
+}
+
+/// The coefficients of `P(x) = (8192 x - 6553) * SUM_{j<deg} f_j x^j` with
+/// `f_j = fl(f_{j-1} / b)`, `f_0 = 1`, `b = 6553 / 8192`.
+///
+/// `P(b) = 0` exactly, because `8192 b - 6553` is. Every coefficient
+/// `c_k = 8192 f_{k-1} - 6553 f_k` is exactly representable, and
+/// [`compose_exact`] checks it rather than assuming it: `f_k` is `f_{k-1} / b`
+/// rounded, so `c_k` is `-6553` times that rounding — about `2^-40 * f_k`, on
+/// the grid of `f_k`'s own last bit, which is thirteen significant bits.
+fn vanishing_polynomial(deg: usize) -> Vec<f64> {
+  let b = 6553.0_f64 / 8192.0;
+  let mut f = vec![0.0_f64; deg];
+  f[0] = 1.0;
+  for j in 1..deg {
+    f[j] = f[j - 1] / b;
+  }
+  (0..=deg)
+    .map(|k| {
+      // `8192 * f_{k-1}` and `6553 * f_k`, each as an exact integer times a power
+      // of two; the end terms are the polynomial's `f_{-1} = f_deg = 0`.
+      let hi = (k > 0).then(|| {
+        let (m, e) = decompose(f[k - 1]);
+        (m, e + 13)
+      });
+      let lo = (k < deg).then(|| {
+        let (m, e) = decompose(f[k]);
+        (m * 6553, e)
+      });
+      let (hi_m, hi_e) = hi.unwrap_or_else(|| (0, lo.expect("both ends cannot be empty").1));
+      let (lo_m, lo_e) = lo.unwrap_or((0, hi_e));
+      let e = hi_e.min(lo_e);
+      compose_exact((hi_m << (hi_e - e)) - (lo_m << (lo_e - e)), e)
+    })
+    .collect()
+}
+
 fn dd_power(bhi: f64, blo: f64, k: usize) -> (f64, f64) {
   let (mut hi, mut lo) = (1.0_f64, 0.0_f64);
   for _ in 0..k {
@@ -750,56 +845,58 @@ fn ema_gate_ratio(weights: &[f64], components: &[f64]) -> f64 {
   (acc + 0.0).abs() / (16.0 * f64::EPSILON * mag + f64::MIN_GATE_THRESHOLD)
 }
 
-/// The accumulated weight error is real and **no input can deliver it to the
-/// determinacy gate**. It is a bound, not a defect.
+/// The accumulated weight error is real, and a **multi-window polynomial
+/// cancellation delivers it to the determinacy gate**.
 ///
-/// FALSIFIER for the bound's *reach*. The weights are built by repeated
-/// multiplication, so weight `k` carries the error of every multiply before it —
-/// about `0.7 * n * u`, past the gate's own `16 * EPSILON = 32u` somewhere near
-/// `n = 32`. That crossing is what a fold would have to exploit, and the
-/// exploitation is what does not exist.
+/// FALSIFIER for the merged answer to
+/// <https://github.com/findit-studio/windit/issues/16>, which claimed the bound
+/// had no reach. It has. The claim rested on a two-window "lever cap" and a
+/// search, and it named its own limit — "a counting argument plus a search, not
+/// a theorem". The witness lives exactly there.
 ///
-/// For any input whose *ideal* weighted sum is exactly zero, write `t_i` for the
-/// ideal terms (`sum_i t_i = 0`) and `d_i` for each weight's relative error. The
-/// residue is `sum_i t_i * d_i`, and the gate measures it against
-/// `32u * sum_i |t_i|`; because the `t_i` sum to zero, any constant may be
-/// subtracted from `d`, so
+/// What survives of that analysis is its opening move. For any input whose
+/// *ideal* weighted sum is exactly zero, write `t_i` for the ideal terms
+/// (`sum_i t_i = 0`) and `d_i` for each weight's relative error. The residue is
+/// `sum_i t_i * d_i`, and the gate measured it against `32u * sum_i |t_i|`;
+/// because the `t_i` sum to zero, any constant may be subtracted from `d`, so
 ///
 /// ```text
 /// residue / mass <= (max_i d_i - min_i d_i) / 2
 /// ```
 ///
 /// — the *spread* of the weight error over the input's support, never its size.
-/// So a witness needs a support carrying a spread above `64u`, and an exact
-/// cancellation across it.
+/// A witness needs a spread above `64u`, and an exact cancellation across it.
 ///
-/// A two-window pair at chain distance `d` cancels exactly only when its ideal
-/// weight ratio `(1 - alpha)^d` is an exact ratio of two `f64` significands.
-/// Writing the complement as `B * 2^-q` with `B` odd, that ratio's odd part is
-/// `B^d`, so it needs `B^d < 2^53` — a lever capped at `d <= 53 / log2(B)`. The
-/// same `B` that buys a long lever makes `(1 - alpha)^k` exactly representable
-/// for `k` up to that same cap, which is precisely where the chain has no error
-/// yet. That tension is the whole result, and it was measured rather than
-/// argued: over every complement `B * 2^-q` with `B` odd up to `2^40 - 1` and
-/// every `q` in `1..=53`, at every chain index whose materialized weight is a
-/// normal `f64`, the largest reachable `|d_k - d_{k+d}|` with `d` inside the
-/// lever cap is **10.0u** — against the `64u` a witness needs. The complement
-/// whose *whole* error spread does clear `64u` needs a support spanning 131 to
-/// 7609 chain steps to realize it, 65 to 1300 times its own lever cap; and a
-/// three-window chain, which is how a support reaches past its own lever,
-/// extends it by a measured **2.2x** and no further, so closing that gap takes
-/// on the order of 30 to 600 support windows whose interior terms all vanish
-/// against the two carrying the mass.
+/// What does **not** survive is the claim that a support cannot reach one. The
+/// lever cap is a fact about *two* windows: a pair at chain distance `d` cancels
+/// exactly only when `(1 - alpha)^d` is a ratio of two `f64` significands, which
+/// with the complement written as `B * 2^-q`, `B` odd, needs `B^d < 2^53` and so
+/// caps `d` at `53 / log2(B)`. **A polynomial relation is not a pair.** Take
+/// `alpha = 1639/8192`, so `b = 6553/8192` exactly, and build
 ///
-/// Driving the fold rather than the arithmetic says the same thing: **5 072 311**
-/// exactly cancelling pairs, every short-mantissa complement at every chain
-/// index whose weights are both normal, and the largest residue any of them
-/// leaves is **0.162** of the threshold. This pins that maximum.
-/// `alpha = 0.625` puts the complement at `3/8`, the odd part that buys the
-/// longest lever (`3^33 < 2^53`), and chain indices 651 and 684 are where the
-/// accumulated error between two such indices is widest.
+/// ```text
+/// P(x) = (8192 x - 6553) * SUM_j f_j x^j,    f_j = fl(f_{j-1} / b),  f_0 = 1
+/// ```
+///
+/// `P(b) = 0` exactly, because `8192 b - 6553 = 0` — one factor, no lever, and a
+/// support as wide as the second factor's degree. The coefficients
+/// `c_k = 8192 f_{k-1} - 6553 f_k` are exactly representable and that is not
+/// luck: `f_k` is `f_{k-1} / b` rounded, so `c_k` is `-6553` times that rounding,
+/// a value of about `2^-40 * f_k` on the grid of `f_k`'s own last bit — thirteen
+/// significant bits, the same thirteen `B = 6553` occupies. The short mantissa
+/// that caps the lever is what *buys* the coefficients.
+///
+/// Laid on chain indices `1168..2446` of a `2447`-window ladder the spread
+/// reaches **71.9u**, past the `64u` the gate leaves and far past the `10.0u` the
+/// merged answer measured as the widest reachable. Every materialized weight over
+/// the support is a normal `f64`, so [#17]'s absolute slack is exactly zero and
+/// cannot help; every component is inside the input domain; and the old
+/// threshold judged the residue at `1.09x` — a fabricated `Ok([-1.0])` out of an
+/// exactly cancelling fold.
+///
+/// [#17]: https://github.com/findit-studio/windit/issues/17
 #[test]
-fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
+fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
   // The measured growth first, so the bound is on record as a number rather
   // than a claim. It is against the *ideal* `(1 - alpha)^k`, so it needs a
   // reference wider than the `f64` under test: `dd_power` carries the power as
@@ -848,6 +945,7 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
   let w = ema_ladder(alpha, n);
   let mut worst = 0.0_f64;
   let mut worst_powi = 0.0_f64;
+  let mut worst_complement = 0.0_f64;
   for k in 0..n - 1 {
     let (hi, lo) = dd_power(bhi, blo, k);
     // `alpha * hi` and `alpha * lo` scale the pair; the relative error of the
@@ -856,6 +954,12 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
     worst = worst.max((((w[n - 1 - k] - rhi) - rlo) / rhi).abs());
     let by_powi = alpha * (1.0 - alpha).powi(k as i32);
     worst_powi = worst_powi.max((((by_powi - rhi) - rlo) / rhi).abs());
+    // The complement's rounding on its own: the same `fl(1 - alpha)` that `powi`
+    // is handed, raised *exactly* — `dd_power` carries the power to about 106
+    // bits — against the same ideal. This is the part of the error that belongs
+    // to the argument rather than to any powering algorithm.
+    let (chi, clo) = dd_power(bhi, 0.0, k);
+    worst_complement = worst_complement.max(((((chi - hi) + clo) - lo) / hi).abs());
   }
   let u = f64::EPSILON / 2.0;
   assert!(
@@ -865,23 +969,62 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
   );
 
   // And the cure the issue named, measured rather than repeated.
-  // `alpha * (1 - alpha).powi(k)` is *not* "one rounding instead of k". `powi`
-  // is exponentiation by squaring, so it is `O(log k)` roundings and not
-  // correctly rounded; and, decisively, it raises the same `fl(1 - alpha)` the
-  // chain does. That single complement rounding, multiplied by `k`, is the
-  // larger part of the error, and `powi` does not touch it. It buys 18% here,
-  // not `k -> 1`. At a dyadic alpha, where the complement is exact, both are
-  // exact and there is nothing to buy.
+  // `alpha * (1 - alpha).powi(k)` is *not* "one rounding instead of k", and the
+  // reason has nothing to do with how `powi` is implemented: it raises the same
+  // `fl(1 - alpha)` the chain does. `fl(1 - 0.46)` sits about `0.926 u` above
+  // the real complement, raising it to the `k` compounds that one rounding `k`
+  // times, and by `k = 62` the exact power of the rounded complement is already
+  // tens of `u` from `alpha * (1 - alpha)^k` — before a single rounding of the
+  // powering itself. Every operation in this measurement is one of IEEE-754's
+  // correctly-rounded basics — `+ - * /` — so its value is fixed by the standard
+  // and identical on every target: it is the portable statement that the two
+  // host-dependent measurements after it are measurements *of*.
   assert!(
-    (47.0..50.0).contains(&(worst_powi / u)),
-    "powi is O(log k) roundings on top of the complement's, not one: {} u",
+    (57.0..58.0).contains(&(worst_complement / u)),
+    "raising the rounded complement multiplies its one rounding by k: {} u",
+    worst_complement / u
+  );
+
+  // The cure as actually spelled, banded rather than pinned. **`f64::powi` is
+  // not correctly rounded and is not the same code on every target**: this
+  // figure was `48.7 u` on `aarch64-apple-darwin` and `58.1 u` on
+  // `x86_64-pc-windows-msvc` — the same IEEE-fixed `57.4 u` above, with `powi`'s
+  // own error contributing `-8.7 u` on the one host and `+0.7 u` on the other.
+  // Do not re-tighten this window onto whichever number the host in front of you
+  // prints. A two-unit window around one host's measurement is exactly what made
+  // this test fail CI on Windows.
+  //
+  // The bounds are derived rather than observed. The ceiling holds for any
+  // multiplication-based `powi`: exponentiation by squaring reaches `b^k` with
+  // at most `k - 1` weighted roundings, so its own relative error stays under
+  // `(1 + u)^61 - 1 < 62 u` for `k <= 62`, and the total cannot pass
+  // `57.5 + 62 + 2 < 130 u`. The floor is a margin and not a theorem: to reach
+  // it `powi` would have to err by about `-37 u`, systematically against the
+  // complement's drift and over four times the largest deviation either host
+  // showed. What both bounds keep is the claim the assertion exists for — at
+  // tens of `u` this is not the order-1 error "one rounding instead of k" buys.
+  assert!(
+    (20.0..130.0).contains(&(worst_powi / u)),
+    "powi raises the same rounded complement, so it is tens of u however many \
+     roundings it costs, not one: {} u",
     worst_powi / u
   );
+  // The same statement in the units #16 argued in, and one-sided for the same
+  // reason the band above is wide. `worst` is correctly-rounded basics too, so
+  // it is the same `59.28 u` everywhere and the ratio moves with `powi` alone:
+  // `1.22x` on macOS against `1.02x` on Windows — a fifth on the one host, two
+  // per cent on the other. No improvement at all is a legitimate outcome for a
+  // third host; a factor of `k` is not.
   assert!(
-    worst / worst_powi > 1.20 && worst / worst_powi < 1.25,
-    "so it improves the weights by about a fifth, not by a factor of k: {}x",
+    worst / worst_powi < 3.0,
+    "so powi does not divide the weight error by k = {}: {}x",
+    n - 1,
     worst / worst_powi
   );
+  // And where the complement *is* exact there was never anything for the cure to
+  // buy: the chain is exact too, at every representable index. Switching to
+  // `powi` would not have moved the witness below either, whose complement is
+  // exact to begin with.
   for k in [4_usize, 64, 199] {
     let (hi, lo) = dd_power(0.5, 0.0, k);
     assert_eq!(
@@ -891,7 +1034,8 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
     );
   }
 
-  // And the reach. `3^33 < 2^53`, so `(3/8)^33 = 3^33 / 2^99` is an exact `f64`
+  // The two-window lever, which is real and is not the ceiling the merged answer
+  // took it for. `3^33 < 2^53`, so `(3/8)^33 = 3^33 / 2^99` is an exact `f64`
   // and `c_hi = -c_lo / (3/8)^33` is exactly `-2^399`; the pair then cancels to
   // zero in exact arithmetic, the terms being
   // `alpha * b^651 * (c_lo + b^33 * c_hi)` with the bracket exactly zero. Both
@@ -904,13 +1048,20 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
   );
   let (k1, d) = (651_usize, 33_usize);
   let n = k1 + d + 2;
-  let c_lo = libm::ldexp(3.0_f64.powi(33), 300);
+  // Both powers by repeated multiplication rather than by `powi`. The lever is
+  // only a lever while `3^d` and `b^d` are reached *exactly*, and `f64::powi` is
+  // not correctly rounded and is a different implementation on every target, so
+  // what it returns is not something an exactness argument may rest on. The
+  // chains are: every partial product `3^j` for `j <= 33` is an integer under
+  // `2^53`, and `b^j = 3^j * 2^-3j` is that integer scaled by a power of two, so
+  // each step of either fold is exact by IEEE-754 alone.
+  let three_pow_d = (0..d).fold(1.0_f64, |acc, _| acc * 3.0);
   assert_eq!(
-    3.0_f64.powi(33),
-    5_559_060_566_555_523.0,
+    three_pow_d, 5_559_060_566_555_523.0,
     "3^33 must be an exact f64, or the lever is not exact"
   );
-  let ratio = b.powi(d as i32);
+  let c_lo = libm::ldexp(three_pow_d, 300);
+  let ratio = (0..d).fold(1.0_f64, |acc, _| acc * b);
   let c_hi = -c_lo / ratio;
   assert_eq!(
     c_lo + c_hi * ratio,
@@ -934,8 +1085,7 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
   let ratio = ema_gate_ratio(&w, &components);
   assert!(
     (0.16..0.17).contains(&ratio),
-    "the accumulated error's strongest reachable residue is a sixth of the \
-     gate, got {ratio}"
+    "a two-window pair really does stay a sixth under the old gate, got {ratio}"
   );
   let lever: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
   let got = EmaRenormalized::new(alpha).aggregate_values(&lever, &vec![1.0; n], 1);
@@ -943,92 +1093,1348 @@ fn ema_weight_error_accumulates_but_no_input_can_reach_the_gate() {
     matches!(got, Err(WinditError::NonFinite)),
     "an exactly cancelling in-domain fold has no direction, got {got:?}"
   );
+
+  // THE WITNESS. A support of 1278 windows carrying the coefficients of a
+  // polynomial that vanishes at the complement, which is how a relation reaches
+  // past the two-window lever: one factor `(8192 x - 6553)` does the cancelling,
+  // and the other one is free to have any degree at all.
+  let alpha = 1639.0 / 8192.0;
+  let b = 1.0 - alpha;
+  assert_eq!(
+    b,
+    6553.0 / 8192.0,
+    "the complement must be exact, or the ideal is not b"
+  );
+  assert_eq!(8192.0 * b - 6553.0, 0.0, "so that P(b) is exactly zero");
+
+  let deg = 1277_usize;
+  let (n, base) = (2447_usize, 1168_usize);
+  let c = vanishing_polynomial(deg);
+  assert_eq!(c.len(), deg + 1, "one coefficient per support window");
+
+  // The coefficients are exact, and the identity they satisfy is the telescope
+  // `sum_k (8192 f_{k-1} - 6553 f_k) b^k = 0`, term by term: `8192 b^k` is
+  // `6553 b^(k-1)`, so the two halves are the same sum shifted by one and
+  // cancel whatever the `f_j` are. `vanishing_polynomial` asserts every
+  // coefficient round-trips, which is the part that is not free.
+  let scale = libm::ldexp(1.0, -24);
+  let mut components = vec![0.0_f64; n];
+  for (k, &ck) in c.iter().enumerate() {
+    assert!(ck != 0.0, "coefficient {k} must be a live window");
+    components[n - 1 - (base + k)] = ck * scale;
+  }
+  for (i, &x) in components.iter().enumerate() {
+    assert!(
+      x == 0.0 || (x.abs() >= f64::MIN_AGG_MAGNITUDE && x.abs() <= f64::MAX_AGG_MAGNITUDE),
+      "window {i} must be in domain: {x:e}"
+    );
+  }
+
+  // Every materialized weight over the support is a *normal* `f64`, so #17's
+  // absolute slack is exactly zero here and cannot be what gates this.
+  let w = ema_ladder(alpha, n);
+  let smallest = (0..c.len())
+    .map(|k| w[n - 1 - (base + k)])
+    .fold(f64::INFINITY, f64::min);
+  assert!(
+    smallest >= f64::MIN_NORMAL,
+    "the whole support must be in the normal range: {smallest:e}"
+  );
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  assert_eq!(
+    ema_formation_slack(&w, &refs, alpha, b)
+      - (0..n)
+        .map(|i| (2.0 * ((n - 1 - i) as f64) + 2.0) * f64::EPSILON * w[i] * components[i].abs())
+        .fold(0.0, |a, x| a + x),
+    0.0,
+    "and so the slack that gates it is the relative term alone"
+  );
+
+  // The spread the merged answer said could not be reached, measured against the
+  // same double-double reference as the growth above. One chain, sampled — 1278
+  // separate `dd_power` calls would be quadratic.
+  let (bhi, blo) = dd_complement(alpha);
+  assert_eq!((bhi, blo), (b, 0.0), "this complement is exact");
+  let (mut hi, mut lo) = (1.0_f64, 0.0_f64);
+  for _ in 0..base {
+    let (p, e) = two_product(hi, bhi);
+    let t = ((e + hi * blo) + lo * bhi) + lo * blo;
+    let s = p + t;
+    lo = (p - s) + t;
+    hi = s;
+  }
+  let (mut lo_d, mut hi_d) = (f64::INFINITY, f64::NEG_INFINITY);
+  for k in base..=(base + deg) {
+    let (rhi, rlo) = (alpha * hi, alpha * lo);
+    let d = ((w[n - 1 - k] - rhi) - rlo) / rhi;
+    lo_d = lo_d.min(d);
+    hi_d = hi_d.max(d);
+    let (p, e) = two_product(hi, bhi);
+    let t = ((e + hi * blo) + lo * bhi) + lo * blo;
+    let s = p + t;
+    lo = (p - s) + t;
+    hi = s;
+  }
+  let spread = (hi_d - lo_d) / u;
+  assert!(
+    (71.0..73.0).contains(&spread),
+    "the support's error spread must clear the 64u the gate leaves, and the \
+     10.0u the merged answer measured as the widest reachable: got {spread} u"
+  );
+
+  // The old threshold, and the direction it fabricated.
+  let ratio = ema_gate_ratio(&w, &components);
+  assert!(
+    (1.09..1.10).contains(&ratio),
+    "the residue must clear the gate the merged answer left standing: {ratio}"
+  );
+  let without = weighted_sum_renorm(&refs, &vec![1.0; n], 1, |i, _| w[i], |_| 0.0);
+  assert!(
+    matches!(without.as_deref(), Ok([-1.0])),
+    "without the policy's term the fold fabricates a direction out of exact \
+     cancellation, which is what #16 was closed against: {without:?}"
+  );
+
+  // And the shipped verdict.
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction, got {got:?}"
+  );
 }
 
 /// A weight whose *ideal* value has left `f64`'s exponent range is rounded
-/// **absolutely**, and the determinacy gate's absolute floor does not cover it.
+/// **absolutely**, and the determinacy gate must carry that error or a fold
+/// whose exact answer is zero comes back as a direction.
 ///
-/// CHARACTERIZATION of a live gap, not a guarantee — see
-/// <https://github.com/findit-studio/windit/issues/17>. The module note used to
-/// claim this regime was sound because a subnormal weight drives the fold's own
-/// products subnormal, leaving `MIN_GATE_THRESHOLD` to gate alone. That holds
-/// only while the components are `O(1)`. The [input domain](super#input-domain)
-/// admits components up to `2^400`, and one of those lifts the product of a
-/// subnormal weight back into the ordinary range, where the floor is nowhere
-/// near it.
+/// FALSIFIER for <https://github.com/findit-studio/windit/issues/17>. Before the
+/// weight-underflow slack this returned `Ok([1.0])` on every row below. The
+/// module note that preceded it claimed the regime was sound because a subnormal
+/// weight drives the fold's own products subnormal, leaving `MIN_GATE_THRESHOLD`
+/// to gate alone. That holds only while the components are `O(1)`. The
+/// [input domain](super#input-domain) admits components up to `2^400`, and one of
+/// those lifts the product of a subnormal weight back into the ordinary range,
+/// where the floor is nowhere near it.
 ///
-/// Nothing here is the repeated multiplication: at `alpha = 0.9` the chain's
-/// accumulated error is a few `u`, and the same input works at `alpha = 0.5`
-/// where every representable weight is exact to the bit. What breaks is that
-/// the ideal ratio between two adjacent weights — `1 / (1 - alpha)`, a factor
-/// of ten here — is not representable at the bottom of the subnormal grid, so
-/// the older weight rounds to zero while the newer one survives. Evaluating
-/// each weight once (`powi`) reaches the same zero: `alpha * 0.1^324` is not an
-/// `f64`, however it is computed.
+/// Nothing here is the repeated multiplication `ema_weight_error_accumulates_but_no_input_can_reach_the_gate`
+/// measures: the `alpha = 0.5` row is exact at every representable chain index,
+/// so it carries none of that error at all. What breaks is that the ideal ratio
+/// between two adjacent weights — `1 / (1 - alpha)` — is not representable at the
+/// bottom of the subnormal grid, so the older weight rounds to zero while the
+/// newer one survives. Evaluating each weight once (`powi`) reaches the same
+/// zero: `alpha * 0.1^324` is not an `f64`, however it is computed.
 #[test]
-fn ema_weights_below_the_exponent_range_fabricate_a_direction() {
-  let alpha = 0.9_f64;
+fn ema_weights_below_the_exponent_range_cannot_fabricate_a_direction() {
+  // Each row: (alpha, chain index of the surviving weight, the newer component).
+  // `c_hi = -c_lo / (1 - alpha)` makes the ideal pair cancel to zero by
+  // construction rather than by luck, so every row's exact answer is the zero
+  // vector and every `Ok` below would be fabricated.
+  let rows: [(f64, usize, f64); 4] = [
+    // The headline witness. `1 - 0.9` is exact (Sterbenz), and `b`'s significand
+    // is `900_719_925_474_099`, so building `c_lo` out of that significand makes
+    // `c_hi` the exact power of two `-2^83`.
+    (0.9, 323, libm::ldexp(900_719_925_474_099.0, 30)),
+    // THE row that identifies the mechanism: at a dyadic alpha the chain is exact
+    // at every representable index, so this witness carries none of the
+    // accumulated multiplication error #16 measured. `0.5 * 2^-1074 = 2^-1075` is
+    // simply not an `f64`, and `powi` reaches the same zero.
+    (0.5, 1073, libm::ldexp(1.0, 399)),
+    (1.0 - libm::ldexp(1.0, -30), 35, libm::ldexp(1.0, 60)),
+    (1.0 - libm::ldexp(1.0, -53), 20, libm::ldexp(1.0, 70)),
+  ];
+
+  for (alpha, k1, c_lo) in rows {
+    let b = 1.0 - alpha;
+    let c_hi = -c_lo / b;
+    assert_eq!(
+      c_lo + c_hi * b,
+      0.0,
+      "alpha {alpha}: the ideal weighted sum must be exactly zero"
+    );
+    assert!(
+      c_lo.abs() >= f64::MIN_AGG_MAGNITUDE
+        && c_lo.abs() <= f64::MAX_AGG_MAGNITUDE
+        && c_hi.abs() >= f64::MIN_AGG_MAGNITUDE
+        && c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+      "alpha {alpha}: both components must be ordinary in-domain values: \
+       {c_lo:e}, {c_hi:e}"
+    );
+
+    let n = k1 + 3;
+    let w = ema_ladder(alpha, n);
+    let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + 1));
+    assert!(
+      w[i1] > 0.0 && w[i1] < f64::MIN_NORMAL,
+      "alpha {alpha}: the surviving weight is a subnormal: {:e}",
+      w[i1]
+    );
+    assert_eq!(
+      w[i2], 0.0,
+      "alpha {alpha}: and its ideal partner has no f64 at all"
+    );
+
+    let mut components = vec![0.0_f64; n];
+    components[i1] = c_lo;
+    components[i2] = c_hi;
+    // The residue the *old* threshold would have judged this against, so the
+    // size of the gap stays on record rather than only its verdict.
+    let ratio = ema_gate_ratio(&w, &components);
+    assert!(
+      ratio > 100.0,
+      "alpha {alpha}: the residue cleared the old gate by {ratio:e}x"
+    );
+
+    let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+    let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+    assert!(
+      matches!(got, Err(WinditError::NonFinite)),
+      "alpha {alpha}, n = {n}: an exactly cancelling in-domain fold has no \
+       direction; got {got:?}"
+    );
+  }
+}
+
+/// The oldest window is in the ladder too, and its weight carries no `alpha`
+/// factor.
+///
+/// FALSIFIER for the one entry the backward pass builds separately.
+/// `weights[0]` is the bare `b^(n - 1)` the recurrence leaves for the window
+/// nothing preceded, so a slack that walked only `weights[1..]` would miss a
+/// cancelling pair straddling it — and that pair is the *worst* one for a
+/// term charged per window, because the ideal ratio across the seam is
+/// `alpha / b` rather than `1 / b`, which at `alpha = 1 - 2^-53` puts a factor
+/// of `2^53` of the mass on the window an off-by-one would drop.
+///
+/// Building the components as `c_1 = b * t` and `c_0 = -alpha * t` makes
+/// `alpha * c_1 + b * c_0` exactly zero by construction, and both of them
+/// exactly representable: `alpha` and `b` are `1 - 2^-53` and `2^-53`, whose
+/// significands fit.
+#[test]
+fn the_oldest_window_is_charged_for_its_own_underflowed_weight() {
+  let alpha = 1.0 - libm::ldexp(1.0, -53);
   let b = 1.0 - alpha;
   assert_eq!(
-    b, 0.099_999_999_999_999_98,
-    "1 - 0.9 is exact (Sterbenz), so the ideal complement is the one the fold \
-     uses and every weight error below is the exponent range and nothing else"
+    b,
+    libm::ldexp(1.0, -53),
+    "the complement is exact (Sterbenz)"
   );
 
-  // `b` is `900_719_925_474_099 * 2^-53`, so building the newer component out of
-  // that significand makes `c_hi = -c_lo / b` the exact power of two `-2^83`,
-  // and the ideal pair cancels to zero by construction rather than by luck.
-  assert_eq!(
-    libm::ldexp(900_719_925_474_099.0, -53),
-    b,
-    "b's significand"
+  // `53 * 20 = 1060`, so at `n = 22` the chain index of window 1 is the last
+  // whose weight survives and window 0's — one step older — is gone.
+  let n = 22_usize;
+  let w = ema_ladder(alpha, n);
+  assert!(
+    w[1] > 0.0 && w[1] < f64::MIN_NORMAL,
+    "window 1's weight is the surviving subnormal: {:e}",
+    w[1]
   );
-  let c_lo = libm::ldexp(900_719_925_474_099.0, 30);
-  let c_hi = -c_lo / b;
-  assert_eq!(c_hi, -libm::ldexp(1.0, 83), "so the quotient is exact");
+  assert_eq!(w[0], 0.0, "and window 0's, `b^(n - 1)`, has no f64 at all");
+
+  let t = libm::ldexp(1.0, 400);
+  let (c_lo, c_hi) = (b * t, -alpha * t);
   assert_eq!(
-    c_lo + c_hi * b,
+    alpha * c_lo + b * c_hi,
     0.0,
-    "the ideal weighted sum must be exactly zero"
+    "the ideal pair must cancel exactly"
   );
   assert!(
-    c_lo.abs() < f64::MAX_AGG_MAGNITUDE && c_hi.abs() < f64::MAX_AGG_MAGNITUDE,
-    "and both components must be ordinary in-domain values: {c_lo:e}, {c_hi:e}"
+    c_lo.abs() >= f64::MIN_AGG_MAGNITUDE && c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+    "and both components stay in domain: {c_lo:e}, {c_hi:e}"
   );
 
-  let k1 = 323_usize;
+  let mut components = vec![0.0_f64; n];
+  components[1] = c_lo;
+  components[0] = c_hi;
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+
+  // The mass window 0 carries, against the mass the rest of the ladder does: an
+  // off-by-one that skipped it would leave the slack four orders under the
+  // residue rather than eleven orders over it. The margin halved when the oldest
+  // window's absolute unit stopped being borrowed from the general one: its unit
+  // is the bare `D`, which at `alpha = 1 - 2^-53` is `1 + 2^-53` and quantizes to
+  // one `2^-1074` where the general `(1 + alpha * D)` quantizes to two. Against
+  // an error of `2^-1113` that still over-bounds by `2^39`, and the separation
+  // between "with window 0" and "without" it is unchanged.
+  let slack = ema_formation_slack(&w, &refs, alpha, b);
+  let without_zero = ema_formation_slack(&w[1..], &refs[1..], alpha, b);
+  let residue = (w[1] * c_lo + w[0] * c_hi).abs();
+  assert!(
+    (5.4e11..5.6e11).contains(&(slack / residue)) && without_zero / residue < 1e-3,
+    "window 0 is where this input's mass is: {slack:e} with it, {without_zero:e} \
+     without, against a residue of {residue:e}"
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction; got {got:?}"
+  );
+}
+
+/// The oldest weight is not `alpha` times anything, so the charge that damps by
+/// `alpha` is not its charge.
+///
+/// FALSIFIER for the fourth defect on this seam, and the same shape as the three
+/// before it: a bound derived for the general term, applied to the element the
+/// module's own text names as the exception. `weights[0]` is the bare ladder
+/// value `p_(n-1)`; every other weight is `fl(alpha * p_k)`. The absolute unit
+/// `(1 + alpha * D)` is derived from that final multiplication — the `1` is its
+/// own rounding and the `alpha * D` is every chain rounding *damped by it*.
+/// Window 0 has no such multiplication, so its chain roundings arrive undamped
+/// and its unit is the bare `D`.
+///
+/// The gap is `1 / (2 * alpha)`, and it is reachable because the ladder does not
+/// decay to zero: past the flush point `fl(p * b) == p` and the chain **stalls**
+/// at a fixed point of the subnormal grid, at `m` ulps with
+/// `(1 - b) * m <= 1/2` — that is `m <= D / 2`, exactly the derived bound and
+/// tight against it. `alpha = 0.05` stalls at `9 * 2^-1074` against a shipped
+/// charge of `2 * 2^-1074`, so the oldest weight is `4.5x` its own error bound
+/// and one `2^400` component on it clears the gate.
+///
+/// What the fold then returns is entirely an artifact of that fixed point: the
+/// ideal `(1 - alpha)^19999 * 2^400` is about `2^-1080`, eighty binary orders
+/// below the `2^-1000` determinacy floor, so no direction is determined at
+/// working precision and `Ok([1.0])` is a fabrication.
+#[test]
+fn the_oldest_weights_charge_is_not_damped_by_alpha() {
+  // The stall, over the coefficients that reach it. `w[0]` is the fixed point
+  // the chain lands on, `D / 2` is the bound it is tight against, and the
+  // shipped `(1 + alpha * D)` unit is a flat `2 * 2^-1074` at every coefficient
+  // — which is the whole of the defect: the unit does not grow as the ladder's
+  // stall does.
+  let eta = libm::ldexp(1.0, -1074);
+  for (alpha, n, stall) in [
+    (0.02_f64, 37_049_usize, 24.0_f64),
+    (0.05, 20_000, 9.0),
+    (0.1, 7_266, 5.0),
+    (0.125, 5_776, 4.0),
+    (0.15, 4_781, 3.0),
+  ] {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, n);
+    assert_eq!(
+      w[0],
+      stall * eta,
+      "alpha {alpha}: the oldest weight is the ladder's subnormal fixed point"
+    );
+    assert_eq!(
+      w[0] * b,
+      w[0],
+      "alpha {alpha}: and it is a fixed point — the chain has stopped decaying"
+    );
+    let damping = 1.0 / (1.0 - b);
+    assert!(
+      stall <= damping / 2.0 && stall > damping / 2.0 - 1.0,
+      "alpha {alpha}: the stall is tight against the derived `(eta/2) * D`: \
+       {stall} against {}",
+      damping / 2.0
+    );
+
+    // The charge the slack assigns window 0, read off the production function:
+    // a unit window there and zeros everywhere else leave `S = E_0 * 1`.
+    let mut components = vec![0.0_f64; n];
+    components[0] = 1.0;
+    let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+    let charge = ema_formation_slack(&w, &refs, alpha, b);
+    assert!(
+      charge >= w[0],
+      "alpha {alpha}: window 0's charge must bound window 0's own weight, which \
+       is the whole of its error where the ideal has left the range — \
+       {charge:e} against {:e}",
+      w[0]
+    );
+    // Exact rather than toleranced, because the unit is an integer number of
+    // `2^-1074`: there is no rounding to allow for, so `damping * eta` either
+    // quantizes to the derived coefficient or it does not.
+    assert_eq!(
+      charge,
+      damping * (f64::MIN_NORMAL * f64::EPSILON),
+      "alpha {alpha}: at the stall the relative term has underflowed to zero, so \
+       this charge is the oldest window's absolute unit and nothing else — the \
+       bare `D` at twice its derived size. Halving that unit, or damping it by \
+       `alpha`, has to show up right here."
+    );
+  }
+
+  // The verdict, on the production path, at the reviewer's row.
+  let (alpha, n) = (0.05_f64, 20_000_usize);
+  let w = ema_ladder(alpha, n);
+  // The ideal weight this stall stands in for, in the only arithmetic that can
+  // hold it: `(n - 1) * log2(1 - alpha)`. Below `2^-1400`, so the ideal
+  // contribution of a `2^400` component is below `2^-1000` — the determinacy
+  // floor — and there is no direction to return.
+  let log2_ideal = (n as f64 - 1.0) * libm::log2(1.0 - alpha);
+  assert!(
+    log2_ideal < -1400.0,
+    "the ideal weight is {log2_ideal} binary orders down, far past any f64"
+  );
+
+  let mut components = vec![0.0_f64; n];
+  components[0] = libm::ldexp(1.0, 400);
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  // What the fold accumulates is the stall times that component — an ordinary
+  // normal `f64`, nowhere near the floor, which is why neither the floor nor
+  // `16 * EPSILON * ||M||` can gate it.
+  let acc = w[0] * components[0];
+  assert_eq!(acc, libm::ldexp(1.125, -671), "the accumulator is normal");
+  assert!(
+    16.0 * f64::EPSILON * acc + f64::MIN_GATE_THRESHOLD < acc,
+    "and the gate's own two terms are nowhere near it"
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a fold whose whole mass rides on a stalled subnormal weight has no \
+     direction at working precision; got {got:?}"
+  );
+}
+
+/// Every window's charge bounds *that* window's own weight error.
+///
+/// The audit made executable, and the one shape a summed assertion cannot see.
+/// `E_i` is a bound on `|w_i - W_i|` at each position *separately*, so the moment
+/// the check is `sum_i E_i * ||e_i|| >= sum_i |w_i - W_i| * ||e_i||` — which is
+/// what `the_formation_slack_bounds_the_actual_weight_error` next door measures —
+/// a term that is too large at one index pays for a term that is too small at
+/// another. All four defects on this seam were the same shape: a bound derived
+/// for the general term applied to an element the crate already knew was special.
+/// `weights[0]` is the bare `p_(n - 1)` the recurrence leaves for the window
+/// nothing preceded, and it carries no `alpha` factor for `(1 + alpha * D)` to
+/// have been derived from.
+///
+/// The charge is *read off* the production function rather than re-derived: a
+/// unit embedding at window `i` and the zero vector everywhere else leaves
+/// `S = E_i * l2_norm([1.0])`, and `l2_norm([1.0])` is exactly `1`.
+///
+/// The reference `W_i` has to be carried where `f64` cannot follow — at
+/// `alpha = 0.05, n = 20000` the ideal weight is about `2^-1480` — so it is a
+/// double-double `(hi, lo)` over an `i32` exponent of its own, renormalized with
+/// `frexp` at every step, and both sides of the comparison stay in that
+/// representation rather than in a scalar that would flush the ideal to zero.
+#[test]
+fn every_windows_charge_bounds_that_windows_own_weight_error() {
+  // `(hi + lo) * 2^e` with `hi` in `[0.5, 1)`, so a comparison is an exponent and
+  // then a mantissa, and never an `f64` that has to hold the value.
+  fn renorm(hi: f64, lo: f64, e: i32) -> (f64, f64, i32) {
+    let (m, ex) = libm::frexp(hi);
+    (m, libm::ldexp(lo, -ex), e + ex)
+  }
+
+  // `a >= b` for two normalized non-negative scaled values.
+  fn at_least(a: (f64, i32), b: (f64, i32)) -> bool {
+    if b.0 == 0.0 {
+      true
+    } else if a.0 == 0.0 {
+      false
+    } else if a.1 == b.1 {
+      a.0 >= b.0
+    } else {
+      a.1 > b.1
+    }
+  }
+
+  // `|w - W|`, normalized. The two can be thousands of binary orders apart, so
+  // the smaller is dropped past `200` bits — which over-states the difference and
+  // so only ever makes the assertion harder to satisfy.
+  fn distance(w: f64, ideal: (f64, f64, i32)) -> (f64, i32) {
+    let (ihi, ilo, ie) = ideal;
+    if w == 0.0 {
+      return (ihi, ie);
+    }
+    let (wm, we) = libm::frexp(w);
+    let e = we.max(ie);
+    let a = if we - e < -200 {
+      0.0
+    } else {
+      libm::ldexp(wm, we - e)
+    };
+    let (bhi, blo) = if ie - e < -200 {
+      (0.0, 0.0)
+    } else {
+      (libm::ldexp(ihi, ie - e), libm::ldexp(ilo, ie - e))
+    };
+    let d = ((a - bhi) - blo).abs();
+    if d == 0.0 {
+      (0.0, 0)
+    } else {
+      let (m, ex) = libm::frexp(d);
+      (m, e + ex)
+    }
+  }
+
+  // Returns how many of the checked positions had actually left the exponent
+  // range, so no row can pass by never reaching the regime it is here for.
+  fn check(alpha: f64, n: usize, full: bool) -> usize {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, n);
+    let mut checked = vec![full; n];
+    if !full {
+      // Ends, quarters, and the two indices that bracket the flushed run: the
+      // positions where a bound derived for one place can differ from the bound
+      // that place is owed.
+      for i in [0, 1, 2, 3, n / 4, n / 2, 3 * n / 4, n - 3, n - 2, n - 1] {
+        checked[i] = true;
+      }
+      if let Some(i) = w.iter().position(|&x| x < f64::MIN_NORMAL) {
+        checked[i] = true;
+      }
+      if let Some(i) = w.iter().rposition(|&x| x < f64::MIN_NORMAL) {
+        checked[i] = true;
+      }
+    }
+
+    // One slice per window, switched between the unit and the zero vector, so the
+    // sweep allocates once rather than once per position.
+    let one = [1.0_f64];
+    let zero = [0.0_f64];
+    let mut refs: Vec<&[f64]> = vec![&zero[..]; n];
+
+    let (bhi, blo) = dd_complement(alpha);
+    let (mut hi, mut lo, mut e) = renorm(1.0, 0.0, 0);
+    let mut flushed = 0_usize;
+    for k in 0..n {
+      // Window `n - 1 - k` carries `alpha * p_k`, except window 0, whose weight
+      // is the bare `p_(n - 1)`.
+      let i = n - 1 - k;
+      let ideal = if i == 0 {
+        renorm(hi, lo, e)
+      } else {
+        let (p, err) = two_product(alpha, hi);
+        let t = err + alpha * lo;
+        let s = p + t;
+        renorm(s, (p - s) + t, e)
+      };
+      if checked[i] {
+        refs[i] = &one[..];
+        let charge = ema_formation_slack(&w, &refs, alpha, b);
+        refs[i] = &zero[..];
+        let scaled = if charge == 0.0 {
+          (0.0, 0)
+        } else {
+          libm::frexp(charge)
+        };
+        let want = distance(w[i], ideal);
+        assert!(
+          at_least(scaled, want),
+          "alpha {alpha}, n {n}, window {i}: the charge must bound this window's \
+           own weight error — {charge:e} against {:e} * 2^{}, where the weight is \
+           {:e} and its ideal is {:e} * 2^{}",
+          want.0,
+          want.1,
+          w[i],
+          ideal.0 + ideal.1,
+          ideal.2
+        );
+        flushed += usize::from(w[i] < f64::MIN_NORMAL);
+      }
+      // `p_(k + 1) = p_k * b`.
+      let (p, err) = two_product(hi, bhi);
+      let t = ((err + hi * blo) + lo * bhi) + lo * blo;
+      let s = p + t;
+      (hi, lo, e) = renorm(s, (p - s) + t, e);
+    }
+    flushed
+  }
+
+  assert_eq!(
+    l2_norm(&[1.0_f64]),
+    1.0,
+    "the charge is read off the production function, so a unit window must weigh \
+     exactly one"
+  );
+
+  // Every position, over ladders short enough for an O(n^2) sweep. The first
+  // three reach the flush; `alpha = 0.4, n = 1000` is the control that stays
+  // inside the exponent range from end to end, where only the relative half is
+  // charged and window 0 is a normal `f64` like every other.
+  for (alpha, n, flushes) in [
+    (0.9_f64, 524_usize, true),
+    (0.75, 737, true),
+    (0.5, 1274, true),
+    (0.4, 1000, false),
+  ] {
+    let flushed = check(alpha, n, true);
+    assert_eq!(
+      flushed > 0,
+      flushes,
+      "alpha {alpha}, n {n}: the sweep must reach the regime it is here for — \
+       {flushed} flushed weights checked"
+    );
+  }
+
+  // The small coefficients, whose flush needs an `n` no full sweep can afford.
+  // These are the rows where the two coefficients differ most: `D` is `20` at
+  // `alpha = 0.05` against a general term that is a flat `2`.
+  for (alpha, n) in [(0.05_f64, 20_000_usize), (0.1, 7_266), (0.15, 4_781)] {
+    assert!(
+      check(alpha, n, false) > 0,
+      "alpha {alpha}, n {n}: the sample must include a flushed weight"
+    );
+  }
+}
+
+/// The weight-underflow slack is a per-dimension mass, not `n * max |e|`.
+///
+/// FALSIFIER for the *shape* of the term rather than for its presence. #17's
+/// prototype was `tau += n * 2^-1074 * max_ij |e_ij|`, a bound with no `dim` in
+/// it on a residue whose norm carries `sqrt(dim)`: give every dimension the same
+/// component and the residue grows as `sqrt(dim)` while `max |e|` does not move.
+///
+/// The construction is what pins the ratio the prototype has to beat. Cancelling
+/// across one chain step forces `c_hi = -c_lo / b`, so the prototype reads
+/// `max |e| = |c_lo| / b` while the residue rides on `|c_lo|`: with the surviving
+/// weight `w` the two sides are `w * |c_lo| * sqrt(dim)` against
+/// `n * 2^-1074 * |c_lo| / b`, and the flush condition `w * b < 2^-1075` caps
+/// their ratio at `sqrt(dim) / (2 * n)`. Reaching that cap wants the ladder to
+/// step *onto* the flush boundary rather than past it, which is a divisibility
+/// question: at `b = 2^-p` the last chain index is `ceil(1075 / p)` and the
+/// overshoot is `p * ceil(1075 / p) - 1075`, zero exactly when `p` divides
+/// `1075 = 5^2 * 43`. `p = 43` is the largest such `p` inside `f64`'s reach
+/// (`1 - 2^-54` is not an `f64`), and it needs only `n = 27` windows — so an
+/// eight-thousand-wide embedding clears the prototype by `1.68x`.
+///
+/// The slack this crate ships gates it by `4x` at *every* width, because it is
+/// the same norm the residue is.
+#[test]
+fn the_weight_underflow_slack_carries_the_dimension() {
+  let b = libm::ldexp(1.0, -43);
+  let alpha = 1.0 - b;
+  assert_eq!(1.0 - alpha, b, "the complement is exact (Sterbenz)");
+
+  // `43 * 25 = 1075`, so the chain's last nonzero weight is `alpha * 2^-1032`
+  // and its ideal successor is `alpha * 2^-1075` — just under the half-step that
+  // rounds to zero, which is the closest any power-of-two complement gets.
+  let k1 = 24_usize;
   let n = k1 + 3;
   let w = ema_ladder(alpha, n);
   let (i1, i2) = (n - 1 - k1, n - 1 - (k1 + 1));
   assert!(
-    w[i1] > 0.0 && w[i1] < f64::MIN_POSITIVE,
-    "the surviving weight is a subnormal, one step above the flush: {:e}",
+    w[i1] > 0.0 && w[i1] < f64::MIN_NORMAL,
+    "the surviving weight is a subnormal: {:e}",
     w[i1]
   );
+  assert_eq!(w[i2], 0.0, "and its ideal partner has no f64 at all");
+
+  let dim = 8192_usize;
+  let c_lo = libm::ldexp(1.0, 300);
+  let c_hi = -c_lo / b;
+  assert_eq!(c_lo + c_hi * b, 0.0, "the ideal pair must cancel exactly");
+  assert!(
+    c_hi.abs() <= f64::MAX_AGG_MAGNITUDE,
+    "and both components stay in domain: {c_hi:e}"
+  );
+
+  let zero = vec![0.0_f64; dim];
+  let lo = vec![c_lo; dim];
+  let hi = vec![c_hi; dim];
+  let mut embeddings: Vec<&[f64]> = vec![zero.as_slice(); n];
+  embeddings[i1] = &lo;
+  embeddings[i2] = &hi;
+
+  // The prototype's term against the residue it has to cover. Measured, so the
+  // reason the shipped term is not the prototype stays on record as a number.
+  let prototype = (n as f64) * libm::ldexp(1.0, -1074) * c_hi.abs();
+  let residue = w[i1] * c_lo * libm::sqrt(dim as f64);
+  assert!(
+    (1.67..1.68).contains(&(residue / prototype)),
+    "the prototype must be the term that misses this: residue {residue:e} \
+     against its {prototype:e}, a ratio of {}",
+    residue / prototype
+  );
+
+  let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &vec![1.0; n], dim);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "an exactly cancelling in-domain fold has no direction; got {:?}",
+    got.map(|v| v[0])
+  );
+}
+
+/// The slack really does bound the weight error it is a bound on, measured
+/// against a double-double reference rather than re-derived.
+///
+/// The claim under test is the one the whole gate now rests on:
+/// `S >= sum_i |w_i - W_i| * ||e_i||` against the *ideal* `W_i`. Everything else
+/// about the term — which regime it covers, how it is grouped, what it costs — is
+/// downstream of that inequality holding, and it is the inequality a mutation
+/// that shaves the coefficient breaks first. `dd_power` carries the ideal to
+/// about 106 bits, so the left-hand side is measured and not modelled.
+///
+/// The upper assertion is the structural containment: `theta_i` is monotone in
+/// the chain index, so the whole term can never exceed the oldest window's
+/// coefficient times the fold's own weighted mass. What the term *costs* is
+/// pinned as a verdict next door, where the number is meaningful; here the
+/// realized error is data-dependent and a ratio against it says nothing (at
+/// `n = 2` the ladder has no chain step at all and the error is exactly zero).
+#[test]
+fn the_formation_slack_bounds_the_actual_weight_error() {
+  for alpha in [
+    0.05_f64,
+    0.1,
+    0.3,
+    0.46,
+    0.5,
+    0.625,
+    0.9,
+    1.0 - libm::ldexp(1.0, -30),
+  ] {
+    for n in [2_usize, 3, 8, 64, 200, 1000] {
+      let w = ema_ladder(alpha, n);
+      // The reference is only valid while every weight is normal; the flushed
+      // regime is what the absolute half covers and is driven elsewhere.
+      if w.iter().any(|&x| x < f64::MIN_NORMAL) {
+        continue;
+      }
+      // In-domain components spanning the domain, so `||e_i||` is not a constant.
+      let cols: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+          let s = libm::ldexp(1.0, (i % 7) as i32 * 100 - 300);
+          [s, -s * 0.5, s * 0.25]
+        })
+        .collect();
+      let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+
+      let (bhi, blo) = dd_complement(alpha);
+      let (mut hi, mut lo) = (1.0_f64, 0.0_f64);
+      let mut actual = 0.0_f64;
+      for k in 0..n {
+        // Window `n - 1 - k` carries `alpha * b^k`, except window 0, which is the
+        // bare `b^(n - 1)`.
+        let i = n - 1 - k;
+        let (ihi, ilo) = if i == 0 {
+          (hi, lo)
+        } else {
+          (alpha * hi, alpha * lo)
+        };
+        actual += ((w[i] - ihi) - ilo).abs() * l2_norm(refs[i]);
+        let (p, e) = two_product(hi, bhi);
+        let t = ((e + hi * blo) + lo * bhi) + lo * blo;
+        let s = p + t;
+        lo = (p - s) + t;
+        hi = s;
+      }
+
+      let slack = ema_formation_slack(&w, &refs, alpha, 1.0 - alpha);
+      assert!(
+        slack >= actual,
+        "alpha {alpha}, n {n}: the slack must bound the error it covers — \
+         {slack:e} against {actual:e}"
+      );
+      // `alpha = 0.5` and `1 - 2^-30` are the exact ladders: nothing is owed and
+      // nothing is charged, which is the certificate rather than a loose bound.
+      let power_of_two = alpha >= 0.5 && {
+        let b = 1.0 - alpha;
+        libm::ldexp(1.0, libm::frexp(b).1 - 1) == b
+      };
+      if power_of_two {
+        assert_eq!(
+          (slack, actual),
+          (0.0, 0.0),
+          "alpha {alpha}, n {n}: an exact ladder owes and is charged nothing"
+        );
+        continue;
+      }
+      // Past a long enough chain an inexact complement really does drift. Not
+      // before: at `n = 2` there is no chain step at all, and a complement with a
+      // short odd part stays exact for as long as that part fits — `0.625`'s is
+      // `3/8`, and `3^33 < 2^53`, so its chain is exact to `k = 33`. That is the
+      // observation the merged #16 answer built a lever cap out of, true about a
+      // chain and never about a support.
+      assert!(
+        n < 64 || actual > 0.0,
+        "alpha {alpha}, n {n}: an inexact ladder must carry error, or the \
+         reference is not measuring one"
+      );
+      let weighted_mass: f64 = (0..n).map(|i| w[i] * l2_norm(refs[i])).sum();
+      assert!(
+        slack <= (2.0 * (n as f64) + 2.0) * f64::EPSILON * weighted_mass,
+        "alpha {alpha}, n {n}: the oldest window's coefficient bounds the whole \
+         term — {slack:e} against {:e}",
+        (2.0 * (n as f64) + 2.0) * f64::EPSILON * weighted_mass
+      );
+    }
+  }
+}
+
+/// `alpha = 0.5`'s dyadic exactness reaches the determinacy *gate*, not only the
+/// ladder — and next door the widening is a pinned number rather than a
+/// direction.
+///
+/// The published contract is bit-exactness, and the weight-formation slack is a
+/// term on the *threshold* rather than on the answer — so a slack charged at a
+/// dyadic `alpha` would leave every documented value untouched and still change
+/// which folds are refused. It is `C::ZERO` there instead, by the power-of-two
+/// certificate rather than by measurement.
+///
+/// The complement being a power of two is the certificate, not the coefficient
+/// looking dyadic: `alpha = 0.625` is as dyadic a literal as `0.5` and its
+/// complement `0.375` is `3/8`, so its chain does drift and it is charged.
+///
+/// A near-cancelling pair on the two newest windows makes the cost a number. The
+/// coefficients there are `2 * EPSILON` and `4 * EPSILON` against the gate's own
+/// `16 * EPSILON`, so the threshold moves by exactly `1.1875x` — a residue at
+/// `1.125x` is refused and one at `1.25x` answers. That is the whole
+/// over-rejection an ordinary recency fold pays.
+#[test]
+fn the_dyadic_gate_is_untouched_where_a_neighbouring_alpha_is_not() {
+  let n = 64_usize;
+  let fold = |alpha: f64, t: f64| {
+    let w = ema_ladder(alpha, n);
+    let mut cols: Vec<[f64; 2]> = vec![[0.0, 0.0]; n];
+    let (j1, j2) = (n - 1, n - 2);
+    cols[j1] = [1.0, 0.0];
+    cols[j2] = [
+      -w[j1] / w[j2],
+      t * 16.0 * f64::EPSILON * (2.0 * w[j1]) / w[j2],
+    ];
+    let refs: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+    let slack = ema_formation_slack(&w, &refs, alpha, 1.0 - alpha);
+    let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 2);
+    (slack, got.is_ok())
+  };
+
+  for alpha in [0.5_f64, 0.75, 1.0 - libm::ldexp(1.0, -30)] {
+    let (slack, ok) = fold(alpha, 1.125);
+    assert_eq!(
+      slack, 0.0,
+      "alpha {alpha}: an exact ladder is charged nothing"
+    );
+    assert!(
+      ok,
+      "alpha {alpha}: and a residue above the fold's own threshold still answers"
+    );
+  }
+  for alpha in [0.46_f64, 0.3, 0.625] {
+    assert!(
+      !fold(alpha, 1.125).1,
+      "alpha {alpha}: 1.125x the fold's own threshold is under the new one"
+    );
+    assert!(
+      fold(alpha, 1.25).1,
+      "alpha {alpha}: and 1.25x is over it, so the widening is exactly 1.1875x"
+    );
+    assert!(
+      fold(alpha, 1.125).0 > 0.0,
+      "alpha {alpha}: and the slack is what decides it"
+    );
+  }
+}
+
+/// The absolute slack's conservative coefficient keeps `alpha`, so it does not
+/// grow as `1 / alpha` and refuse folds whose direction is not in doubt.
+///
+/// FALSIFIER for the over-rejection [#17] shipped. The derivation is
+/// `(EPSILON/2) * MIN_NORMAL * (1 + alpha * D)`; the code charged
+/// `MIN_NORMAL * EPSILON * (1 + D)`, dropping the coefficient on the grounds that
+/// `alpha <= 1`. That is a valid *inequality* and a bad *bound*: `D` is about
+/// `1 / alpha`, so `(1 + alpha * D)` is about `2` at every coefficient while
+/// `(1 + D)` grows without limit as the coefficient shrinks. At `alpha = 0.05`
+/// the two are `20x` apart, and that factor is the whole verdict here.
+///
+/// The fixture puts the entire underflowed mass on one window — a `2^400`
+/// component on a weight that has flushed to zero — and the entire *live* mass on
+/// another, a `2^-400` component on a weight that is still normal. The live term
+/// is the answer; the flushed window's ideal contribution is a ninth of it, so
+/// even reversing that window's sign leaves a robust direction. The shipped code
+/// refused anyway, because `S` alone was `5.185x` the accumulator.
+///
+/// [#17]: https://github.com/findit-studio/windit/issues/17
+#[test]
+fn the_underflow_slack_does_not_charge_1_over_alpha() {
+  let alpha = 0.05_f64;
+  let b = 1.0 - alpha;
+  let n = 14471_usize;
+  let (i_flushed, i_live) = (1_usize, 10853_usize);
+  let w = ema_ladder(alpha, n);
   assert_eq!(
-    w[i2], 0.0,
-    "and its ideal partner, a tenth of it, has no f64 at all"
+    w[i_flushed], 0.0,
+    "the old window's weight has flushed away"
+  );
+  assert!(
+    w[i_live] >= f64::MIN_NORMAL,
+    "and the live one's is an ordinary normal weight: {:e}",
+    w[i_live]
   );
 
   let mut components = vec![0.0_f64; n];
-  components[i1] = c_lo;
-  components[i2] = c_hi;
-  let ratio = ema_gate_ratio(&w, &components);
-  assert!(
-    ratio > 100.0,
-    "the residue clears the gate by two orders of magnitude even with the \
-     absolute floor fully engaged, got {ratio:e}"
+  components[i_flushed] = libm::ldexp(1.0, 400);
+  components[i_live] = libm::ldexp(1.0, -400);
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+
+  // The accumulator is the live term alone, the flushed weight contributing an
+  // exact zero.
+  let accumulator = w[i_live] * components[i_live];
+  assert_eq!(
+    accumulator, 5.167_161_890_762_072e-203,
+    "the fold's whole answer is the live window's term"
   );
 
-  // The verdict this pins is the defect. When #17 is fixed this assertion is
-  // what has to change, and the numbers above are what it has to change to.
-  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
-  let got = EmaRenormalized::new(alpha).aggregate_values(&refs, &vec![1.0; n], 1);
+  // The two coefficients, against that answer.
+  let damping = 1.0 / (1.0 - b);
+  let mass = components[i_flushed];
+  let derived = ((1.0 + alpha * damping) * (f64::MIN_NORMAL * f64::EPSILON)) * mass;
+  let dropped = ((1.0 + damping) * (f64::MIN_NORMAL * f64::EPSILON)) * mass;
   assert!(
-    matches!(got.as_deref(), Ok([1.0])),
-    "TODAY a direction is fabricated from exact cancellation, at n = {n} and \
-     ordinary components; got {got:?}"
+    (5.18..5.19).contains(&(dropped / accumulator)),
+    "dropping alpha makes the term {}x the accumulator, which decides NonFinite \
+     by itself",
+    dropped / accumulator
   );
+  assert!(
+    (0.49..0.50).contains(&(derived / accumulator)),
+    "and keeping it leaves the term at {}x, under the answer it is judging",
+    derived / accumulator
+  );
+  // The shipped slack is that derived term plus the live window's *relative*
+  // share, which is eleven digits down: the flushed weight is an exact zero, so
+  // it carries no relative part at all, and the live one is only `3617` chain
+  // steps old.
+  let shipped = ema_formation_slack(&w, &refs, alpha, b);
+  assert!(
+    shipped > derived && (shipped - derived) / derived < 1e-9,
+    "the absolute term is the whole of the slack to nine digits: {shipped:e} \
+     against {derived:e}"
+  );
+  assert!(
+    shipped < accumulator,
+    "and it sits under the answer it is judging: {shipped:e} against \
+     {accumulator:e}"
+  );
+
+  // What the flushed window was actually worth: `(1 - alpha)^10852 * 2^800`, the
+  // ratio of its ideal term to the live one. Raised against the *materialized*
+  // complement rather than the exact `1 - alpha`, which moves the ratio by about
+  // `10852 * u` — twelve orders under the two digits quoted.
+  let mut ideal_ratio = libm::ldexp(1.0, 800);
+  for _ in 0..(n - 2 - (n - 1 - i_live)) {
+    ideal_ratio *= b;
+  }
+  assert!(
+    (0.120..0.121).contains(&ideal_ratio),
+    "the flushed window is worth {ideal_ratio} of the live term, so even \
+     reversing it leaves a direction"
+  );
+
+  let got = EmaRenormalized::new(alpha)
+    .aggregate_values(&refs, &vec![1.0; n], 1)
+    .expect("a fold whose live mass outruns its underflowed tail has a direction");
+  assert_eq!(got, vec![1.0], "and it is the live window's direction");
+}
+
+/// The slack is charged only where a weight actually left the exponent range, so
+/// an ordinary long EMA still answers.
+///
+/// The over-rejection guard, and the reason the term is not `n * 2^-1074 * max |e|`
+/// over the whole slice. At `alpha = 0.9` the ladder flushes to zero past about
+/// `326` windows, so a `400`-window fold has `92` windows whose weight is gone —
+/// and it is still an entirely ordinary EMA, whose answer is the newest windows'.
+/// Charging every window would put the slack at `400 * 2^-1074` against a fold
+/// whose mass is `~1`; charging the underflowed ones puts it at `~2^-1066`, and
+/// either way the answer must survive. What must *not* survive is the same slice
+/// with its mass moved onto the underflowed tail, which is the row above.
+#[test]
+fn an_ordinary_long_ema_still_answers_past_the_underflow_point() {
+  let alpha = 0.9_f64;
+  let n = 400_usize;
+  let w = ema_ladder(alpha, n);
+  let flushed = w.iter().filter(|&&x| x == 0.0).count();
+  assert!(
+    flushed > 70,
+    "the ladder must actually have left the exponent range: {flushed} of {n}"
+  );
+
+  // Unit windows alternating between two axes: an ordinary recency fold whose
+  // answer is dominated by the newest windows.
+  let a: [f64; 2] = [1.0, 0.0];
+  let bvec: [f64; 2] = [0.0, 1.0];
+  let embeddings: Vec<&[f64]> = (0..n)
+    .map(|i| if i % 2 == 0 { &a[..] } else { &bvec[..] })
+    .collect();
+  let got = EmaRenormalized::new(alpha)
+    .aggregate_values(&embeddings, &vec![1.0; n], 2)
+    .expect("an ordinary long EMA has a direction");
+  // The newest window is index 399 (odd), so the answer leans on `[0, 1]`.
+  assert!(
+    got[1] > got[0] && got[0] > 0.0,
+    "and it is the recency answer: {got:?}"
+  );
+
+  // The same ladder, with the whole mass moved onto a window whose weight is
+  // gone, is the regime that must be refused — the contrast that keeps the row
+  // above from being satisfiable by rejecting everything.
+  let zero: [f64; 2] = [0.0, 0.0];
+  let big: [f64; 2] = [libm::ldexp(1.0, 300), 0.0];
+  let mut tail: Vec<&[f64]> = vec![&zero[..]; n];
+  tail[0] = &big;
+  let refused = EmaRenormalized::new(alpha).aggregate_values(&tail, &vec![1.0; n], 2);
+  assert!(
+    matches!(refused, Err(WinditError::NonFinite)),
+    "a fold whose whole mass rides on a flushed weight has no direction, got \
+     {refused:?}"
+  );
+}
+
+/// `alpha = 0.5`'s dyadic weights are exact, and the slack must not touch them.
+///
+/// The published contract: at a dyadic `alpha` every materialized weight is the
+/// ideal one to the bit, so the ladder — and every fold it drives — is exact.
+/// Verified over `n` in `2..=199`, where `0.5^198 = 2^-198` is still a normal
+/// `f64` and nothing underflows, which is why the weight-underflow slack is
+/// exactly `C::ZERO` across the whole range and the fold is bit-identical to the
+/// one that shipped without it.
+#[test]
+fn the_dyadic_alpha_stays_bit_exact_across_the_documented_range() {
+  for n in 2..=199_usize {
+    let w = ema_ladder(0.5, n);
+    // The ideal ladder, built by exact power-of-two scaling rather than by the
+    // chain under test.
+    let mut ideal = vec![0.0_f64; n];
+    for (i, x) in ideal.iter_mut().enumerate().skip(1) {
+      *x = libm::ldexp(1.0, -((n - i) as i32));
+    }
+    ideal[0] = libm::ldexp(1.0, -((n - 1) as i32));
+    assert_eq!(w, ideal, "the dyadic ladder must be exact at n = {n}");
+    let sum = w.iter().fold(0.0_f64, |a, x| a + x);
+    assert_eq!(sum, 1.0, "and it must sum to exactly one at n = {n}");
+    assert!(
+      w[0] >= f64::MIN_NORMAL,
+      "and no weight in the documented range is subnormal at n = {n}: {:e}",
+      w[0]
+    );
+
+    // And the fold itself, through the policy: the standard basis makes the
+    // ladder observable up to the renormalization every policy ends with.
+    let basis: Vec<Vec<f64>> = (0..n)
+      .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+      .collect();
+    let refs: Vec<&[f64]> = basis.iter().map(Vec::as_slice).collect();
+    let folded = EmaRenormalized::new(0.5)
+      .aggregate_values(&refs, &vec![1.0; n], n)
+      .expect("a convex EMA over the basis has a direction");
+    let mut replica = ideal;
+    l2_renorm(&mut replica).expect("the ladder has a direction");
+    assert_eq!(folded, replica, "and the fold reproduces it at n = {n}");
+  }
+}
+
+/// The slack is what gates the witness, and the gate is otherwise untouched.
+///
+/// The attribution test: the same ladder, the same components, the same fold —
+/// only the third term of `tau` differs. With `C::ZERO` in its place the residue
+/// clears the threshold and `l2_renorm` turns it into a unit direction, which is
+/// exactly the `Ok([1.0])` this crate shipped; with the policy's own term it is
+/// refused. Nothing else about `weighted_sum_renorm` changed, so nothing else can
+/// be credited with the fix.
+#[test]
+fn the_weight_underflow_slack_is_what_gates_the_witness() {
+  let alpha = 0.9_f64;
+  let c_lo = libm::ldexp(900_719_925_474_099.0, 30);
+  let c_hi = -c_lo / (1.0 - alpha);
+  let (k1, n) = (323_usize, 326_usize);
+  let w = ema_ladder(alpha, n);
+  let mut components = vec![0.0_f64; n];
+  components[n - 1 - k1] = c_lo;
+  components[n - 2 - k1] = c_hi;
+  let refs: Vec<&[f64]> = components.iter().map(core::slice::from_ref).collect();
+  let coverages = vec![1.0; n];
+
+  let without = weighted_sum_renorm(&refs, &coverages, 1, |i, _| w[i], |_| 0.0);
+  assert!(
+    matches!(without.as_deref(), Ok([1.0])),
+    "with no slack the fold still fabricates, which is what #17 reported: \
+     {without:?}"
+  );
+
+  let with = weighted_sum_renorm(
+    &refs,
+    &coverages,
+    1,
+    |i, _| w[i],
+    |embs| ema_formation_slack(&w, embs, alpha, 1.0 - alpha),
+  );
+  assert!(
+    matches!(with, Err(WinditError::NonFinite)),
+    "and the policy's own term is the whole of the difference: {with:?}"
+  );
+
+  // The size of that term against the residue it has to cover, so the margin is
+  // on record rather than only the verdict.
+  let slack = ema_formation_slack(&w, &refs, alpha, 1.0 - alpha);
+  let residue = w[n - 1 - k1] * c_lo;
+  assert!(
+    (11.0..12.0).contains(&(slack / residue)),
+    "the slack covers the residue by {}x",
+    slack / residue
+  );
+}
+
+/// A residue that lands exactly on the threshold is refused, not answered.
+///
+/// MUTATION-LEDGER pin for the comparison itself. The gate is
+/// `l2_norm(&acc) <= tau`, and the crate promises that `<=` in two places: the
+/// module note and [`weighted_sum_renorm`]'s own comment both say a result *at or
+/// below* the fold's rounding floor is reported as [`WinditError::NonFinite`].
+/// Nothing here pinned the boundary — turning that `<=` into `<` passed every
+/// other test in this file, because every other input clears the threshold by
+/// orders or falls under it by orders. The contract is not an accident of which
+/// side a float landed on: a residue sitting exactly on its own rounding floor is
+/// indistinguishable from that floor, and has no direction either.
+///
+/// Landing on it *exactly* is what the slack closure buys. `tau` is
+/// `16 * EPSILON * ||M|| + MIN_GATE_THRESHOLD + S`, and `S` is the only term a
+/// caller chooses, so it is the only knob that can put `tau` on a representable
+/// `acc` from inside the input domain. One window, weight `1`, and the domain's
+/// own floor as the component:
+///
+/// ```text
+/// 16 * EPSILON * ||M||    2^-48 * 2^-400   ->  2^-448
+/// + MIN_GATE_THRESHOLD    2^-1000              absorbed, far under 2^-448's ulp
+/// + S                     2^-400 - 2^-448  ->  2^-400  exactly
+/// acc                                          2^-400
+/// ```
+///
+/// Both sides come out `26f0000000000000`.
+#[test]
+fn the_gate_refuses_a_residue_exactly_at_the_threshold() {
+  // The domain's own lower bound, so the input is in range by construction and
+  // the component is an exact power of two the arithmetic below can land on.
+  let component = f64::MIN_AGG_MAGNITUDE;
+  assert_eq!(
+    component,
+    libm::ldexp(1.0, -400),
+    "the domain floor is 2^-400"
+  );
+
+  // `2^-448` is sixteen ulps of `2^-400`, so the difference is representable and
+  // the slack is not itself a rounding the boundary could drift on.
+  let slack = component - libm::ldexp(1.0, -448);
+  assert_eq!(
+    slack + libm::ldexp(1.0, -448),
+    component,
+    "the slack is exact, so `tau` lands on `acc` rather than near it"
+  );
+
+  // Recomputed the way `weighted_sum_renorm` forms them, in its order: one window
+  // of weight `1` makes the accumulator and the magnitude sum the same vector.
+  let emb = [component];
+  let acc_norm = l2_norm(&emb);
+  let tau = 16.0 * f64::EPSILON * l2_norm(&emb) + f64::MIN_GATE_THRESHOLD + slack;
+  assert_eq!(
+    acc_norm.to_bits(),
+    tau.to_bits(),
+    "the residue must land on the threshold to the bit: {acc_norm:e} against \
+     {tau:e}"
+  );
+  assert_eq!(
+    acc_norm.to_bits(),
+    0x26f0_0000_0000_0000,
+    "and the boundary is the domain floor itself"
+  );
+
+  let refs: &[&[f64]] = &[&emb];
+  let got = weighted_sum_renorm(refs, &[1.0], 1, |_, _| 1.0, |_| slack);
+  assert!(
+    matches!(got, Err(WinditError::NonFinite)),
+    "a residue exactly at the threshold is *at or below* it, so it is refused; \
+     got {got:?}"
+  );
+}
+
+/// The two degenerate ladders owe the gate nothing; the one that never decays
+/// owes it the complement's whole rounding, and `powi` reaches the same zero.
+///
+/// FALSIFIER for the guards in [`ema_formation_slack`] and for #16's named cure,
+/// and a **correction**: the note this replaces called `b == 1` a third exact
+/// ladder, on the grounds that `p` stays exactly one and every weight is an
+/// unrounded `alpha`. Both halves of that are true about the *chain* and neither
+/// is true about the *ideal*. `b == 1` is reached by every `alpha <= 2^-54`, and
+/// there the ideal ladder still decays by about `alpha` a step while every
+/// materialized weight stays an identical `alpha` — the complement rounding at
+/// the largest it can be, charged `k` times over. A guard there was an
+/// exemption, not a certificate.
+///
+/// What does hold is the pair either end of the range. `alpha == 1` (so
+/// `b == 0`) leaves the newest window an exact `1` and every other weight an
+/// exact zero; `alpha == 0` leaves the *oldest* an exact `1` and does the same to
+/// the rest. Both are their own ideals at every index, so a slack charged there
+/// is pure over-rejection. Asserted on the helper rather than through a verdict,
+/// because neither can *show* the difference in a fold: the surviving weight is
+/// exactly `1`, so the fold's mass is a whole window's and outruns any term
+/// written in `2^-1074`.
+#[test]
+fn the_degenerate_ladders_owe_the_gate_nothing_and_the_flat_one_does_not() {
+  let big = libm::ldexp(1.0, 400);
+  let cols: Vec<[f64; 2]> = vec![[big, 0.0], [0.0, big], [1.0, 1.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0; 3];
+
+  for alpha in [1.0_f64, 0.0] {
+    let b = 1.0 - alpha;
+    let w = ema_ladder(alpha, 3);
+    assert_eq!(
+      ema_formation_slack(&w, &embeddings, alpha, b),
+      0.0,
+      "alpha {alpha} makes a ladder {w:?} that is its own ideal at every index"
+    );
+  }
+
+  // And the ladder that never decays, which is where the old guard was wrong.
+  // `1 - alpha` rounds to exactly one, so every materialized weight is the same
+  // `alpha` while the ideal `alpha * (1 - alpha)^k` is not — the relative part
+  // charges it, and the absolute part stays zero because nothing is ever formed
+  // in the subnormal range.
+  for alpha in [libm::ldexp(1.0, -60), libm::ldexp(1.0, -1074)] {
+    let b = 1.0 - alpha;
+    assert_eq!(
+      b, 1.0,
+      "alpha {alpha:e} leaves the complement at exactly one"
+    );
+    let w = ema_ladder(alpha, 3);
+    assert_eq!(
+      (w[1], w[2]),
+      (alpha, alpha),
+      "alpha {alpha:e}: every materialized weight is the same unrounded alpha"
+    );
+    let slack = ema_formation_slack(&w, &embeddings, alpha, b);
+    assert!(
+      slack > 0.0,
+      "alpha {alpha:e}: the ideal ladder decays and the materialized one does        not, so something is owed"
+    );
+    // It is the relative term and nothing else: the absolute unit is `2^-1074`
+    // times a mass under `2^401`, so a slack that carried it would be under
+    // `2^-673` and this one is fifteen orders above that.
+    assert!(
+      slack > libm::ldexp(1.0, -600),
+      "alpha {alpha:e}: and it is the relative term, not the absolute one:        {slack:e}"
+    );
+  }
+
+  // Every one of the four still answers, which is what a term charged here must
+  // not cost: the relative part is a few `EPSILON` of a fold whose mass is a
+  // whole window's.
+  for alpha in [1.0_f64, 0.0, libm::ldexp(1.0, -60), libm::ldexp(1.0, -1074)] {
+    let got = EmaRenormalized::new(alpha).aggregate_values(&embeddings, &coverages, 2);
+    assert!(got.is_ok(), "alpha {alpha:e}: {got:?}");
+  }
+
+  // #16's named cure, checked against #17 rather than repeated: evaluating each
+  // weight once reaches the same zero, because the value is not an `f64` however
+  // it is computed. `0.9^324` underflows whichever way it is raised.
+  let alpha = 0.9_f64;
+  let b = 1.0 - alpha;
+  assert_eq!(ema_ladder(alpha, 326)[1], 0.0, "the chain reaches zero");
+  assert_eq!(
+    alpha * b.powi(324),
+    0.0,
+    "and so does powi, which is why #16's cure does not touch this"
+  );
+}
+
+/// The three policies whose weights are rounded relatively hand the gate an exact
+/// `C::ZERO`, and would not have moved even if they had not.
+///
+/// Two separate claims, because only one of them is structural. The shipped code
+/// gives [`CoverageWeightedMean`], [`MeanRenormalized`] and [`SaliencyWeighted`]
+/// a literal `C::ZERO`, and `tau + 0.0` is `tau` to the bit, so their verdicts are
+/// unchanged by construction — that is the reason the term is passed beside the
+/// weight function instead of being added to the shared threshold.
+///
+/// The second claim is the measurement that decision did **not** rest on: forcing
+/// an EMA-sized slack into those three folds anyway, over the regimes where it
+/// could plausibly decide something (a coverage ratio past the normal boundary, a
+/// fold whose heaviest window is all zero, components at both ends of the input
+/// domain), changes no verdict either. Their weights are bounded below — the
+/// `2^-1022` [`normalizing_shift`] guarantees, the constant `1`, a norm the domain
+/// puts at `2^-400` — so the mass they accumulate always outruns a term written in
+/// `2^-1074`. Recorded because "narrowing avoids a regression" would have been the
+/// obvious reason to narrow, and it is not the true one.
+#[test]
+fn a_forced_slack_would_change_no_relative_weight_policy_verdict() {
+  /// One row: a name, its two-dimensional windows, and their coverages.
+  type Case = (&'static str, Vec<[f64; 2]>, Vec<f64>);
+
+  let big = libm::ldexp(1.0, 400);
+  let small = libm::ldexp(1.0, -400);
+  let cases: [Case; 5] = [
+    (
+      "the heaviest window is all zero",
+      vec![[0.0, 0.0], [big, 0.0], [0.0, big]],
+      vec![1.0, libm::ldexp(1.0, -1021), libm::ldexp(1.0, -1021)],
+    ),
+    (
+      "a coverage ratio past the normal boundary",
+      vec![[big, 0.0], [0.0, big]],
+      vec![1.0, libm::ldexp(1.0, -1074)],
+    ),
+    (
+      "components at the domain floor",
+      vec![[small, 0.0], [0.0, small]],
+      vec![1.0, 1.0],
+    ),
+    (
+      "exact cancellation, which must stay refused",
+      vec![[big, small], [-big, small]],
+      vec![1.0, 1.0],
+    ),
+    (
+      "one heavy window against a far lighter one",
+      vec![[big, big], [small, -small]],
+      vec![1.0, libm::ldexp(1.0, -1000)],
+    ),
+  ];
+
+  for (name, cols, coverages) in cases {
+    let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+    // The largest slack any EMA ladder could hand this slice: every window
+    // charged, at the loosest damping the bound admits.
+    let mass = embeddings
+      .iter()
+      .map(|e| l2_norm(e))
+      .fold(0.0_f64, |a, x| a + x);
+    let forced: f64 = mass * (1.0 + coverages.len() as f64) * (f64::MIN_NORMAL * f64::EPSILON);
+    assert!(
+      forced > 0.0 || mass < 1.0,
+      "{name}: a slack that underflows to zero must be one that could not have \
+       mattered — mass {mass:e}, so the term is under 2^-1074 and the \
+       MIN_GATE_THRESHOLD floor carries it"
+    );
+
+    // Each policy's weight function verbatim, driven through the shared fold
+    // twice: once with the zero it is given and once with the forced slack.
+    let largest = max_magnitude(&coverages);
+    let shift = normalizing_shift(&coverages, largest);
+    let coverage_weight = |i: usize, _: &[f64]| {
+      if largest > 0.0 {
+        coverages[i].ldexp(shift) / largest
+      } else {
+        0.0
+      }
+    };
+    let mut norms = Vec::new();
+    for e in &embeddings {
+      norms.push(l2_norm(e));
+    }
+    let saliency_weight = |i: usize, _: &[f64]| norms[i];
+
+    let mut compared = 0;
+    macro_rules! both {
+      ($policy:literal, $w:expr) => {{
+        let shipped = weighted_sum_renorm(&embeddings, &coverages, 2, $w, |_| 0.0);
+        let taxed = weighted_sum_renorm(&embeddings, &coverages, 2, $w, |_| forced);
+        assert_eq!(
+          shipped, taxed,
+          "{name} / {}: a forced slack must decide nothing",
+          $policy
+        );
+        compared += 1;
+      }};
+    }
+    both!("CoverageWeightedMean", &coverage_weight);
+    both!("MeanRenormalized", |_: usize, _: &[f64]| 1.0);
+    both!("SaliencyWeighted", &saliency_weight);
+    assert_eq!(compared, 3, "{name}: all three policies must be driven");
+  }
 }
 
 #[test]
@@ -1567,6 +2973,136 @@ fn permutations(n: usize) -> Vec<Vec<usize>> {
   let mut out = Vec::new();
   recur(&mut a, n, &mut out);
   out
+}
+
+/// [`l2_renorm`](super::l2_renorm) divides by the scale and by the unit
+/// separately, and never forms the norm.
+///
+/// FALSIFIER for the other pair the ledger left standing. Both properties are
+/// claimed in the module note and neither was pinned: folding the two divisions
+/// into `x / (scale * unit)`, and deleting the `unit.is_finite()` guard, each
+/// passed the whole suite while moving nothing on a `1876`-row sweep — because
+/// [`check_inputs`](super::check_inputs)' `2^400` ceiling puts both regimes out
+/// of an aggregation's reach. `l2_renorm` is `pub(crate)` and
+/// [`VectorEma`](crate::smooth::VectorEma) renormalizes through it without that
+/// ceiling, so the properties are real; they are pinned here, at the routine,
+/// rather than left to a caller that cannot exercise them.
+#[test]
+fn the_renormalization_survives_a_norm_it_cannot_represent() {
+  // `sqrt(2) * f64::MAX` overflows, so `scale * unit` does too and a single
+  // combined division returns the zero vector. Two divisions by exact
+  // power-of-two relatives return the direction.
+  let mut diagonal = [f64::MAX, f64::MAX];
+  l2_renorm(&mut diagonal).expect("an ordinary diagonal has a direction");
+  let want = 1.0 / libm::sqrt(2.0);
+  assert_eq!(
+    diagonal,
+    [want, want],
+    "the diagonal's direction must survive a norm that does not"
+  );
+
+  // And the sum of squares leaving the range in the other direction.
+  let mut tiny = [f64::MIN_POSITIVE, f64::MIN_POSITIVE];
+  l2_renorm(&mut tiny).expect("a subnormal-square diagonal has a direction");
+  assert_eq!(tiny, [want, want], "and so must its mirror image");
+
+  // A NaN never becomes the maximum, so it passes the scale check and surfaces
+  // in the sum of squares instead: the `unit.is_finite()` guard is the only
+  // thing between it and a vector of NaNs reported as `Ok`.
+  let mut poisoned = [1.0, f64::NAN];
+  assert!(
+    matches!(l2_renorm(&mut poisoned), Err(WinditError::NonFinite)),
+    "a NaN component must be refused, not divided by"
+  );
+  assert_eq!(
+    poisoned[0], 1.0,
+    "and a refused vector is left exactly as it was"
+  );
+}
+
+/// The fold is compensated, and the compensation is what the answer is made of.
+///
+/// FALSIFIER for [`neumaier_add`](super::neumaier_add), and a mutant the ledger
+/// had left standing: deleting the compensation, or its fold-back, or the
+/// magnitude branch inside it, **passed the whole suite** while moving `830` of
+/// `1876` swept aggregations by up to `2.1e-15`. Every existing row that could
+/// have seen it compares with a tolerance, and `2e-15` is inside all of them.
+/// This one compares bits.
+///
+/// Three windows at `alpha`-free uniform weight: `[1, 0]`, `[2^-60, 1]`,
+/// `[-1, 0]`. A naive left fold absorbs the `2^-60` into the partial sum `1` —
+/// `fl(1 + 2^-60) = 1` — and the later `-1` then cancels it away entirely, so
+/// dimension 0 comes back exactly zero and the answer is `[0, 1]`. The
+/// compensation is carrying that `2^-60` in `comp`, and folding it back is what
+/// puts it in the result. The gate sees the same `||M||` either way, so nothing
+/// but the compensation decides this.
+#[test]
+fn the_compensated_fold_keeps_a_term_a_naive_one_loses() {
+  let tiny = libm::ldexp(1.0, -60);
+  let cols: [[f64; 2]; 3] = [[1.0, 0.0], [tiny, 1.0], [-1.0, 0.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let coverages = vec![1.0; 3];
+
+  // The naive left fold, spelled out, so "what a naive one loses" is measured
+  // rather than asserted.
+  let mut naive = [0.0_f64; 2];
+  for e in &embeddings {
+    for (a, x) in naive.iter_mut().zip(*e) {
+      *a += *x;
+    }
+  }
+  assert_eq!(
+    naive,
+    [0.0, 1.0],
+    "a naive fold loses the term entirely, which is the point"
+  );
+
+  for (name, got) in [
+    (
+      "MeanRenormalized",
+      MeanRenormalized
+        .aggregate_values(&embeddings, &coverages, 2)
+        .expect("in-domain fold"),
+    ),
+    (
+      "CoverageWeightedMean",
+      CoverageWeightedMean
+        .aggregate_values(&embeddings, &coverages, 2)
+        .expect("in-domain fold"),
+    ),
+  ] {
+    // Bit-for-bit: the surviving term is exactly `2^-60`, and the norm it is
+    // divided by is exactly one, so both components are exact.
+    assert_eq!(
+      (got[0].to_bits(), got[1].to_bits()),
+      (tiny.to_bits(), 1.0_f64.to_bits()),
+      "{name} must keep the compensated term: {got:?}"
+    );
+  }
+}
+
+/// The compensation's magnitude branch is load-bearing too.
+///
+/// The companion falsifier, for the half of [`neumaier_add`](super::neumaier_add)
+/// that chooses which operand to subtract from the new sum. `(acc - sum) + term`
+/// is the exact correction only while `|acc| >= |term|`; with the inequality the
+/// other way it is `(term - sum) + acc`, and a branchless fold that always takes
+/// the first form is wrong precisely when a large term lands on a small
+/// accumulator. Ordering the same three windows so the tiny one arrives *first*
+/// puts every subsequent add in that case.
+#[test]
+fn the_compensations_magnitude_branch_decides_the_answer() {
+  let tiny = libm::ldexp(1.0, -60);
+  let cols: [[f64; 2]; 4] = [[tiny, 0.0], [1.0, 1.0], [tiny, 0.0], [-1.0, 0.0]];
+  let embeddings: Vec<&[f64]> = cols.iter().map(|c| c.as_slice()).collect();
+  let got = MeanRenormalized
+    .aggregate_values(&embeddings, &[1.0; 4], 2)
+    .expect("in-domain fold");
+  assert_eq!(
+    (got[0].to_bits(), got[1].to_bits()),
+    ((2.0 * tiny).to_bits(), 1.0_f64.to_bits()),
+    "both tiny terms must survive a fold that starts under them: {got:?}"
+  );
 }
 
 #[test]

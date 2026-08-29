@@ -41,11 +41,13 @@
   not(any(feature = "std", feature = "alloc")),
   doc = "`runs`, `longest_run`, and `runs_sorted` are the predicate-driven counterparts. Every batch driver"
 )]
-//! *drives* a fresh `Segmenter` over a slice and collects what it emits, so batch
-//! output equals the streaming core plus [`finish`](Segmenter::finish) by
-//! construction rather than by two implementations kept in sync. Each restarts
-//! from fresh state on every call — a batch convenience, not an incremental
-//! decoder. For streaming, drive a [`Gate`] into a `Segmenter` directly.
+//! *drives* a fresh `Segmenter` over a slice and consumes what it emits — the
+//! `Vec`-returning ones collect it, `longest_run` folds it into a single
+//! incumbent range — so batch output equals the streaming core plus
+//! [`finish`](Segmenter::finish) by construction rather than by two
+//! implementations kept in sync. Each restarts from fresh state on every call —
+//! a batch convenience, not an incremental decoder. For streaming, drive a
+//! [`Gate`] into a `Segmenter` directly.
 //!
 //! The [`Gate`]/[`GatePolicy`] traits, the gate configs, the `Segmenter`,
 //! `SegmentTail`, `Range`, and `SegmentOptions` all live in the featureless core
@@ -214,13 +216,19 @@ impl Default for SegmentOptions {
 ///
 /// # State and bound
 ///
-/// The state is four fields (a fixed 80 bytes) — `opts`, the currently-extending
-/// run (`open`), the closed-and-merged candidate awaiting its gap verdict
-/// (`pending`), and the last start seen (`last_start`) — and is **O(1) for
-/// every configuration**, including an unbounded `merge_gap`. A large
-/// `merge_gap` never grows the state: `pending` only ever widens, and its
-/// emission simply defers to [`finish`](Segmenter::finish). Every
-/// [`push`](Segmenter::push) allocates nothing.
+/// The state is four fields — `opts`, the currently-extending run (`open`), the
+/// closed-and-merged candidate awaiting its gap verdict (`pending`), and the
+/// last start seen (`last_start`) — and is **O(1) for every configuration**,
+/// including an unbounded `merge_gap`. A large `merge_gap` never grows the
+/// state: `pending` only ever widens, and its emission simply defers to
+/// [`finish`](Segmenter::finish). Every [`push`](Segmenter::push) allocates
+/// nothing.
+///
+/// The field count and the O(1) bound hold on every target. The *byte* figure
+/// does not, because every field is `usize`-shaped: **80 bytes on a 64-bit
+/// target, 40 on a 32-bit one** (`wasm32`, `i686`, `thumbv7em`, all of which CI
+/// builds). Both numbers are pinned by the `const` assertions below, so a
+/// layout change fails the build on whichever width it occurs.
 ///
 /// # Emission and commit latency
 ///
@@ -249,6 +257,25 @@ pub struct Segmenter {
   /// The `start` of the most recent pushed span, for the monotonicity check.
   last_start: Option<usize>,
 }
+
+/// The `Segmenter` state-size claim on its documentation, made executable on both
+/// pointer widths.
+///
+/// A `const` assertion rather than a test, because the 32-bit figure has to be
+/// checked on targets the test harness never runs on: CI's `cross` job builds
+/// `wasm32-*` and `i686-*`, and its `no-std` job builds `thumbv7em-none-eabihf`,
+/// but neither executes tests there. Compiling the crate for any of them
+/// evaluates this.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+  core::mem::size_of::<Segmenter>() == 80,
+  "Segmenter is documented as 80 bytes on a 64-bit target"
+);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(
+  core::mem::size_of::<Segmenter>() == 40,
+  "Segmenter is documented as 40 bytes on a 32-bit target"
+);
 
 impl Segmenter {
   /// A fresh segmenter that shapes its runs with `opts`.
@@ -565,14 +592,24 @@ where
   Ok(out)
 }
 
-/// The longest range from [`runs`], breaking ties toward the earliest.
+/// The longest range [`runs`] would return, breaking ties toward the earliest.
 ///
-/// Returns `Ok(None)` when [`runs`] is empty.
+/// Returns `Ok(None)` when [`runs`] would be empty.
+///
+/// Defined by the same [`Segmenter`] drive as [`runs`], but *folded* rather than
+/// collected: the answer is one incumbent [`Range`], so this keeps one instead
+/// of every finalized range, and its additional space is **O(1) in the number of
+/// output runs**. It allocates nothing at all — a sequence with half a million
+/// runs costs the same as one with none. That is the only difference from
+/// collecting [`runs`] and scanning it; the ranges, the earliest-on-tie rule,
+/// the [`SegmentOptions`] morphology, and the span contract are identical, and a
+/// differential test pins the two definitions together.
 ///
 /// # Errors
 ///
-/// Propagates [`runs`]: [`WinditError::NonMonotonicSpan`] or
-/// [`WinditError::AllocFailed`].
+/// [`WinditError::NonMonotonicSpan`] if a span's `start` is strictly before its
+/// predecessor's, exactly as [`runs`] reports it. Unlike [`runs`], this never
+/// returns [`WinditError::AllocFailed`]: it asks for no memory to fail.
 #[cfg(any(feature = "std", feature = "alloc"))]
 #[cfg_attr(docsrs, doc(cfg(any(feature = "std", feature = "alloc"))))]
 pub fn longest_run<V, F>(
@@ -583,13 +620,28 @@ pub fn longest_run<V, F>(
 where
   F: Fn(&V) -> bool,
 {
-  let mut best: Option<Range> = None;
-  for r in runs(seq, predicate, opts)? {
+  /// Keep the incumbent on a tie, so the earliest of equal-length runs wins —
+  /// the rule the collected form applied by scanning in output order, which the
+  /// fold reproduces because the `Segmenter` emits in that same order.
+  fn fold(best: &mut Option<Range>, r: Range) {
     match best {
-      // Keep the incumbent on a tie, so the earliest of equal-length runs wins.
       Some(b) if b.len() >= r.len() => {}
-      _ => best = Some(r),
+      _ => *best = Some(r),
     }
+  }
+
+  let mut seg = Segmenter::new(*opts);
+  let mut best: Option<Range> = None;
+  for w in seq {
+    if let Some(r) = seg.push(predicate(w.value()), w.span())? {
+      fold(&mut best, r);
+    }
+  }
+  // The `finish` tail is part of the output, not an epilogue to it: the last run
+  // and the pending accumulator are emitted only here, and either can be the
+  // longest.
+  for r in seg.finish() {
+    fold(&mut best, r);
   }
   Ok(best)
 }
