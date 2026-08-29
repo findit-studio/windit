@@ -945,6 +945,7 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
   let w = ema_ladder(alpha, n);
   let mut worst = 0.0_f64;
   let mut worst_powi = 0.0_f64;
+  let mut worst_complement = 0.0_f64;
   for k in 0..n - 1 {
     let (hi, lo) = dd_power(bhi, blo, k);
     // `alpha * hi` and `alpha * lo` scale the pair; the relative error of the
@@ -953,6 +954,12 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
     worst = worst.max((((w[n - 1 - k] - rhi) - rlo) / rhi).abs());
     let by_powi = alpha * (1.0 - alpha).powi(k as i32);
     worst_powi = worst_powi.max((((by_powi - rhi) - rlo) / rhi).abs());
+    // The complement's rounding on its own: the same `fl(1 - alpha)` that `powi`
+    // is handed, raised *exactly* — `dd_power` carries the power to about 106
+    // bits — against the same ideal. This is the part of the error that belongs
+    // to the argument rather than to any powering algorithm.
+    let (chi, clo) = dd_power(bhi, 0.0, k);
+    worst_complement = worst_complement.max(((((chi - hi) + clo) - lo) / hi).abs());
   }
   let u = f64::EPSILON / 2.0;
   assert!(
@@ -962,24 +969,61 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
   );
 
   // And the cure the issue named, measured rather than repeated.
-  // `alpha * (1 - alpha).powi(k)` is *not* "one rounding instead of k". `powi`
-  // is exponentiation by squaring, so it is `O(log k)` roundings and not
-  // correctly rounded; and, decisively, it raises the same `fl(1 - alpha)` the
-  // chain does. That single complement rounding, multiplied by `k`, is the
-  // larger part of the error, and `powi` does not touch it. It buys 18% here,
-  // not `k -> 1`. At a dyadic alpha, where the complement is exact, both are
-  // exact and there is nothing to buy — and switching to it would not have
-  // touched the witness below either, whose complement is exact to begin with.
+  // `alpha * (1 - alpha).powi(k)` is *not* "one rounding instead of k", and the
+  // reason has nothing to do with how `powi` is implemented: it raises the same
+  // `fl(1 - alpha)` the chain does. `fl(1 - 0.46)` sits about `0.926 u` above
+  // the real complement, raising it to the `k` compounds that one rounding `k`
+  // times, and by `k = 62` the exact power of the rounded complement is already
+  // tens of `u` from `alpha * (1 - alpha)^k` — before a single rounding of the
+  // powering itself. Every operation in this measurement is `+ - *`, so it is
+  // IEEE-determined and identical on every target: it is the portable statement
+  // that the two host-dependent measurements after it are measurements *of*.
   assert!(
-    (47.0..50.0).contains(&(worst_powi / u)),
-    "powi is O(log k) roundings on top of the complement's, not one: {} u",
+    (57.0..58.0).contains(&(worst_complement / u)),
+    "raising the rounded complement multiplies its one rounding by k: {} u",
+    worst_complement / u
+  );
+
+  // The cure as actually spelled, banded rather than pinned. **`f64::powi` is
+  // not correctly rounded and is not the same code on every target**: this
+  // figure was `48.7 u` on `aarch64-apple-darwin` and `58.1 u` on
+  // `x86_64-pc-windows-msvc` — the same IEEE-fixed `57.4 u` above, with `powi`'s
+  // own error contributing `-8.7 u` on the one host and `+0.7 u` on the other.
+  // Do not re-tighten this window onto whichever number the host in front of you
+  // prints. A two-unit window around one host's measurement is exactly what made
+  // this test fail CI on Windows.
+  //
+  // The bounds are derived rather than observed. The ceiling holds for any
+  // multiplication-based `powi`: exponentiation by squaring reaches `b^k` with
+  // at most `k - 1` weighted roundings, so its own relative error stays under
+  // `(1 + u)^61 - 1 < 62 u` for `k <= 62`, and the total cannot pass
+  // `57.5 + 62 + 2 < 130 u`. The floor is a margin and not a theorem: to reach
+  // it `powi` would have to err by about `-37 u`, systematically against the
+  // complement's drift and over four times the largest deviation either host
+  // showed. What both bounds keep is the claim the assertion exists for — at
+  // tens of `u` this is not the order-1 error "one rounding instead of k" buys.
+  assert!(
+    (20.0..130.0).contains(&(worst_powi / u)),
+    "powi raises the same rounded complement, so it is tens of u however many \
+     roundings it costs, not one: {} u",
     worst_powi / u
   );
+  // The same statement in the units #16 argued in, and one-sided for the same
+  // reason the band above is wide. `worst` is `+ - *`, so it is the same
+  // `59.28 u` on every target and the ratio moves with `powi` alone: `1.22x` on
+  // macOS against `1.02x` on Windows — a fifth on the one host, two per cent on
+  // the other. No improvement at all is a legitimate outcome for a third host; a
+  // factor of `k` is not.
   assert!(
-    worst / worst_powi > 1.20 && worst / worst_powi < 1.25,
-    "so it improves the weights by about a fifth, not by a factor of k: {}x",
+    worst / worst_powi < 3.0,
+    "so powi does not divide the weight error by k = {}: {}x",
+    n - 1,
     worst / worst_powi
   );
+  // And where the complement *is* exact there was never anything for the cure to
+  // buy: the chain is exact too, at every representable index. Switching to
+  // `powi` would not have moved the witness below either, whose complement is
+  // exact to begin with.
   for k in [4_usize, 64, 199] {
     let (hi, lo) = dd_power(0.5, 0.0, k);
     assert_eq!(
@@ -1003,13 +1047,20 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
   );
   let (k1, d) = (651_usize, 33_usize);
   let n = k1 + d + 2;
-  let c_lo = libm::ldexp(3.0_f64.powi(33), 300);
+  // Both powers by repeated multiplication rather than by `powi`. The lever is
+  // only a lever while `3^d` and `b^d` are reached *exactly*, and `f64::powi` is
+  // not correctly rounded and is a different implementation on every target, so
+  // what it returns is not something an exactness argument may rest on. The
+  // chains are: every partial product `3^j` for `j <= 33` is an integer under
+  // `2^53`, and `b^j = 3^j * 2^-3j` is that integer scaled by a power of two, so
+  // each step of either fold is exact by IEEE-754 alone.
+  let three_pow_d = (0..d).fold(1.0_f64, |acc, _| acc * 3.0);
   assert_eq!(
-    3.0_f64.powi(33),
-    5_559_060_566_555_523.0,
+    three_pow_d, 5_559_060_566_555_523.0,
     "3^33 must be an exact f64, or the lever is not exact"
   );
-  let ratio = b.powi(d as i32);
+  let c_lo = libm::ldexp(three_pow_d, 300);
+  let ratio = (0..d).fold(1.0_f64, |acc, _| acc * b);
   let c_hi = -c_lo / ratio;
   assert_eq!(
     c_lo + c_hi * ratio,
