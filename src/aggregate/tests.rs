@@ -975,9 +975,10 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
   // the real complement, raising it to the `k` compounds that one rounding `k`
   // times, and by `k = 62` the exact power of the rounded complement is already
   // tens of `u` from `alpha * (1 - alpha)^k` — before a single rounding of the
-  // powering itself. Every operation in this measurement is `+ - *`, so it is
-  // IEEE-determined and identical on every target: it is the portable statement
-  // that the two host-dependent measurements after it are measurements *of*.
+  // powering itself. Every operation in this measurement is one of IEEE-754's
+  // correctly-rounded basics — `+ - * /` — so its value is fixed by the standard
+  // and identical on every target: it is the portable statement that the two
+  // host-dependent measurements after it are measurements *of*.
   assert!(
     (57.0..58.0).contains(&(worst_complement / u)),
     "raising the rounded complement multiplies its one rounding by k: {} u",
@@ -1009,11 +1010,11 @@ fn a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound() {
     worst_powi / u
   );
   // The same statement in the units #16 argued in, and one-sided for the same
-  // reason the band above is wide. `worst` is `+ - *`, so it is the same
-  // `59.28 u` on every target and the ratio moves with `powi` alone: `1.22x` on
-  // macOS against `1.02x` on Windows — a fifth on the one host, two per cent on
-  // the other. No improvement at all is a legitimate outcome for a third host; a
-  // factor of `k` is not.
+  // reason the band above is wide. `worst` is correctly-rounded basics too, so
+  // it is the same `59.28 u` everywhere and the ratio moves with `powi` alone:
+  // `1.22x` on macOS against `1.02x` on Windows — a fifth on the one host, two
+  // per cent on the other. No improvement at all is a legitimate outcome for a
+  // third host; a factor of `k` is not.
   assert!(
     worst / worst_powi < 3.0,
     "so powi does not divide the weight error by k = {}: {}x",
