@@ -235,6 +235,15 @@ fn dyn_policy_is_object_safe_at_both_scalars() {
     assert_unit_norm(&aggregate(policy, &windows).expect("aggregate"));
   }
 
+  // "Defaults to `f64`" is a claim about type *identity*, so it is pinned by an
+  // assignment rather than by an assertion: the elided spelling and the named
+  // one are the same object type, and moving one into the other only compiles
+  // while that holds. Change the default to `f32` and this line stops
+  // compiling — which is the point, since the module documentation used to name
+  // the wrong scalar here.
+  let elided: Box<dyn AggregatePolicy> = Box::new(MeanRenormalized);
+  let _named_default: Box<dyn AggregatePolicy<f64>> = elided;
+
   // Naming the scalar explicitly (here `f64`, the default) compiles to the same
   // object and drives an f64-stored embedding, so the trait stays object-safe
   // whether the parameter is spelled or left off.

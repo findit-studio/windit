@@ -1131,7 +1131,76 @@ fn segmenter_matches_oracle_on_randomized_finite_and_non_finite_inputs() {
       ref_hy,
       "Hysteresis::segment: n={n} on={on} off={off} opts={opts:?}"
     );
+
+    // `longest_run` folds the `Segmenter` emissions instead of collecting them,
+    // so its agreement with the collected definition is a differential property
+    // rather than a shared code path — and it inherits this loop's whole grid:
+    // every geometry, both `merge_gap` extremes, every `min_len`, ties included.
+    assert_eq!(
+      longest_run(&s, |&v| v >= thr, &opts).unwrap(),
+      longest_of(&ref_thr),
+      "longest_run: n={n} window={window} hop={hop} thr={thr} opts={opts:?}"
+    );
   }
+}
+
+/// The longest range of `ranges`, ties to the earliest — the materializing
+/// definition `longest_run` replaced, kept as its differential oracle.
+fn longest_of(ranges: &[Range]) -> Option<Range> {
+  let mut best: Option<Range> = None;
+  for &r in ranges {
+    match best {
+      Some(b) if b.len() >= r.len() => {}
+      _ => best = Some(r),
+    }
+  }
+  best
+}
+
+#[test]
+fn longest_run_folds_without_collecting_and_keeps_every_contract() {
+  // Four cases the fold could get wrong that a collected scan could not, each
+  // separating the two definitions rather than merely agreeing with them.
+
+  // 1. The winner is emitted by `finish`, not by a `push`: the only — and
+  //    therefore longest — run is still open at end of stream. A fold that
+  //    skipped the tail would answer `None`.
+  let trailing = seq(&[0.1, 0.1, 0.9, 0.9, 0.9]);
+  assert_eq!(
+    longest_run(&trailing, |&v| v > 0.5, &plain()).unwrap(),
+    Some(Range::new(2, 5))
+  );
+
+  // 2. The winner rides in the *second* tail slot: with an unbounded merge_gap
+  //    every run folds into one pending accumulator that only `finish` emits,
+  //    and `finish` emits at most two ranges.
+  let merged = seq(&[0.9, 0.1, 0.1, 0.1, 0.9]);
+  let unbounded = SegmentOptions::new().with_merge_gap(usize::MAX);
+  assert_eq!(
+    longest_run(&merged, |&v| v > 0.5, &unbounded).unwrap(),
+    Some(Range::new(0, 5))
+  );
+  assert_eq!(
+    longest_of(&runs(&merged, |&v| v > 0.5, &unbounded).unwrap()),
+    Some(Range::new(0, 5))
+  );
+
+  // 3. `min_len` is applied at finalization, so a dropped run must not win: the
+  //    length-3 run survives and the length-1 runs never become output at all.
+  let short_and_long = seq(&[0.9, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9]);
+  let filtered = SegmentOptions::new().with_min_len(2);
+  assert_eq!(
+    longest_run(&short_and_long, |&v| v > 0.5, &filtered).unwrap(),
+    Some(Range::new(2, 5))
+  );
+
+  // 4. Ties still go to the earliest: the incumbent is displaced only by a
+  //    strictly longer run, which is what makes the fold order-dependent.
+  let tie = seq(&[0.9, 0.9, 0.1, 0.9, 0.9, 0.1, 0.9, 0.9]);
+  assert_eq!(
+    longest_run(&tie, |&v| v > 0.5, &plain()).unwrap(),
+    Some(Range::new(0, 2))
+  );
 }
 
 // ── chunk-partition invariance ───────────────────────────────────────────────
