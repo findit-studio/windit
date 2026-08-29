@@ -211,7 +211,10 @@ pub trait Real:
   /// recency factors decaying without limit, a coverage far below
   /// the fullest window's — that drives a product toward a subnormal. The
   /// determinacy gate's [`MIN_GATE_THRESHOLD`](Real::MIN_GATE_THRESHOLD) floor
-  /// keeps that regime sound (see the `aggregate` module's Input domain note). A
+  /// keeps that regime sound (see the `aggregate` module's Input domain note).
+  /// EMA reaches one regime further, its *weights* leaving the exponent range
+  /// rather than only its products, and there the floor is not enough; see the
+  /// `aggregate` module's *A weight below the exponent range*. A
   /// nonzero component below this bound is rejected before any arithmetic. Every
   /// magnitude an `f32`-storage embedding can produce sits far above it.
   const MIN_AGG_MAGNITUDE: Self;
@@ -234,10 +237,15 @@ pub trait Real:
   /// part underflows to zero once an unbounded weight *ratio* drives the fold's
   /// products into the subnormal range, where per-term rounding is absolute (at
   /// most `2^-1075`) rather than relative. This floor dominates the largest
-  /// residue such an exactly-cancelling fold can leave
+  /// residue *the products* of such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
-  /// residue slips past. It sits far below `16 * EPSILON * ||M||` for any mass a
+  /// residue slips past. It does **not** cover a *weight* rounded absolutely,
+  /// which contributes `2^-1075 * sum_i |e_ij|` — the unweighted embedding mass,
+  /// reaching `n * 2^-675` under the input domain's own ceiling. Only
+  /// `EmaRenormalized` forms such a weight, and the `aggregate` module's
+  /// *A weight below the exponent range* records the gap that leaves. It sits
+  /// far below `16 * EPSILON * ||M||` for any mass a
   /// fold whose heaviest window carries its own accumulates, so those verdicts
   /// are bit-for-bit unchanged. It engages whenever the accumulated mass falls below about
   /// `2^-948`, including folds whose products are still normal — where it
