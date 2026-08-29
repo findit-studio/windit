@@ -1158,9 +1158,15 @@ public names:
   is exponentiation by squaring, so `O(log k)` roundings and not correctly
   rounded, and — decisively — it raises the same `fl(1 - alpha)` the chain does.
   That single complement rounding, multiplied by `k`, is the larger part of the
-  error, and `powi` does not touch it. At `alpha = 0.46, n = 64`: `58.75u` for
-  the chain against `48.15u` for `powi`, a fifth, not a factor of `k`. At a
-  dyadic `alpha`, where the complement is exact, both are exact and there is
+  error, and `powi` does not touch it. Measured at `alpha = 0.46, n = 64`:
+  `59.28u` for the chain, the same on every target since it is IEEE-754's
+  correctly-rounded basics throughout. `powi` is tens of `u` too, floored at
+  `57.4u` by a theorem rather than a measurement — the floor is that same
+  complement rounding, raised. Its actual improvement is target-dependent and
+  nothing like a factor of `k`: `1.22x` on `aarch64-apple-darwin`, `1.02x` on
+  `x86_64-pc-windows-msvc` (see
+  `a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound`).
+  At a dyadic `alpha`, where the complement is exact, both are exact and there is
   nothing to buy — so the documented bit-exactness at `alpha = 0.5` was never in
   question either way.
 
