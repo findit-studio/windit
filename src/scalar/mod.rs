@@ -202,17 +202,18 @@ pub trait Real:
   /// [`EPSILON`](Real::EPSILON)` / 2`; below it the grid is absolute and evenly
   /// spaced, so a value there is rounded by at most half that spacing —
   /// `MIN_NORMAL * EPSILON / 2`, which is `2^-1075` for `f64` and is itself not
-  /// representable. `MIN_NORMAL * EPSILON` (`2^-1074`, the spacing) is, and is
-  /// the unit the `aggregate` module's weight-underflow slack is written in.
+  /// representable. `MIN_NORMAL * EPSILON` (`2^-1074`, the spacing) is, and is the
+  /// unit the absolute half of the `aggregate` module's weight-formation slack is
+  /// written in.
   ///
   /// Aggregation needs this for exactly one question, asked of a *weight* rather
-  /// than of an embedding value: whether the weight a policy materialized was
-  /// rounded relatively (in which case the determinacy gate's
-  /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M||` term already covers it) or
-  /// absolutely (in which case it does not, and the policy owes the gate a term
-  /// of its own). `EmaRenormalized` is the only built-in policy that can answer
-  /// "absolutely"; see the `aggregate` module's
-  /// *A weight below the exponent range*.
+  /// than of an embedding value: whether the weight a policy materialized carries
+  /// an *absolute* error on top of its relative one. Only `EmaRenormalized` can
+  /// answer yes, and that policy owes the gate a term for both halves — the
+  /// relative one because its ladder is a chain of multiplications rather than a
+  /// single rounding, which no constant multiple of
+  /// [`EPSILON`](Real::EPSILON) bounds. See the `aggregate` module's
+  /// *A weight the fold did not form*.
   ///
   /// Named for the property rather than after `f64::MIN_POSITIVE`, which is that
   /// property under a misleading name: the smallest positive `f64` is
@@ -238,8 +239,9 @@ pub trait Real:
   /// keeps that regime sound (see the `aggregate` module's Input domain note).
   /// EMA reaches one regime further, its *weights* leaving the exponent range
   /// rather than only its products, and there the floor is not the right shape of
-  /// quantity at all; the term that covers it is the policy's own, and the
-  /// `aggregate` module's *A weight below the exponent range* says why. A
+  /// quantity at all; the term that covers it — and the growing relative error its
+  /// chain carries whether or not anything underflows — is the policy's own, and
+  /// the `aggregate` module's *A weight the fold did not form* says why. A
   /// nonzero component below this bound is rejected before any arithmetic. Every
   /// magnitude an `f32`-storage embedding can produce sits far above it.
   const MIN_AGG_MAGNITUDE: Self;
@@ -257,22 +259,26 @@ pub trait Real:
   /// `f64`).
   ///
   /// The determinacy gate rejects a folded result whose norm is at or below
-  /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD`, where `M`
-  /// is the accumulated term-magnitude vector. The relative `16 * EPSILON * ||M||`
+  /// `16 * `[`EPSILON`](Real::EPSILON)` * ||M|| + MIN_GATE_THRESHOLD + S`, where
+  /// `M` is the accumulated term-magnitude vector and `S` is the term the policy
+  /// supplies for its own weights. The relative `16 * EPSILON * ||M||`
   /// part underflows to zero once an unbounded weight *ratio* drives the fold's
   /// products into the subnormal range, where per-term rounding is absolute (at
   /// most `2^-1075`) rather than relative. This floor dominates the largest
   /// residue *the products* of such an exactly-cancelling fold can leave
   /// (`sqrt(dim) * n * 2^-1075 <= 2^-1018` for any `n <= 2^40`, `dim <= 2^32`), so
   /// the gate cannot degenerate into an exact-zero check that a nonzero subnormal
-  /// residue slips past. It does **not** cover a *weight* rounded absolutely,
-  /// which contributes `sum_i |w_i - W_i| * ||e_i||` — the unweighted window
-  /// norms, reaching `n * 2^-675` under the input domain's own ceiling. No floor
-  /// can: this constant is a fixed absolute quantity, and that term scales with
-  /// the input's own mass. Only `EmaRenormalized` forms such a weight, and it supplies
-  /// the covering term itself, beside its weight function rather than here: see
-  /// the `aggregate` module's *A weight below the exponent range* for why a
-  /// weight-formation error belongs to the policy that formed it. This floor sits
+  /// residue slips past. It does **not** cover a *weight* that is not the ideal one
+  /// to within `EPSILON / 2`, which contributes `sum_i |w_i - W_i| * ||e_i||` — the
+  /// unweighted window norms, reaching `n * 2^-675` under the input domain's own
+  /// ceiling for a weight rounded onto the subnormal grid, and a growing multiple
+  /// of the fold's own mass for one built by a chain of multiplications. No floor
+  /// can cover either: this constant is a fixed absolute quantity, and both terms
+  /// scale with the input's own mass. Only `EmaRenormalized` forms such a weight,
+  /// and it supplies the covering term itself, beside its weight function rather
+  /// than here: see the `aggregate` module's *A weight the fold did not form* for
+  /// why a weight-formation error belongs to the policy that formed it. This floor
+  /// sits
   /// far below `16 * EPSILON * ||M||` for any mass a
   /// fold whose heaviest window carries its own accumulates, so those verdicts
   /// are bit-for-bit unchanged. It engages whenever the accumulated mass falls below about

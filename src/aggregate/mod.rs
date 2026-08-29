@@ -127,7 +127,7 @@
 //!   exponent range, `alpha * (1 - alpha)^k` reaching the subnormal grid and
 //!   then zero even for in-domain inputs. That is a different regime from a
 //!   subnormal *product*, and the difference is what
-//!   [the note below](self#a-weight-below-the-exponent-range) is about.
+//!   [the note below](self#a-weight-the-fold-did-not-form) is about.
 //! - [`CoverageWeightedMean`] folds `c_i / max_j c_j`, lifted by one shared
 //!   power of two, so its largest weight is exactly `2^shift` however the caller
 //!   scaled the slice — `shift` being zero for every slice whose weights are
@@ -146,7 +146,7 @@
 //! caller's coverages were small, which is a scale and cannot change a
 //! normalized weighted mean. A subnormal *weight* is not that regime, and
 //! [`EmaRenormalized`] is the only built-in policy that reaches it; see
-//! [A weight below the exponent range](self#a-weight-below-the-exponent-range).
+//! [A weight the fold did not form](self#a-weight-the-fold-did-not-form).
 //!
 //! Every value an `f32`-storage embedding can produce lies more than 250 binary
 //! orders inside this window on both sides, so no realizable `f32` input ever
@@ -156,55 +156,82 @@
 //! `4 * `[`Real::EPSILON`]` * ||M|| + K_abs` of the exact weighted sum, where `M`
 //! is the componentwise sum of the folded term magnitudes and `K_abs` is the small
 //! absolute term defined below; any result whose norm is at or below
-//! `16 * `[`Real::EPSILON`]` * ||M|| + `[`Real::MIN_GATE_THRESHOLD`] is reported as
-//! [`WinditError::NonFinite`] — no direction is determined at working precision.
-//! This is the crate's one accuracy claim, and it is a theorem rather than an
-//! observation, and it is stated against the exact weighted sum of the weights
-//! the policy *intends*, not of the ones it managed to represent — which is why
-//! the weight's own formation error is the first term of the derivation and not
-//! an omission from it. **A materialized weight must therefore carry a bounded
-//! *relative* error**, and the two policies whose weights the domain's own
-//! reasoning turns on carry one of at most `u`: exactly zero for
-//! [`MeanRenormalized`]'s constant `1`, and one correctly rounded division for
-//! [`CoverageWeightedMean`], whose lift is what keeps that division out of the
-//! subnormal range where its error would turn absolute and unbounded in relative
-//! terms. [`EmaRenormalized`] builds its weights by repeated multiplication and
-//! [`SaliencyWeighted`] takes each as a norm, so those two carry a formation
-//! error that grows with the window count and with the dimension rather than a
-//! flat `u` (EMA's reaches `2.6u` at `alpha = 0.3, n = 4` and about `0.7 * n * u`
-//! beyond); for them the bound below is stated against the weighted sum of the
-//! weights the fold was *given*.
+//! `16 * `[`Real::EPSILON`]` * ||M|| + `[`Real::MIN_GATE_THRESHOLD`]` + S` is reported
+//! as [`WinditError::NonFinite`] — no direction is determined at working
+//! precision. This is the crate's one accuracy claim, and it is a theorem rather
+//! than an observation, and it is stated against the exact weighted sum of the
+//! weights the policy *intends*, not of the ones it managed to represent — which
+//! is why the weight's own formation error is the first term of the derivation
+//! and not an omission from it.
 //!
-//! For EMA that accumulated error is a **bound with no reach**, which is a
-//! different thing from a defect, and the difference was measured rather than
-//! assumed. For any input whose ideal weighted sum is exactly zero the ideal
-//! terms `t_i` sum to zero, so any constant may be subtracted from the weights'
-//! relative errors `d_i`, and the residue the gate sees obeys
-//! `|sum_i t_i d_i| / sum_i |t_i| <= (max_i d_i - min_i d_i) / 2`: what a witness
-//! needs is the error's *spread over its own support*, above `64u`, never its
-//! size. Two windows cancel exactly only when their ideal weight ratio
-//! `(1 - alpha)^d` is an exact ratio of two `f64` significands; writing the
-//! complement as `B * 2^-q` with `B` odd, that needs `B^d < 2^53`, capping the
-//! lever at `d <= 53 / log2(B)`. The same small `B` that buys a long lever is
-//! what makes `(1 - alpha)^k` exactly representable — and so the chain exact —
-//! over that very range. Over every complement with `B` odd up to `2^40 - 1` and
-//! every `q` in `1..=53`, at every chain index whose materialized weight is a
-//! normal `f64`, the widest reachable `|d_k - d_{k+d}|` inside the cap is
-//! **10.0u**; the complements whose whole spread does clear `64u` need a support
-//! spanning 131 to 7609 chain steps, 65 to 1300 times their own lever cap, and a
-//! three-window chain — how a support reaches past its own lever at all —
-//! extends it by a measured `2.2x` and no further. Driving the fold says the
-//! same: over **5 072 311** exactly cancelling pairs, every short-mantissa
-//! complement at every chain index whose weights are both normal, the largest
-//! residue any of them leaves is **0.162** of the threshold.
-//! `ema_weight_error_accumulates_but_no_input_can_reach_the_gate` pins that
-//! maximum. Evaluating each weight once instead
-//! (`alpha * (1 - alpha).powi(k)`) does not change this and is not the "one
-//! rounding" it looks like: `powi` is exponentiation by squaring, so `O(log k)`
-//! roundings and not correctly rounded, and it raises the same `fl(1 - alpha)`
-//! the chain does — that single complement rounding, multiplied by `k`, is the
-//! larger part of the error. Measured at `alpha = 0.46, n = 64`: `58.75u` for
-//! the chain against `48.15u` for `powi`, a fifth, not a factor of `k`.
+//! **That first term is not the fold's to carry.** `16 * EPSILON * ||M||` bounds
+//! what the *fold* did to the terms it was given; the gap between a materialized
+//! weight and the ideal one is a property of whatever formed the weight, and only
+//! that thing can bound it. So the threshold carries a third term `S`, supplied by
+//! the policy beside its weight function:
+//!
+//! ```text
+//! S = sum_i E_i * ||e_i||,   E_i a proven bound on |w_i - W_i|
+//! ```
+//!
+//! — the *unweighted* window norms, which is a different quantity from `||M||` and
+//! cannot be recovered from it. Three of the four built-ins hand in a literal
+//! `C::ZERO`, and their verdicts are therefore unchanged to the bit:
+//! [`MeanRenormalized`]'s weight is the exact constant `1`; [`CoverageWeightedMean`]'s
+//! is one correctly rounded division of a lifted coverage, so `E_i <= u * w_i` and
+//! the gate's own term already covers it — the lift being what keeps that division
+//! out of the subnormal range where its error would turn absolute; and
+//! [`SaliencyWeighted`]'s weight is a norm the input domain bounds below, taken by
+//! the same `l2_norm` the gate measures `||M||` with, which is the sense in which
+//! that policy weights by *this crate's* norm rather than by an ideal it
+//! approximates.
+//!
+//! [`EmaRenormalized`] is the one that owes a term, and the reason it owes one is
+//! the correction this note carries. Its ladder is built by repeated
+//! multiplication, so weight `k` carries the roundings of every step before it —
+//! about `0.7 * n * u`, past the gate's own `32u` near `n = 32`. A previous
+//! revision measured that growth, agreed it was real, and then argued it had **no
+//! reach**. That argument is false, and there is a witness.
+//!
+//! What survives of it is the opening move. For any input whose ideal weighted sum
+//! is exactly zero the ideal terms `t_i` sum to zero, so any constant may be
+//! subtracted from the weights' relative errors `d_i`, and the residue the gate
+//! sees obeys `|sum_i t_i d_i| / sum_i |t_i| <= (max_i d_i - min_i d_i) / 2`: what
+//! a witness needs is the error's *spread over its own support*, above `64u`,
+//! never its size. What does not survive is the claim that no support reaches one.
+//! That rested on a **two-window lever cap** — a pair cancels exactly only when
+//! `(1 - alpha)^d` is a ratio of two `f64` significands, which with the complement
+//! written `B * 2^-q`, `B` odd, needs `B^d < 2^53` — plus a search over pairs and
+//! adjacent triples. **A cancellation is not a pair.** At `alpha = 1639/8192`,
+//! where `b = 6553/8192` is exact, the polynomial
+//!
+//! ```text
+//! P(x) = (8192 x - 6553) * SUM_j f_j x^j,   f_j = fl(f_{j-1} / b),  f_0 = 1
+//! ```
+//!
+//! vanishes at `b` because its first factor does — no lever, and a support as wide
+//! as the second factor's degree. Its coefficients `c_k = 8192 f_{k-1} - 6553 f_k`
+//! are exactly representable, and not by luck: `c_k` is `-6553` times the rounding
+//! in `f_k`, about `2^-40 * f_k` on the grid of `f_k`'s own last bit — the same
+//! thirteen bits `B = 6553` occupies. **The short mantissa that caps the lever is
+//! what buys the coefficients.** Over `1278` windows at chain indices `1168..2446`
+//! the spread reaches `71.9u` against the `10.0u` the old search reported as the
+//! widest reachable, every materialized weight stays a normal `f64`, every
+//! component stays inside the domain, and the fold returned `Ok([-1.0])` out of an
+//! exactly cancelling input at `1.09x` the threshold.
+//! `a_multi_window_polynomial_cancellation_reaches_the_ema_weight_error_bound`
+//! drives it.
+//!
+//! So EMA carries the bound instead of arguing it away: `E_i` is
+//! `(2k + 2) * EPSILON * w_i` for the relative part and the subnormal grid for the
+//! absolute one, and `ema_formation_slack` derives both. Evaluating each weight
+//! once (`alpha * (1 - alpha).powi(k)`) is not an alternative and never was: `powi`
+//! is exponentiation by squaring, so `O(log k)` roundings and not correctly
+//! rounded, and it raises the same `fl(1 - alpha)` the chain does — that single
+//! complement rounding, multiplied by `k`, is the larger part of the error.
+//! Measured at `alpha = 0.46, n = 64`: `58.75u` for the chain against `48.15u` for
+//! `powi`, a fifth, not a factor of `k` — and the witness's complement is exact, so
+//! `powi` would not have touched it at all.
 //!
 //! Each product `w_i * e_i` is then rounded relatively when it
 //! is a normal `f64` (by at most `u * |w_i * e_i|`, `u = EPSILON / 2`) and
@@ -223,10 +250,10 @@
 //! exactly cancelling sum has `||R|| <= 4 * EPSILON * ||M|| + K_abs < τ` and is
 //! always gated, whatever the ordering, tier structure, or weight range — so no
 //! fold can fabricate a direction from in-domain cancellation without violating the
-//! bound — **as long as every weight's error is relative**. Where it is not, `S`
-//! is what carries it, and `S` is supplied by the *policy* rather than by the
-//! fold, for the reason
-//! [A weight below the exponent range](self#a-weight-below-the-exponent-range)
+//! bound — **as long as every weight is the ideal one to within `u`**. Where it is
+//! not, `S` is what carries it, and `S` is supplied by the *policy* rather than by
+//! the fold, for the reason
+//! [A weight the fold did not form](self#a-weight-the-fold-did-not-form)
 //! gives; it is exactly `0` for three of the four built-ins, so their thresholds
 //! are the same numbers to the bit. When a fold's *products* are driven
 //! subnormal by an unbounded weight ratio while the weights themselves stay
@@ -242,8 +269,8 @@
 //!
 //! An absolute floor is only ever sound against a quantity carried in the
 //! embedding's own units, which `||M||` and `||R||` are and a *weight* is not —
-//! and that is also why `S` is not a second floor but a *mass*, the unweighted
-//! `sum_i ||e_i||` over the windows whose weight was rounded absolutely.
+//! and that is also why `S` is not a second floor but a *mass*, each window's
+//! unweighted `||e_i||` against a bound on its own weight's error.
 //! So reaching either regime takes an unbounded weight **ratio** —
 //! [`EmaRenormalized`]'s decaying recency factors, or a [`CoverageWeightedMean`]
 //! fold whose fullest windows are themselves all zero — and never a weight
@@ -251,14 +278,48 @@
 //! Neither regime is one a realizable `f32` workload reaches through
 //! [`aggregate`].
 //!
-//! # A weight below the exponent range
+//! # A weight the fold did not form
 //!
-//! The paragraph above holds while every weight's error is *relative*. There is
-//! one built-in policy for which it is not, and this section is what the gate
-//! carries instead.
+//! The paragraph above holds while every weight is the ideal one to within a flat
+//! `u`. There is one built-in policy for which it is not — twice over, relatively
+//! and absolutely — and this section is what the gate carries instead.
 //!
-//! [`EmaRenormalized`]'s weight ladder is the only one whose *range*, not merely
-//! whose ratio, is unbounded: `alpha * (1 - alpha)^k` falls below
+//! ## Relatively, without limit
+//!
+//! [`EmaRenormalized`]'s ladder is a chain of multiplications, so weight `k` is
+//! off its ideal by the `k` roundings before it and by the `k` copies of
+//! `b = fl(1 - alpha)` standing in for the exact complement: `2k + 1` roundings,
+//! `|w_i / W_i - 1| <= gamma_(2k+1)`. **No constant multiple of `EPSILON` bounds
+//! that**, because it grows with the window count, and the fold's own
+//! `16 * EPSILON * ||M||` is a constant. The revision that claimed otherwise
+//! reasoned from a two-window lever cap and a search over pairs, and named its own
+//! limit — "a counting argument plus a search, not a theorem". The witness the
+//! [Input domain](self#input-domain) note records lives exactly there: a
+//! polynomial that vanishes at the complement needs no lever at all, and reaches a
+//! `71.9u` spread over `1278` windows where the search reported `10.0u` as the
+//! ceiling.
+//!
+//! So the term is `E_i = (2k + 2) * EPSILON * w_i`, twice the derived
+//! `gamma / (1 - gamma)` bound, the doubling covering the slack's own arithmetic.
+//! It is charged against `||e_i||` like the absolute part below, one formula for
+//! both: `E_i` bounds `|w_i - W_i|` and how the weight came to be wrong changes
+//! only which half dominates. Two ladders are exempt, by certificate rather than
+//! by measurement — `alpha == 1` and `alpha == 0`, whose weights are exact at
+//! every index, and any `alpha >= 1/2` whose complement is a power of two, where
+//! Sterbenz makes `1 - alpha` exact and a power-of-two multiply moves only the
+//! exponent. That second one is what keeps `alpha = 0.5`'s published dyadic range
+//! bit-identical at the *gate* as well as in the ladder.
+//!
+//! What this costs a fold that is not cancelling is a few `EPSILON` of its own
+//! mass: `sum_k (2k + 2) * EPSILON * alpha * b^k` is about `2 * EPSILON / alpha`,
+//! against an accumulator of order `||e||`. It bites only where the fold has
+//! already cancelled to within about `n * u`, which is where the weights genuinely
+//! stop resolving a direction.
+//!
+//! ## Absolutely, past the exponent range
+//!
+//! [`EmaRenormalized`]'s weight ladder is also the only one whose *range*, not
+//! merely whose ratio, is unbounded: `alpha * (1 - alpha)^k` falls below
 //! [`Real::MIN_NORMAL`] and then below half the subnormal spacing at a window
 //! count of about `1074 / log2(1 / (1 - alpha))` — `326` at `alpha = 0.9`, `23`
 //! at `alpha = 1 - 2^-53`. There the weight is rounded **absolutely**, to the
@@ -281,8 +342,7 @@
 //! fold in the regime it does not fix; and a lifted accumulator is no longer in
 //! the embedding's units, so it would have to un-scale before the gate besides.
 //!
-//! What the gate was missing is the term this makes. Where a weight's error is
-//! absolute rather than relative, the residue of an exactly cancelling fold is
+//! The residue of an exactly cancelling fold is
 //! `R_j = sum_i (w_i - W_i) * e_ij` against the *ideal* weights `W_i`, so
 //!
 //! ```text
@@ -296,11 +356,20 @@
 //! over `326` windows, with two ordinary components near `10^24` whose ideal
 //! weighted sum is exactly zero, [`aggregate`] returned a unit vector.
 //!
-//! So the threshold carries `S = sum_i A_i * ||e_i||`, with `A_i` the *absolute*
-//! part of window `i`'s weight-formation error — bounded by
-//! `MIN_NORMAL * EPSILON` times `(1 + D)`, `D <= 1 / (1 - fl(1 - alpha))` being
-//! the geometric damping of the chain's own roundings — and `A_i = 0` wherever the
-//! materialized weight is normal. Three consequences worth stating plainly:
+//! So `E_i` gains an absolute part alongside its relative one, bounded by
+//! `MIN_NORMAL * EPSILON` times `(1 + alpha * D)`, with
+//! `D <= 1 / (1 - fl(1 - alpha))` the geometric damping of the chain's own
+//! roundings, and charged only where the materialized weight is under
+//! `MIN_NORMAL`. **The coefficient keeps its `alpha`.** A previous revision dropped
+//! it for `alpha <= 1` and charged `(1 + D)`, which is a valid inequality and a bad
+//! bound: `D` is about `1 / alpha`, so the derived `(1 + alpha * D)` is about `2`
+//! at every coefficient while `(1 + D)` grows without limit as the coefficient
+//! shrinks. At `alpha = 0.05, n = 14471`, one `2^400` component on a flushed weight
+//! and one `2^-400` on a normal one, the dropped-`alpha` term came to `5.185x` the
+//! accumulator and decided [`WinditError::NonFinite`] by itself — where the
+//! flushed window's ideal contribution is `0.12` of the live term, so even
+//! reversing it leaves a direction. `the_underflow_slack_does_not_charge_1_over_alpha`
+//! drives that. Four consequences worth stating plainly:
 //!
 //! - **`S` belongs to the policy, not to the fold.** A weight's formation error
 //!   is a property of whatever formed the weight, so the fold cannot derive it
@@ -329,18 +398,28 @@
 //!   `an_ordinary_long_ema_still_answers_past_the_underflow_point` pins both
 //!   halves.
 //!
+//! - **It is a bound on a weight, not a budget for a policy.** The absolute unit
+//!   is charged at twice its derived size and the derived size is itself up to
+//!   twice what a given flushed weight is worth, so a window in this regime is
+//!   charged about `4x` its ideal contribution — the figure the `alpha = 0.05`
+//!   row above reads as `0.494` against `0.120`. That is the conservatism the term
+//!   is allowed; `1 / alpha` was not.
+//!
 //! `ema_weights_below_the_exponent_range_cannot_fabricate_a_direction` is the
 //! falsifier, over `alpha = 0.9`, `0.5`, `1 - 2^-30` and `1 - 2^-53`; every row
 //! returned `Ok` before this term and returns [`WinditError::NonFinite`] now. The
 //! `alpha = 0.5` row is the one that identifies the mechanism: that chain is
-//! exact at every representable index, so it carries none of the accumulated
-//! multiplication error above — `0.5 * 2^-1074` is simply not an `f64`.
+//! exact at every representable index — it is one of the exempt ladders above —
+//! so it carries none of the relative error at all, and `0.5 * 2^-1074` is simply
+//! not an `f64`.
 //!
 //! What this does **not** claim is that the regime is now accurate. The verdict
 //! it produces is a refusal: past the point its ladder leaves the exponent range,
-//! a fold whose whole mass rides on the underflowed windows has no direction at
-//! working precision, and says so. A fold whose mass is anywhere else is
-//! untouched.
+//! a fold whose mass rides on the underflowed windows has no direction at working
+//! precision, and says so. A fold whose underflowed windows carry no mass is
+//! untouched to the bit; one whose underflowed windows carry mass is charged about
+//! four times what that mass is ideally worth, and is refused only where that
+//! charge outruns the live answer.
 //!
 //! [`Real`]: crate::scalar::Real
 //! [`Real::from_f64`]: crate::scalar::Real::from_f64
@@ -801,16 +880,15 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
     // `w_i = alpha*(1-alpha)^(n-1-i)` for `i >= 1`. Building those weights and
     // folding through `weighted_sum_renorm` gives EMA the same input domain,
     // determinacy gate, and error bound as every other policy from one proof —
-    // there is no separate recurrence fold left to fabricate a direction. Unlike
-    // the other policies these weights are unbounded below, so at a large window
-    // count the oldest windows' products underflow toward a subnormal; the gate's
-    // `MIN_GATE_THRESHOLD` floor is what keeps *that* regime sound (module Input
-    // domain note). The regime past it — the ladder falling under
-    // `Real::MIN_NORMAL`, so that the weight rather than the product is rounded
-    // absolutely — is the one no floor can cover, because the error is in the
-    // weight and the floor is in embedding units; `ema_underflow_slack` is the
-    // term this policy owes the gate for it, and it is the only nonzero one any
-    // built-in supplies. See the module's *A weight below the exponent range*.
+    // there is no separate recurrence fold left to fabricate a direction. What
+    // the shared fold cannot carry is the *weight*'s own formation error. This
+    // ladder is built by repeated multiplication, so weight `k` sits off its
+    // ideal relatively by the `k` roundings before it, and — once the ladder
+    // leaves `f64`'s exponent range — absolutely by the subnormal grid it landed
+    // on. Neither is a property of the fold, so neither can live inside the
+    // gate's own `16 * EPSILON * ||M||` constant; `ema_formation_slack` is the
+    // term this policy owes the gate for both, and it is the only nonzero one any
+    // built-in supplies. See the module's *A weight the fold did not form*.
     // The dyadic case (`alpha = 0.5` over basis vectors) reproduces
     // the old recurrence bit for bit. The coefficient arrives already in `C` —
     // it is configured in the compute domain rather than widened into it — so
@@ -835,75 +913,131 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
       dim,
       |i, _| weights[i],
       // The one policy that owes the gate a term of its own.
-      |embs| ema_underflow_slack(&weights, embs, complement),
+      |embs| ema_formation_slack(&weights, embs, alpha, complement),
     )
   }
 }
 
 /// The term [`EmaRenormalized`] owes the determinacy gate for the weights it
-/// could not represent: `2^-1074 * (1 + D) * sum_i ||e_i||` over the windows
-/// whose weight left the exponent range.
+/// could not form exactly: `sum_i E_i * ||e_i||`, over every window, with `E_i`
+/// a proven bound on how far the materialized weight sits from the ideal one.
 ///
-/// The fold's whole error argument rests on every materialized weight carrying a
-/// bounded *relative* error, and this is the one built-in policy for which that
-/// fails: below [`Real::MIN_NORMAL`] the grid is absolute, so a weight there is
-/// rounded to it — and below half its spacing there is no representable weight
-/// at all, so the older of two adjacent ideal weights becomes zero while the
-/// newer survives. No way of *forming* the weight repairs it, because the value
-/// itself is not a `C` (see the module's
-/// [A weight below the exponent range](self#a-weight-below-the-exponent-range)).
-/// What is left is to carry the error into the threshold, which is what this is.
+/// The fold's whole error argument rests on every materialized weight being the
+/// ideal one to within a bounded *relative* error the gate's own
+/// `16 * EPSILON * ||M||` already covers. This is the one built-in policy for
+/// which that fails, and it fails twice over:
+///
+/// - **Relatively.** The ladder is a chain of multiplications, so weight `k`
+///   carries the rounding of every step before it, and of the complement itself.
+///   That error grows with `k` without limit, so no constant multiple of
+///   `EPSILON` bounds it — see the module's
+///   [A weight the fold did not form](self#a-weight-the-fold-did-not-form).
+/// - **Absolutely.** Below [`Real::MIN_NORMAL`] the grid is absolute, so a weight
+///   there is rounded to it — and below half its spacing there is no
+///   representable weight at all, so the older of two adjacent ideal weights
+///   becomes zero while the newer survives. No way of *forming* the weight
+///   repairs that one, because the value itself is not a `C`.
 ///
 /// # The bound
 ///
-/// Write `W_i` for the ideal weight and `w_i` for the materialized one. Where
-/// the exact weighted sum is zero the residue the gate sees is
+/// Write `W_i` for the ideal weight and `w_i` for the materialized one. Where the
+/// exact weighted sum is zero the residue the gate sees is
 /// `R_j = sum_i (w_i - W_i) * e_ij`, so
-/// `||R|| <= sum_i |w_i - W_i| * ||e_i||` — the *unweighted* window norms, which
-/// is why this cannot be folded into `||M||` and why it is a `sqrt(dim)`-carrying
-/// quantity rather than the scalar `n * max_ij |e_ij|` the issue prototyped. (A
-/// residue that fills every dimension equally grows as `sqrt(dim)` while
-/// `max |e|` does not move at all;
-/// `the_weight_underflow_slack_carries_the_dimension` drives the input where
-/// that difference decides the verdict.)
-///
-/// The chain is `p_0 = 1`, `p_{k+1} = fl(p_k * b)`, `w = fl(alpha * p_k)`, and
-/// each rounding is *either* relative by at most `EPSILON / 2` *or* absolute by
-/// at most half the subnormal spacing. Only the absolute halves are collected
-/// here — the relative ones are what the gate's `16 * EPSILON * ||M||` term
-/// already covers, and the module's Input domain note records the measurement
-/// showing they have no reach. Propagating them,
 ///
 /// ```text
-/// |w_k - W_k|_absolute  <=  (EPSILON/2) * MIN_NORMAL * (1 + alpha * D),
+/// ||R||  <=  sum_i |w_i - W_i| * ||e_i||
+/// ```
+///
+/// — the *unweighted* window norms, which is why this cannot be folded into
+/// `||M||` and why it is a `sqrt(dim)`-carrying quantity rather than the scalar
+/// `n * max_ij |e_ij|` the issue prototyped. (A residue that fills every dimension
+/// equally grows as `sqrt(dim)` while `max |e|` does not move at all;
+/// `the_weight_underflow_slack_carries_the_dimension` drives the input where that
+/// difference decides the verdict.) One formula covers both regimes, which is the
+/// point: `E_i` is a bound on `|w_i - W_i|`, and how the weight came to be wrong
+/// changes only which of its two parts dominates.
+///
+/// The chain is `p_0 = 1`, `p_{k+1} = fl(p_k * b)`, `w_i = fl(alpha * p_k)` at
+/// `k = n - 1 - i`, and each rounding is *either* relative by at most
+/// `EPSILON / 2` *or* absolute by at most half the subnormal spacing.
+///
+/// **The relative part.** `k` chain roundings, one for the final `alpha * p_k`,
+/// and `k` more for `b = fl(1 - alpha)` being raised in place of the exact
+/// `1 - alpha` — `2k + 1` roundings, so `|w_i / W_i - 1| <= gamma_(2k+1)` with
+/// `gamma_m = (1 + u)^m - 1`, `u = EPSILON / 2`. Turning that into a bound on
+/// `|w_i - W_i|` against the weight this actually *has* costs one more factor:
+/// `W_i <= w_i / (1 - gamma)`, so
+///
+/// ```text
+/// |w_i - W_i|_relative  <=  gamma / (1 - gamma) * w_i  <=  (2k + 2) * EPSILON * w_i
+/// ```
+///
+/// wherever `(2k + 1) * u <= 1/4` — `n <= 2^50`, well past the `n <= 2^40` the
+/// crate's own `K_abs` already assumes, so no realizable slice reaches the
+/// condition and no guard here can bind. The right-hand form is about twice the
+/// derived one, and that doubling is what covers the roundings in computing the
+/// slack itself: the integer `2k + 2` is exact up to `2^41`, its product with
+/// `EPSILON` is exact (a power of two), and what is left is one rounding per
+/// multiply and one per accumulation, at most `(n + dim) * u` all told.
+///
+/// **The absolute part**, charged only where `w_i < MIN_NORMAL`:
+///
+/// ```text
+/// |w_i - W_i|_absolute  <=  (EPSILON/2) * MIN_NORMAL * (1 + alpha * D),
 ///     D = sum_{j<k} b^j <= 1 / (1 - b)
 /// ```
 ///
 /// — each earlier rounding damped by every multiplication after it, plus one for
-/// the final `alpha * p_k`. `alpha <= 1`, so `(1 + D)` is the bound this actually
-/// uses and the coefficient itself never has to be read; and `alpha * D <= 2` for
-/// every representable pair (`b = fl(1 - alpha)` puts `1 - b` within `2^-54` of
-/// `alpha`), so at any coefficient that can reach this regime the true term is
-/// under `3 * 2^-1075`. The unit is `MIN_NORMAL * EPSILON` — `2^-1074`, one
-/// binade above the half-spacing, and the smallest quantity of this shape that
-/// *is* representable — which leaves the factor of two that covers the rounding
-/// in computing `D` and the mass themselves.
+/// the final `alpha * p_k`. **`alpha` stays in.** Dropping it for `alpha <= 1`
+/// leaves `(1 + D)`, which is about `1 / alpha` where the derived coefficient is
+/// about `2`, so the term grows as the coefficient shrinks and refuses folds
+/// whose direction is not in doubt: at `alpha = 0.05, n = 14471`, one `2^400`
+/// component on a zero weight and one `2^-400` component on a normal one, the
+/// dropped-`alpha` term is `5.185x` the accumulator and decides `NonFinite` by
+/// itself, where the ideal contribution of that same window is `0.12` of the
+/// legitimate term. `the_underflow_slack_does_not_charge_1_over_alpha` drives it.
+/// The unit is `MIN_NORMAL * EPSILON` — `2^-1074`, one binade above the
+/// half-spacing, and the smallest quantity of this shape that *is* representable
+/// — which leaves the same factor of two for the roundings in `D` and the mass.
 ///
-/// # Zero wherever the ladder is representable
+/// A `w_i` that flushed to zero is covered by the same line rather than by a case
+/// of its own: `fl(alpha * p_k) == 0` means `alpha * p_k` was under half the
+/// spacing, so `W_i` itself is under `(EPSILON/2) * MIN_NORMAL * (1 + alpha * D)`
+/// up to the relative factor already charged.
 ///
-/// `w_i >= MIN_NORMAL` is enough to certify window `i`, and not only its own
-/// rounding: `w_i = fl(alpha * p) <= p` for `alpha <= 1`, so a normal weight
-/// implies a normal `p`, and the chain is monotone, so every `p` before it was
-/// normal too. So a ladder that stays in the normal range contributes exactly
-/// `C::ZERO` and the fold is bit-for-bit the one that shipped without this term
-/// — including the whole of `alpha = 0.5`'s documented dyadic range, where
-/// `0.5^198` is still normal.
+/// # Zero wherever the ladder is exact
 ///
-/// The two exact ladders are answered before it is read: at `b == 0`
-/// (`alpha == 1`) every weight but the newest is a zero that *is* its ideal, and
-/// at `b == 1` the chain never decays, so `p` stays exactly one and each weight is
-/// `alpha` with nothing rounded at all. `alpha == 0` needs no guard of its own —
-/// it makes `b` exactly one and so reaches the second.
+/// Two certificates make `E_i` exactly `C::ZERO`, and both are structural rather
+/// than measured:
+///
+/// - **`alpha == 1`** (so `b == 0`) **and `alpha == 0`**: the two degenerate
+///   ladders. The first keeps the newest window at an exact `1` and every other
+///   weight at an exact zero; the second keeps the oldest at an exact `1` and does
+///   the same to the rest. Both are answered before anything is read — charging
+///   the absolute unit against a `2^400` component sitting on one of `alpha == 1`'s
+///   exact zeros would refuse an entirely determined fold.
+/// - **`alpha >= 1/2` with a power-of-two `b`**: Sterbenz makes `1 - alpha` exact
+///   for `alpha >= 1/2`, so `b` *is* the ideal complement rather than a rounding
+///   of it, and multiplying by a power of two moves only the exponent — so every
+///   `p_k`, and every `alpha * p_k`, is exact for as long as it is representable
+///   and the whole *relative* part is zero. Both halves of that test are needed:
+///   `alpha = 1/2 - 2^-54` also has `fl(1 - alpha) = 1/2`, and there the exact
+///   complement is `1/2 + 2^-54` and the chain does drift. This is what keeps
+///   `alpha = 0.5`'s published dyadic range bit-identical at the *gate* as well as
+///   in the ladder, and it is why `alpha = 1 - 2^-43`'s subnormal witness is
+///   unchanged to the bit.
+///
+/// The absolute part survives a power-of-two `b`, and must: the ladder is exact
+/// only while its value is representable, and `alpha = 1 - 2^-43` walks straight
+/// onto the flush boundary.
+///
+/// `b == 1` — the chain that never decays, reached by every `alpha <= 2^-54` — is
+/// **not** a third certificate, and the note that once called it one was wrong.
+/// Nothing is ever *formed* in the subnormal range there, so the absolute part is
+/// zero by its own condition; but the *ideal* ladder does still decay, by about
+/// `alpha` per step, while every materialized weight stays an identical `alpha`.
+/// That is the complement rounding at its largest, and the relative part charges
+/// it `k` times over, as it must.
 ///
 /// `D` is bounded by the geometric sum alone and not also by the window count,
 /// because the count can never be the smaller of the two *here*: it binds only
@@ -912,34 +1046,57 @@ impl<C: Real> AggregatePolicy<C> for EmaRenormalized<C> {
 /// `n > 708 / alpha > 708 * n`. A cap that cannot bind would read as
 /// load-bearing while being unreachable, which is the same reason
 /// [`normalizing_shift`] carries no second guard.
-fn ema_underflow_slack<C: Real>(weights: &[C], embeddings: &[&[C]], b: C) -> C {
-  if b == C::ZERO || b == C::ONE {
+fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b: C) -> C {
+  // The two degenerate ladders, each exact at every index: `alpha == 1` keeps the
+  // newest window at an exact `1` and makes every other weight an exact zero,
+  // and `alpha == 0` keeps the oldest at an exact `1` and does the same to the
+  // rest. Charging either would be pure over-rejection, and for `alpha == 1` the
+  // absolute unit below would land on `n - 1` weights that are exactly their own
+  // ideals.
+  if b == C::ZERO || alpha == C::ZERO {
     return C::ZERO;
   }
-  // The unweighted mass of the windows whose weight was rounded absolutely.
-  // `l2_norm` rather than a componentwise sum: it is the norm the residue is
-  // bounded by, it is the same scale-aware spelling the gate measures `||M||`
-  // with, and it costs a pass over only the windows this regime reaches.
-  let mut mass = C::ZERO;
-  for (w, emb) in weights.iter().zip(embeddings) {
-    if *w < C::MIN_NORMAL {
-      mass = mass + l2_norm(emb);
+  let n = weights.len();
+  // Sterbenz plus a power-of-two complement: the chain is exact at every
+  // representable index, so only the flush below the exponent range is left.
+  let half = C::from_f32(0.5);
+  let exact_chain = alpha >= half && C::ONE.ldexp(b.exponent()) == b;
+  // The absolute unit, `(EPSILON/2) * MIN_NORMAL * (1 + alpha * D)` charged at
+  // twice its derived size, in the one grouping that keeps it representable:
+  // `MIN_NORMAL * EPSILON` is `2^-1074` exactly and `(1 + alpha * D)` keeps it
+  // normal. `b == C::ONE` is the chain that never decays, so no weight is ever
+  // formed in the subnormal range — and it is the one value at which the damping
+  // would divide by zero.
+  let absolute = if b < C::ONE {
+    (C::ONE + alpha * (C::ONE / (C::ONE - b))) * (C::MIN_NORMAL * C::EPSILON)
+  } else {
+    C::ZERO
+  };
+  let mut slack = C::ZERO;
+  for (i, (&w, emb)) in weights.iter().zip(embeddings).enumerate() {
+    // `(2k + 2) * EPSILON * w`: the integer is exact to `2^41` and its product
+    // with `EPSILON` is a power-of-two scaling, so the only rounding is the last
+    // multiply. Formed in this order so a subnormal `w` is reached last — and
+    // where that product does underflow, the weight is subnormal and the absolute
+    // unit below is the larger of the two by orders anyway.
+    let mut error = if exact_chain {
+      C::ZERO
+    } else {
+      C::from_f64(2.0 * ((n - 1 - i) as f64) + 2.0) * C::EPSILON * w
+    };
+    if w < C::MIN_NORMAL {
+      error = error + absolute;
+    }
+    // `l2_norm` rather than a componentwise sum: it is the norm the residue is
+    // bounded by, and it is the same scale-aware spelling the gate measures
+    // `||M||` with. Skipped where the error is an exact zero, which is every
+    // window of an exact ladder that has not flushed — so a dyadic `alpha` still
+    // pays for no pass at all.
+    if error > C::ZERO {
+      slack = slack + error * l2_norm(emb);
     }
   }
-  if mass == C::ZERO {
-    return C::ZERO;
-  }
-  // `D`, the geometric damping of the chain's own roundings. `1 - b` is positive
-  // (`b == C::ONE` returned above) and at least `2^-53`, so this is at most
-  // `2^53` and the product below stays a normal value.
-  let damping = C::ONE / (C::ONE - b);
-  // Grouped so the small factor is formed first: `MIN_NORMAL * EPSILON` is
-  // `2^-1074` exactly, and `(1 + damping)` keeps it normal, so only the last
-  // multiplication can underflow. It does so only when `mass` is under one — and
-  // then the whole term is under `2^-1074`, far below the `MIN_GATE_THRESHOLD`
-  // floor `tau` carries anyway, so the lost bits could not have decided a
-  // verdict.
-  ((C::ONE + damping) * (C::MIN_NORMAL * C::EPSILON)) * mass
+  slack
 }
 
 /// Serde-serializable selector over the built-in aggregation policies.
@@ -1057,11 +1214,13 @@ fn check_inputs<C: Real>(
 /// weighted sum is indistinguishable from zero there, so a smaller residue is
 /// rounding noise with no direction — not a vector for [`l2_renorm`] to amplify
 /// into a fabricated unit direction. The absolute floor keeps the gate sound where
-/// subnormal *products* make `16 * EPSILON * ||M||` underflow; it cannot cover a
-/// subnormal *weight*, which only [`EmaRenormalized`] forms, so that policy hands
-/// in `weight_slack` — the third term of the threshold, `C::ZERO` for every other
-/// built-in and therefore invisible in their verdicts. See the module's
-/// [A weight below the exponent range](self#a-weight-below-the-exponent-range).
+/// subnormal *products* make `16 * EPSILON * ||M||` underflow; what neither term
+/// can cover is a *weight* that is not the ideal one to within `u` — a chain of
+/// multiplications, or one rounded onto the subnormal grid, both of which only
+/// [`EmaRenormalized`] forms — so that policy hands in `weight_slack`, the third
+/// term of the threshold, `C::ZERO` for every other built-in and therefore
+/// invisible in their verdicts. See the module's
+/// [A weight the fold did not form](self#a-weight-the-fold-did-not-form).
 /// The bound is the crate's one accuracy claim; see the module
 /// [Input domain](self#input-domain) note for the proof.
 ///
@@ -1079,10 +1238,11 @@ fn weighted_sum_renorm<C: Real>(
   // embedding that exists, so the accumulators below are bounded by real data.
   check_inputs(embeddings, coverages, dim)?;
   // Asked only once, and only after the domain check, because it reads the
-  // components: the term a policy owes the gate for weights it could not
-  // represent relatively (see [`ema_underflow_slack`]). `C::ZERO` for the three
-  // policies whose weights are always rounded relatively, and adding an exact
-  // zero to `tau` below leaves their verdicts bit-for-bit where they were.
+  // components: the term a policy owes the gate for the gap between the weights
+  // it materialized and the ones it intends (see [`ema_formation_slack`]).
+  // `C::ZERO` for the three policies whose weight is one rounding of an ideal, and
+  // adding an exact zero to `tau` below leaves their verdicts bit-for-bit where
+  // they were.
   let slack = weight_slack(embeddings);
   let mut acc = try_zeroed(dim)?;
   // The running Neumaier compensation, one term per dimension: the sum of the
@@ -1117,9 +1277,9 @@ fn weighted_sum_renorm<C: Real>(
   // rounding turns absolute, so without the floor the gate would degenerate into an
   // exact-zero check a nonzero subnormal residue slips past (module Input domain
   // note). With it, exact cancellation (`||exact|| = 0`) is caught at every
-  // ordering, tier structure, and weight range for which the weights' own error is
-  // relative; `slack` is the third term, and covers the one policy and one regime
-  // for which it is not (module *A weight below the exponent range*). It is an
+  // ordering, tier structure, and weight range for which each weight is its own
+  // ideal to within `u`; `slack` is the third term, and covers the one policy
+  // whose weights are not (module *A weight the fold did not form*). It is an
   // exact `C::ZERO` for the other three, so their thresholds are unchanged to the
   // bit. Wherever the fold's heaviest
   // window carries mass of its own the floor sits far under
