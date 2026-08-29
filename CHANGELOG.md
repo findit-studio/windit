@@ -67,6 +67,40 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   smoother's cost — the one that made the bound worth re-examining — could not be
   measured from inside the repository at all.
 
+- **A `package` CI job** ([#11], F7). Every other job builds the working tree;
+  none built the *tarball*, whose contents `exclude` decides. It runs `cargo
+  package`, unpacks the result, runs `cargo hack test --each-feature` from inside
+  it, and then `cargo publish --dry-run` — so a file the suite needs and
+  `exclude` drops fails CI instead of the published crate.
+
+- **A `bench parity` CI job** ([#11], F1/F7). `cargo bench --bench windit --
+  --test` runs every benchmark once without measuring, which executes the
+  equivalence assertion each comparable arm makes outside its timed loop. The
+  pairs can no longer drift back into measuring different work: restoring the old
+  bare-threshold streaming arm fails this job with the diverging range lists.
+  Correctness only — no timing threshold is asserted anywhere, because a shared
+  runner cannot support one.
+
+- **`.github/workflows/release.yml`** ([#11], F3). 0.1.0 through 0.2.0 were
+  published with no git tag and no GitHub Release, leaving the crates.io tarball
+  as the only record of what shipped. The workflow is triggered *by* the tag, so
+  a tag pointing at the exact published commit necessarily exists before the
+  crate does; it then checks the tag against `Cargo.toml` and `CHANGELOG.md`,
+  repeats the package verification against the tagged tree, publishes the
+  reviewed changelog section as the release body, and runs `cargo publish` last
+  as the only irreversible step.
+
+  `v0.1.2` (`ece6e46`) and `v0.2.0` (`7aff9cb`) are backfilled as annotated tags.
+  The 0.2.0 tarball was re-verified while doing so: its `.cargo_vcs_info.json`
+  names `7aff9cbef5b8a981180ed70d6a36dd07b1748ac5`, and its sha256 is
+  `7a42d143174fd46d11ecf6be281dc8decf010410ac0f4078fe5292c6d7ce68a2` — **not**
+  the value quoted in [#11], which matches neither the crates.io API nor the
+  downloaded file.
+
+- **`tests/segment_longest_run_alloc.rs`**, the sixth allocation suite: a
+  counting global allocator armed around `longest_run` alone, asserting zero
+  calls and zero bytes over a million-window, half-a-million-run input.
+
 ### Tested
 
 - **The vector smoother is reachable without `Clone`, from outside the crate, and
@@ -91,7 +125,116 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A pre-existing gap, closed here because it is on the very method this entry is
   about and the harness it needed was already in the repository.
 
+### Fixed
+
+- **`longest_run` is O(1) in the number of output runs, not O(runs)** ([#11],
+  F4). It called `runs`, materialized every finalized `Range` into a `Vec`, and
+  only then scanned for the longest — storing an answer it discards. It now
+  drives the same `Segmenter` and folds each emission into one incumbent range,
+  `finish` tail included. Same ranges, same earliest-on-tie rule, same
+  `min_len` / `merge_gap` behaviour, same `NonMonotonicSpan`; a differential
+  assertion inside the existing 200-case randomized oracle loop pins the two
+  definitions together over every geometry and both `merge_gap` extremes.
+
+  Measured on a million unit spans alternating accepted/rejected (~500,000
+  one-element runs), with a counting global allocator armed around the call
+  alone: **18 allocation calls / 16,777,152 bytes before, 0 / 0 after**. The
+  count is the evidence rather than a timing, because the property is space and
+  a loaded machine cannot resolve the difference in wall clock.
+
+  Consequence for callers: `longest_run` can no longer return `AllocFailed` — it
+  asks for no memory to fail. `runs` and `runs_sorted` are unchanged; both return
+  every range and so must still collect.
+
+- **The `clippy` CI job lints every target** ([#9]). It ran `cargo hack clippy
+  --each-feature` without `--all-targets`, so it linted the library alone: the
+  test, integration and bench targets were compiled elsewhere in CI and never
+  linted. The flag lands green — `cargo hack clippy --each-feature --all-targets
+  -- -D warnings` was clean on all eight feature rows before the switch, so the
+  accumulated-warning backlog the issue anticipated does not exist.
+
+- **A Markdown-only change no longer skips CI** ([#11], F6). `paths-ignore`
+  carried `'**.md'`, while `src/lib.rs` includes `README.md` as the crate
+  documentation on every `alloc`/`std` row — so the front page's worked examples
+  are doctests, and a README-only pull request could replace one with a call to
+  an item that does not exist while every job stayed unrun. Demonstrated:
+  renaming `longest_run` to a nonexistent `longest_speech_run` in the README
+  fails `cargo test --doc --all-features` with ``cannot find function
+  `longest_speech_run` in this scope``. The ignore is gone, the `docs` job now
+  *executes* the doctests on both README-carrying rows instead of only building
+  rustdoc, and a step in that job fails if `'**.md'` is ever put back.
+
+- **One canonical repository identity** ([#11], F9). The README's GitHub, CI and
+  Codecov link definitions pointed at `Findit-AI/windit` while the badge images,
+  the licence link and `Cargo.toml` used `findit-studio/windit`. Those three were
+  not merely non-canonical, they were broken: `github.com/Findit-AI/windit`
+  answers `404` with no redirect. All six now use `findit-studio`, and each was
+  re-fetched — GitHub, the CI workflow page, Codecov, crates.io, docs.rs and the
+  licence anchor all answer `200`.
+
+### Changed
+
+- **The declared benchmark pairs each change exactly one variable** ([#11], F1).
+  Three of them changed two, so none could support the comparison its comment
+  claimed:
+
+  - `segment/hysteresis_batch` latched on `Hysteresis(0.6, 0.3)` and returned
+    `Vec<Range>`; `segment/streaming` applied a bare `>= 0.5` and returned a
+    count — different gate semantics *and* different output work. The streaming
+    arm is now `segment/hysteresis_streaming`, on the same gate and the same
+    `Vec<Range>` sink, and `segment/hysteresis_two_pass` joins them as the
+    materialized reference that prices the O(n) intermediate decision vector the
+    fused driver avoids.
+  - `smooth/cadence_ema_streaming` folded to a count against a batch arm that
+    built a vector; it now collects the same `Vec<Windowed<f32>>`.
+  - `decode/identity_threshold` versus `decode/hangover_dwell_vote` changed both
+    the smoother and the gate. `decode/cadence_threshold` is added as the hinge:
+    against `identity_threshold` it changes the smoother alone, against
+    `hangover_dwell_vote` the gate alone.
+
+  The streaming arms collecting output does not weaken the zero-allocation
+  claims: those were never what the benchmarks proved. They are asserted exactly,
+  under refusing global allocators, in `tests/segment_alloc.rs`,
+  `tests/smooth_alloc.rs` and `tests/decode_alloc.rs` — an exact integer where a
+  benchmark mean is a machine-dependent estimate.
+
+  `segment/longest_run_fold` and `segment/longest_run_materialized` are added for
+  the entry above, on the same high-run-count corpora.
+
+- **`Segmenter`'s state size is qualified by pointer width** ([#11], F5). The
+  type documentation and `tests/segment_alloc.rs` called it "a fixed 80 bytes"
+  without saying on what. Every field is `usize`-shaped: it is 80 bytes on a
+  64-bit target and **40 on a 32-bit one**. The field count and the O(1) bound
+  are architecture-independent and unchanged. Both numbers are now `const`
+  assertions in `src/segment/mod.rs`, so they are checked on the `wasm32-*`,
+  `i686-*` and `thumbv7em-none-eabihf` targets CI builds but never runs tests on.
+
+- **The README's streaming claim is bounded to what is tested** ([#11], F2). "A
+  live decode and an offline one agree by construction" is now stated as
+  incremental — including chunked — decoding agreeing with the batch composition
+  under the documented span and lifecycle contract, which is the parity the suite
+  actually establishes, with VAD/endpointing quality, undeclared discontinuities
+  and turn semantics named as out of scope.
+
+- **Documentation reconciled with three implemented contracts** ([#11], F8).
+  `Ema`'s type documentation said a "non-finite (NaN)" alpha clamps to `0.0`.
+  The clamp is an ordering rule, not a finiteness test, and the three non-finite
+  coefficients do not share an answer: `NaN` and `-inf` clamp to `0.0`, `+inf`
+  clamps to `1.0`. Stated exactly on `Ema`, on `VectorEma`, and pinned by a
+  doctest on `Ema::new`. The other two items in F8 were **already fixed** before
+  this branch and are recorded here as verified rather than reopened:
+  `SmoothPolicy::smooth` has named `CadenceEma`'s `NonMonotonicSpan` since
+  [#12], and the `aggregate` module introduction has said `f64` since [#14].
+  Each gains the executable pin F8 asked for: a doctest driving a descending
+  span through the batch smoother, and a type-identity assignment in
+  `tests/genericity.rs` that stops compiling if the `AggregatePolicy` default
+  scalar ever moves off `f64`.
+
+[#9]: https://github.com/findit-studio/windit/issues/9
+[#11]: https://github.com/findit-studio/windit/issues/11
+[#12]: https://github.com/findit-studio/windit/pull/12
 [#13]: https://github.com/findit-studio/windit/issues/13
+[#14]: https://github.com/findit-studio/windit/pull/14
 
 ## 0.3.0
 
