@@ -59,3 +59,4 @@ mod error;
 mod test_support;
 
 pub use error::WinditError;
+pub use plan::TailPolicy;

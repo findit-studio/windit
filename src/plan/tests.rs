@@ -387,7 +387,7 @@ fn window_options_serde_round_trip() {
 fn window_options_serde_optional_cap_and_rejects_unknown_keys() {
   // `max_windows` may be omitted; it then defaults to no cap.
   let opts: WindowOptions =
-    serde_json::from_str(r#"{"window":4,"hop":4,"tail":"KeepWithCoverage"}"#).unwrap();
+    serde_json::from_str(r#"{"window":4,"hop":4,"tail":{"kind":"keep_with_coverage"}}"#).unwrap();
   assert_eq!(opts.max_windows(), None);
 
   // A required (non-optional) field is still enforced.
@@ -396,7 +396,79 @@ fn window_options_serde_optional_cap_and_rejects_unknown_keys() {
   // An unknown key (e.g. a typo'd `max_window`) is rejected by
   // `deny_unknown_fields` rather than silently ignored.
   assert!(serde_json::from_str::<WindowOptions>(
-    r#"{"window":4,"hop":4,"tail":"KeepWithCoverage","max_window":2}"#
+    r#"{"window":4,"hop":4,"tail":{"kind":"keep_with_coverage"},"max_window":2}"#
   )
   .is_err());
+}
+
+#[test]
+fn tail_policy_default_is_keep_with_coverage() {
+  // Pinned on its own, independent of serde: whichever variant `#[default]`
+  // marks is a semantic choice (the planner keeps a ragged tail rather than
+  // dropping or padding it), and this regresses if it silently moves.
+  assert_eq!(TailPolicy::default(), TailPolicy::KeepWithCoverage);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_round_trips_through_toml_keep_with_coverage() {
+  let original = TailPolicy::KeepWithCoverage;
+  let doc = toml::to_string(&original).unwrap();
+  assert_eq!(toml::from_str::<TailPolicy>(&doc).unwrap(), original);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_round_trips_through_toml_drop_below_min() {
+  let original = TailPolicy::DropBelowMin(10);
+  let doc = toml::to_string(&original).unwrap();
+  assert_eq!(toml::from_str::<TailPolicy>(&doc).unwrap(), original);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_round_trips_through_toml_pad_full() {
+  let original = TailPolicy::PadFull;
+  let doc = toml::to_string(&original).unwrap();
+  assert_eq!(toml::from_str::<TailPolicy>(&doc).unwrap(), original);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_toml_document_form_is_pinned() {
+  // The adjacently tagged wire form, pinned exactly, the same discipline
+  // `aggregate::tests::kind_serde_wire_format_is_pinned` applies to
+  // `AggregatePolicyKind`: a renamed variant, a retagged field, or a payload
+  // moved out of `value` would all fail here rather than silently reaching a
+  // downstream document as something else.
+  //
+  // Internally tagged (`#[serde(tag = "kind")]` alone, no `content`) was
+  // rejected for this enum specifically: it only covers struct- and map-shaped
+  // payloads, and serializing `DropBelowMin`'s bare `usize` under it fails at
+  // run time with "cannot serialize tagged newtype variant
+  // TailPolicy::DropBelowMin containing an integer" — proven against a
+  // throwaway probe crate before this form was chosen, not assumed.
+  assert_eq!(
+    toml::to_string(&TailPolicy::KeepWithCoverage).unwrap(),
+    "kind = \"keep_with_coverage\"\n"
+  );
+  assert_eq!(
+    toml::to_string(&TailPolicy::DropBelowMin(2)).unwrap(),
+    "kind = \"drop_below_min\"\nvalue = 2\n"
+  );
+  assert_eq!(
+    toml::to_string(&TailPolicy::PadFull).unwrap(),
+    "kind = \"pad_full\"\n"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_round_trips_as_a_window_options_document_field() {
+  // The motivating scenario: a `TailPolicy` reached not as a bare value but as
+  // the `tail` field of a `WindowOptions` document — the shape a `mediagraph`
+  // node-options TOML file actually carries.
+  let opts = WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(2));
+  let doc = toml::to_string(&opts).unwrap();
+  assert_eq!(toml::from_str::<WindowOptions>(&doc).unwrap(), opts);
 }
