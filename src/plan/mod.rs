@@ -248,8 +248,22 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 }
 
 /// How the planner treats a final window that does not fill a whole [`Span`].
+///
+/// With the `serde` feature this is adjacently tagged — `kind` names the
+/// variant, `value` carries [`DropBelowMin`](TailPolicy::DropBelowMin)'s
+/// minimum — rather than internally tagged: the internally tagged
+/// representation only covers struct- and map-shaped payloads, and a bare
+/// `usize` is neither, so `#[serde(tag = "kind")]` alone fails at
+/// serialization time for [`DropBelowMin`](TailPolicy::DropBelowMin) with
+/// "cannot serialize tagged newtype variant ... containing an integer". The
+/// adjacent `value` field sidesteps that: it holds whatever the variant
+/// carries with no merge into a shared map.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(
+  feature = "serde",
+  serde(rename_all = "snake_case", tag = "kind", content = "value")
+)]
 pub enum TailPolicy {
   /// Keep the ragged tail as a partial span; its [`Span::coverage`] is below
   /// `1.0`. This is the default.

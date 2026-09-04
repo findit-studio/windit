@@ -6,6 +6,49 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.4.0
+
+`plan::TailPolicy` becomes a document citizen. `mediagraph`'s `text::embeddings`
+node options document could not carry windit's tail policy: `TailPolicy` was
+reachable only as `windit::plan::TailPolicy` (or through the prelude), not from
+the crate root, and its wire form was the `#[derive]` default — exact-case
+Rust variant names, the payload-carrying variant keyed on its own variant name
+(`{"DropBelowMin": 5}`) — rather than a shape suited to a hand-written
+configuration document.
+
+### Breaking
+
+- **`TailPolicy`'s serde wire form changes.** It was, since `TailPolicy` first
+  gained `Serialize`/`Deserialize` in `0.1.0`, the `#[derive]` default:
+  externally tagged, exact Rust-case variant names — `"KeepWithCoverage"`,
+  `{"DropBelowMin": 5}`, `"PadFull"`. It is now adjacently tagged and
+  `rename_all = "snake_case"`: `kind = "keep_with_coverage"`; `kind =
+  "drop_below_min"` with `value = 5`; `kind = "pad_full"`. A document written
+  against the old wire form does not deserialize against this one.
+  `WindowOptions`, which embeds `TailPolicy` in its `tail` field, carries the
+  same wire change; its own field names and `deny_unknown_fields` posture are
+  unchanged.
+
+  Internally tagged (`#[serde(tag = "kind")]` alone, no `content`) was
+  considered first, since it needs no second field for the common unit-variant
+  case, and rejected on evidence rather than preference: the internally tagged
+  representation covers only struct- and map-shaped payloads, and
+  `DropBelowMin`'s payload is a bare `usize`, neither. Serializing
+  `TailPolicy::DropBelowMin(_)` under `#[serde(tag = "kind")]` alone fails at
+  *run time* — `cargo build` and `cargo clippy` see nothing wrong — with
+  `cannot serialize tagged newtype variant TailPolicy::DropBelowMin containing
+  an integer`, reproduced against a throwaway probe crate before adjacent
+  tagging was chosen. Changing `DropBelowMin`'s shape from a tuple variant to a
+  struct variant (`DropBelowMin { min: usize }`) would have kept internal
+  tagging available, but that is a Rust API break this release does not make.
+
+### Added
+
+- **`TailPolicy` re-exported from the crate root** (`windit::TailPolicy`), so a
+  consumer configuring window geometry — or a document format like
+  `mediagraph`'s that persists a policy choice — no longer needs
+  `windit::plan::` or the prelude glob to name it.
+
 ## 0.3.0 - 2026-08-29
 
 One new smoother — the streaming sibling of an aggregation policy that already

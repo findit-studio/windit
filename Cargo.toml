@@ -1,6 +1,6 @@
 [package]
 name = "windit"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 repository = "https://github.com/findit-studio/windit"
 homepage = "https://github.com/findit-studio/windit"
@@ -87,6 +87,14 @@ criterion = "0.8"
 # A serde data format for the round-trip tests. `alloc`-only (no `std`) so the
 # tests exercise serde in the `no_std + alloc` configuration too.
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+# The document format `TailPolicy` is actually configured through (a TOML
+# options document, per the `mediagraph` node-options surface). `alloc`-only for
+# the same reason as `serde_json` above.
+toml = { version = "1", default-features = false, features = [
+  "parse",
+  "display",
+  "serde",
+] }
 
 [profile.bench]
 opt-level = 3
