@@ -249,21 +249,34 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 
 /// How the planner treats a final window that does not fill a whole [`Span`].
 ///
-/// With the `serde` feature this is adjacently tagged — `kind` names the
-/// variant, `value` carries [`DropBelowMin`](TailPolicy::DropBelowMin)'s
-/// minimum — rather than internally tagged: the internally tagged
-/// representation only covers struct- and map-shaped payloads, and a bare
-/// `usize` is neither, so `#[serde(tag = "kind")]` alone fails at
-/// serialization time for [`DropBelowMin`](TailPolicy::DropBelowMin) with
-/// "cannot serialize tagged newtype variant ... containing an integer". The
-/// adjacent `value` field sidesteps that: it holds whatever the variant
-/// carries with no merge into a shared map.
+/// With the `serde` feature this is **adjacently tagged**, in one shape for every
+/// format: `kind` names the variant and `value` carries
+/// [`DropBelowMin`](TailPolicy::DropBelowMin)'s minimum. Internal tagging
+/// (`#[serde(tag = "kind")]` with no `content`) was rejected: that representation
+/// covers only struct- and map-shaped payloads, and a bare `usize` is neither,
+/// so it fails at serialization time for
+/// [`DropBelowMin`](TailPolicy::DropBelowMin) with "cannot serialize tagged
+/// newtype variant ... containing an integer". The adjacent `value` field
+/// sidesteps that: it holds whatever the variant carries with no merge into a
+/// shared map.
+///
+/// A self-describing format writes the two as named fields —
+/// `{"kind":"drop_below_min","value":5}` — and a compact one writes the variant
+/// and then the payload, `[01, 05]` under postcard. `Deserialize` asks for a
+/// struct, which is what lets serde route each format to the road it belongs on:
+/// a self-describing format's map goes straight to serde's own derived
+/// adjacently tagged reader, so that grammar is `0.4.0`'s to the letter, and a
+/// compact format's sequence goes to a small reader written for it.
+///
+/// The derive alone could not serve both: an adjacent tag is deserialized by
+/// buffering the content, which asks for `deserialize_any`, and a format that
+/// does not describe itself cannot answer — postcard refuses it outright with
+/// `WontImplement`. Splitting on `is_human_readable` would not serve them
+/// either, since CBOR and MessagePack report `false` while writing the named
+/// fields. The struct request splits them where they actually differ: serde
+/// hands it to `visit_map` or `visit_seq` by what the format encodes, not by
+/// what it claims to be.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(
-  feature = "serde",
-  serde(rename_all = "snake_case", tag = "kind", content = "value")
-)]
 pub enum TailPolicy {
   /// Keep the ragged tail as a partial span; its [`Span::coverage`] is below
   /// `1.0`. This is the default.
@@ -271,12 +284,276 @@ pub enum TailPolicy {
   KeepWithCoverage,
   /// Drop a ragged tail whose real length is below the given minimum. A full
   /// window (`len == window`) is always kept.
+  ///
+  /// The `text` chunker `split::ContentAware::chunk` honours this variant too.
+  /// A chunk has no element count of its own, so "real length" there is the
+  /// chunk's measure in the caller's `MeasureText` units, and a chunk that
+  /// fills the window is kept exactly as a full span is.
   DropBelowMin(usize),
   /// Keep the ragged tail; pre-processing pads it to a full window. The produced
   /// span is identical to [`KeepWithCoverage`](TailPolicy::KeepWithCoverage);
   /// the two differ only in downstream padding and weighting intent.
+  ///
+  /// The padding is the element pipeline's: `pre::slice_pad_mask` pads a
+  /// fixed-width `Copy` element into a `window`-length buffer. Text has no such
+  /// primitive — a chunk is a byte range over the caller's own `&str`, and
+  /// there is no neutral text to append that the caller's measurer would count
+  /// as padding — so the `text` chunker `split::ContentAware::chunk` keeps the
+  /// tail unpadded here, indistinguishably from
+  /// [`KeepWithCoverage`](TailPolicy::KeepWithCoverage). That is a named gap
+  /// rather than an oversight: inventing characters to pad with would move the
+  /// very boundaries the measurer chose.
   PadFull,
 }
+
+// `TailPolicy`'s wire form has exactly one declaration. The `wire_tail_policy!`
+// invocation below lists the variants, their wire names, and their payloads
+// once, and everything the wire needs is generated from that list: the derived
+// adjacently tagged twin that writes and reads the map form, the tag-only twin
+// the sequence form resolves against, the type identity, the field names, the
+// variant roster, and the sequence reader's arms. Nothing about the wire can be
+// respelled in one place and not another, because there is only one place.
+//
+// The two `From` conversions between the public enum and its twin stay
+// hand-written: they are what the compiler checks for payload-shape drift, and a
+// variant added to either side stops the build in them.
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+const _: () = {
+  use core::fmt;
+
+  use serde::{
+    de::{value::MapAccessDeserializer, Error as _, Expected, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+  };
+
+  /// Declare the wire form once.
+  ///
+  /// `tag` and `content` name the two fields; each variant line gives its Rust
+  /// name, its payload if it has one, and the name it travels under. From that:
+  ///
+  /// - `wire::TailPolicy`, the derived adjacently tagged twin. It is *named*
+  ///   `TailPolicy`, not renamed to it, because serde passes a type's Rust
+  ///   identifier — not its `#[serde(rename)]` — as the enum name in the nested
+  ///   `deserialize_enum` an adjacent tag seed makes, so a renamed twin answers
+  ///   under two identities at once.
+  /// - `wire::tag::TailPolicy`, the same variants without their payloads, named
+  ///   the same way and for the same reason. The sequence reader resolves its tag
+  ///   by deserializing this, so the tag's names and ordinals are the derive's,
+  ///   never a second table.
+  /// - `wire::NAME`, `wire::FIELDS` and `wire::VARIANTS`, each from the same
+  ///   tokens the derives were given.
+  /// - `from_tag`, the sequence reader's arms: one per variant, reading the
+  ///   payload the variant declares and no other.
+  macro_rules! wire_tail_policy {
+    (
+      tag: $tag:literal, content: $content:literal;
+      $( $variant:ident $( ( $payload:ty ) )? => $name:literal ),+ $(,)?
+    ) => {
+      mod wire {
+        use serde::{Deserialize, Serialize};
+
+        /// The adjacently tagged document, derived.
+        #[derive(Clone, Copy, Deserialize, Serialize)]
+        #[serde(tag = $tag, content = $content)]
+        pub(super) enum TailPolicy {
+          $( #[serde(rename = $name)] $variant $( ( $payload ) )?, )+
+        }
+
+        /// The `kind` alone, for the reader that has to resolve a tag before it
+        /// knows what payload to ask for.
+        pub(super) mod tag {
+          use serde::Deserialize;
+
+          #[derive(Clone, Copy, Deserialize)]
+          pub enum TailPolicy {
+            $( #[serde(rename = $name)] $variant, )+
+          }
+        }
+
+        /// The type identity, from the same token the types above are named by.
+        pub(super) const NAME: &str = stringify!(TailPolicy);
+        /// The two field names, from the same tokens the derive was given.
+        pub(super) const FIELDS: &[&str] = &[$tag, $content];
+        /// The variant roster in wire order, from the same names.
+        pub(super) const VARIANTS: &[&str] = &[$( $name ),+];
+      }
+
+      /// The policy a resolved tag names, with its payload read from `seq`.
+      ///
+      /// Exhaustive over the tag twin, and each arm reads exactly what its
+      /// variant declares — so a variant cannot be added, renamed, or given a
+      /// payload without this following it.
+      fn from_tag<'de, A: SeqAccess<'de>>(
+        tag: wire::tag::TailPolicy,
+        seq: &mut A,
+        expected: &dyn Expected,
+      ) -> Result<TailPolicy, A::Error> {
+        Ok(match tag {
+          $(
+            wire::tag::TailPolicy::$variant =>
+              wire_tail_policy!(@element $variant $( ( $payload ) )?, seq, expected),
+          )+
+        })
+      }
+    };
+
+    // A variant with a payload: the element after the tag is that payload, and
+    // it is required.
+    (@element $variant:ident ( $payload:ty ), $seq:expr, $expected:expr) => {
+      TailPolicy::$variant(
+        $seq
+          .next_element::<$payload>()?
+          .ok_or_else(|| serde::de::Error::invalid_length(1, $expected))?,
+      )
+    };
+
+    // A payload-free variant: it is *written* as a one-field struct, so a
+    // compact format leaves nothing after the tag and asking unconditionally
+    // would read into whatever follows in the buffer. The derived reader always
+    // consumed one element and accepted a unit there, so a sequence that does
+    // carry the trailing unit keeps parsing. The element is optional; present,
+    // it must be the unit.
+    (@element $variant:ident, $seq:expr, $expected:expr) => {{
+      let _ = $expected;
+      $seq.next_element::<NoContent>()?;
+      TailPolicy::$variant
+    }};
+  }
+
+  wire_tail_policy! {
+    tag: "kind", content: "value";
+    KeepWithCoverage => "keep_with_coverage",
+    DropBelowMin(usize) => "drop_below_min",
+    PadFull => "pad_full",
+  }
+
+  /// Into the wire form. Exhaustive over [`TailPolicy`]: a variant added to the
+  /// public enum stops the build here until the wire form can express it.
+  impl From<TailPolicy> for wire::TailPolicy {
+    fn from(policy: TailPolicy) -> Self {
+      match policy {
+        TailPolicy::KeepWithCoverage => Self::KeepWithCoverage,
+        TailPolicy::DropBelowMin(min) => Self::DropBelowMin(min),
+        TailPolicy::PadFull => Self::PadFull,
+      }
+    }
+  }
+
+  /// Out of it. Exhaustive over the wire form, which closes the other direction:
+  /// between the two, neither enum can gain a variant the other cannot carry,
+  /// nor change a payload's shape alone.
+  impl From<wire::TailPolicy> for TailPolicy {
+    fn from(policy: wire::TailPolicy) -> Self {
+      match policy {
+        wire::TailPolicy::KeepWithCoverage => Self::KeepWithCoverage,
+        wire::TailPolicy::DropBelowMin(min) => Self::DropBelowMin(min),
+        wire::TailPolicy::PadFull => Self::PadFull,
+      }
+    }
+  }
+
+  impl Serialize for TailPolicy {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+      // The derive writes the document, so it is `0.4.0`'s document — the same
+      // code that wrote it then, reached through a conversion the compiler
+      // checks. Nothing here decides a field count, a tag, or a name.
+      wire::TailPolicy::from(*self).serialize(serializer)
+    }
+  }
+
+  /// The content element a payload-free variant may carry in a sequence.
+  ///
+  /// Deserializing through `deserialize_unit` is what keeps it free on a compact
+  /// format — a unit is zero bytes in postcard, so a present-but-empty slot
+  /// costs no read — while still refusing a real value, and the visitor's
+  /// `expecting` is what names the refusal.
+  struct NoContent;
+
+  struct NoContentVisitor;
+
+  impl Visitor<'_> for NoContentVisitor {
+    type Value = NoContent;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(
+        f,
+        "no `{}`, which `drop_below_min` alone carries",
+        wire::FIELDS[1]
+      )
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<NoContent, E> {
+      Ok(NoContent)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<NoContent, E> {
+      Ok(NoContent)
+    }
+  }
+
+  impl<'de> Deserialize<'de> for NoContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      deserializer.deserialize_unit(NoContentVisitor)
+    }
+  }
+
+  struct TailPolicyVisitor;
+
+  impl<'de> Visitor<'de> for TailPolicyVisitor {
+    type Value = TailPolicy;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(
+        f,
+        "a tail policy: `{}` naming one of {:?}, with `{}` carrying `drop_below_min`'s minimum",
+        wire::FIELDS[0],
+        wire::VARIANTS,
+        wire::FIELDS[1]
+      )
+    }
+
+    /// The shape a self-describing format hands over — JSON and TOML, and the
+    /// binary ones that report `is_human_readable() == false` while still naming
+    /// their fields, CBOR and MessagePack among them.
+    ///
+    /// The map is handed whole to the wire enum's derived reader, so every
+    /// question this road raises — whether the content precedes the tag and must
+    /// be buffered, what type to ask the format for once the tag is known,
+    /// whether a key arrived as text or as bytes, what to do with an entry that
+    /// is neither field, and what each failure says — is answered exactly as
+    /// `0.4.0` answered it, because it is the same code.
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
+      wire::TailPolicy::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+    }
+
+    /// The shape a format that encodes a struct as a sequence hands over: the
+    /// tag, then the content the tag calls for.
+    ///
+    /// The derive cannot serve this road — it reads an adjacent tag by buffering
+    /// the content, which asks for `deserialize_any`, and postcard answers
+    /// `WontImplement` — so the tag is resolved by deserializing the tag twin,
+    /// whose names and ordinals are the derive's own, and `from_tag` reads what
+    /// the resolved variant declares.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<TailPolicy, A::Error> {
+      let tag = seq
+        .next_element::<wire::tag::TailPolicy>()?
+        .ok_or_else(|| A::Error::invalid_length(0, &self))?;
+      from_tag(tag, &mut seq, &self)
+    }
+  }
+
+  impl<'de> Deserialize<'de> for TailPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      // Asking for the adjacent shape itself, rather than for whatever the value
+      // happens to be, is what keeps this readable by a format that cannot
+      // answer `deserialize_any` — and serde routes the request to `visit_seq`
+      // or `visit_map` by what the format encodes a struct as, which is the line
+      // the wire actually splits on.
+      deserializer.deserialize_struct(wire::NAME, wire::FIELDS, TailPolicyVisitor)
+    }
+  }
+};
 
 /// Fully configurable window geometry: window size, hop/overlap, tail handling,
 /// and an optional cap on the number of windows.

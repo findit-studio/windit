@@ -6,6 +6,124 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+`TailPolicy` reaches the compact formats, and the text chunker starts obeying it.
+Two defects of one shape — a policy declared and then not honoured: once by a
+wire form that could write the value but never read it back, once by a chunker
+that read every other field of the geometry and skipped `tail`.
+
+### Breaking
+
+- **`ContentAware::chunk` now honours `TailPolicy::DropBelowMin`.** It read
+  `WindowOptions`' window, hop, and cap and never `tail()`, so a caller who
+  configured a minimum got the ragged final chunk anyway — the same
+  configuration `FixedWindow`, through `WindowPlan::spans`, has honoured since
+  `0.1.0`. The final chunk is now judged by the exact rule spans use — keep when
+  the length is at least the minimum **or** equal to the window — stated in the
+  caller's `MeasureText` units, since a chunk has no element count. The
+  comparison against the window is load-bearing rather than defensive: a lone
+  `char` that alone exceeds the window is emitted as-is, so a final chunk can
+  measure *more* than the window, and a rule shortened to "did the measure reach
+  the limit" would keep a 6-measure tail under a minimum of 7. The consequence
+  `WindowPlan::spans` already documented follows here too: **a non-empty input
+  can now yield no chunks at all**, when its only chunk is that short one. A
+  caller who wants every chunk regardless should leave the tail at its default,
+  `TailPolicy::KeepWithCoverage`; nothing changes there, nor under the default
+  geometry, which is what `WindowOptions::new` produces.
+
+  The policy governs the *tail*, not every short chunk: an interior chunk that a
+  sentence boundary leaves below the minimum is not its business. A dropped tail
+  is also not counted against `WindowOptions::max_windows`, matching
+  `WindowPlan::spans`, which caps only the spans it kept.
+
+  `TailPolicy::PadFull` is a **named gap** in the chunker rather than a silent
+  one: it keeps the tail, indistinguishably from `KeepWithCoverage`. The padding
+  that variant names belongs to the element pipeline, where `pre::slice_pad_mask`
+  pads fixed-width `Copy` elements into a full window; text has no counterpart to
+  it, since a chunk is a byte range over the caller's own `&str` and inventing
+  characters to pad it would move the very boundaries the measurer chose. Both
+  the variant and `ContentAware::chunk` say so in their documentation.
+
+### Fixed
+
+- **`TailPolicy` deserializes from compact, non-self-describing formats again.**
+  `postcard::to_allocvec` wrote a `TailPolicy` happily and `postcard::from_bytes`
+  then failed for **every** variant with `WontImplement`: the adjacently tagged
+  representation `0.4.0` introduced buffers the tagged content and so asks for
+  `deserialize_any`, which a format that does not describe itself cannot answer.
+  The derived, externally tagged form `0.3.0` shipped had round-tripped through
+  such a format, so this is a `0.4.0` regression, and it made a `WindowOptions`
+  persisted through one write-only from that release on.
+
+  `Deserialize` now asks for the adjacent shape *itself* — `deserialize_struct`
+  with a visitor implementing both `visit_map` and `visit_seq` — rather than for
+  whatever the value happens to be. That removes the `deserialize_any`
+  requirement, because serde hands a struct to one visitor method or the other by
+  what the format encodes.
+
+  **The wire form has one definition, and writing is not reimplemented either.**
+  A private module holds a derived, adjacently tagged twin of the enum, carrying
+  exactly the attributes `TailPolicy` bore in `0.4.0`; `Serialize` converts into
+  it and lets the derive write the document, and `visit_map` hands the whole map
+  to the derive to read one. Every question those roads raise — the field count,
+  the tag, whether the content precedes it and must be buffered, what type to ask
+  the format for once the tag is known, whether a key arrived as text or as
+  bytes, what to do with an entry that is neither field, and what each failure
+  says — is therefore answered by the same code as before, by construction rather
+  than by enumeration. Only the sequence road, which the derive cannot serve, is
+  written here: the tag, then the payload the tag calls for, with an optional
+  trailing unit for a payload-free variant.
+
+  The wire is *declared* once — variant names, payloads, and the two field names
+  in a single macro invocation — and everything it needs is generated from that
+  declaration: the twin, a tag-only twin the sequence road resolves against, the
+  type identity, the field names, the variant roster, and the sequence reader's
+  arms. Names and ordinals therefore cannot change independently, and the
+  sequence road no longer keeps a schema of its own beside the derive's.
+
+  Both twins live in modules so that their *Rust identifier* can be `TailPolicy`,
+  which is load-bearing rather than tidy: serde passes a type's identifier — not
+  its `#[serde(rename)]` — as the enum name in the nested `deserialize_enum` its
+  adjacent tag seed makes, while the surrounding `deserialize_struct` does use
+  the rename. A renamed helper therefore answers under two identities at once,
+  which no format available here would have revealed. Two exhaustive `From`
+  conversions bracket the twin, so neither enum can gain a variant the other
+  cannot carry or change a payload's shape alone, and the identity is pinned in
+  both directions by tests that *are* the serializer and the deserializer.
+
+  **Branching the reader on `is_human_readable` would not have been enough**, and
+  is not what shipped: CBOR and MessagePack report `false` while writing `kind`
+  and `value` by name, so that flag does not divide formats along the line the
+  wire splits on, and routing them to an externally tagged shape would have
+  broken CBOR documents that the derived reader had read fine. The CBOR round
+  trip is now a test.
+
+  **The document is unchanged, byte for byte** — `{"kind":"drop_below_min",
+  "value":5}`; `kind = "drop_below_min"` with `value = 5`; `[01, 05]` under
+  postcard — and all three are pinned, read back from those literals rather than
+  only from what the serializer had just produced.
+
+  **What the reader accepts is unchanged too, and that is what the delegation
+  buys.** `TailPolicy` never carried `deny_unknown_fields`, so a map entry that
+  is neither the tag nor the content is skipped rather than refused, and a field
+  name handed over as bytes — a CBOR map with byte-string keys — is recognised.
+  A document whose `value` precedes its `kind` is buffered and re-read, and one
+  whose `kind` comes first has its minimum asked for as a `usize`, never as an
+  option: a format is free to require `Some(..)`/`None` syntax for one, and
+  default RON does, so asking would have rejected this crate's own output.
+  (`WindowOptions` does deny unknown fields; that posture is its own and is
+  unchanged.) In sequence form the derived reader always consumed a second
+  element and accepted a unit there, while a payload-free variant is *written* as
+  a one-element sequence — so both `["pad_full"]` and `["pad_full", null]` are
+  read, and a real value in that slot is still refused by name. Key order, both
+  key encodings, a missing or surplus `value`, a duplicate key and an unknown
+  variant are all pinned.
+
+  That includes the identities serde is asked for, which no format here keeps and
+  a schema-aware one does: the document is a `TailPolicy` and the tag is a
+  `TailPolicy` variant at its old index and name, on the way out and on the way
+  in alike. Tests record what a `Serializer` is asked to write and what a
+  `Deserializer` is asked for, since no round trip can see either.
+
 ## 0.4.0
 
 `plan::TailPolicy` becomes a document citizen. `mediagraph`'s `text::embeddings`

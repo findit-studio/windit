@@ -1,6 +1,6 @@
 [package]
 name = "windit"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 repository = "https://github.com/findit-studio/windit"
 homepage = "https://github.com/findit-studio/windit"
@@ -95,6 +95,17 @@ toml = { version = "1", default-features = false, features = [
   "display",
   "serde",
 ] }
+# A compact, non-self-describing format, for the half of `TailPolicy`'s wire
+# split that no human-readable format can exercise. `alloc`-only (no `std`) for
+# the same reason as `serde_json` above; postcard's `alloc` feature is what
+# supplies `to_allocvec`.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# A *self-describing* binary format: it reports `is_human_readable() == false`
+# yet writes `TailPolicy`'s two fields by name, so it is the row that separates
+# "not human-readable" from "not self-describing" — the distinction the wire
+# split turns on. `default-features = false` drops its `std` default, matching
+# the dev-dependencies above.
+ciborium = { version = "0.2", default-features = false }
 
 [profile.bench]
 opt-level = 3

@@ -155,6 +155,8 @@ const _: () = {
   use std::collections::VecDeque;
   use unicode_segmentation::{USentenceBoundIndices, UnicodeSegmentation, UnicodeWordIndices};
 
+  use crate::plan::TailPolicy;
+
   /// The paragraph separator the coarsest boundary level splits on.
   const PARAGRAPH_SEPARATOR: &str = "\n\n";
 
@@ -265,6 +267,24 @@ const _: () = {
     /// Chunks cover the tokenized content in order; inter-token whitespace
     /// falls inside a chunk's range but is never a chunk of its own. An empty
     /// or whitespace-only input yields no chunks.
+    ///
+    /// The last chunk answers to [`WindowOptions::tail`], the policy
+    /// [`WindowPlan::spans`] applies to a ragged final span — stated here in the
+    /// measurer's units, since a chunk has no element count.
+    /// [`DropBelowMin`](crate::plan::TailPolicy::DropBelowMin) drops a final
+    /// chunk measuring below its minimum, and as in
+    /// [`WindowPlan::spans`] that leaves a non-empty input able to yield no
+    /// chunks at all, when the only chunk is that short one. A final chunk that
+    /// measures a whole window is kept whatever the minimum says.
+    /// [`KeepWithCoverage`](crate::plan::TailPolicy::KeepWithCoverage) keeps it,
+    /// and so — today — does
+    /// [`PadFull`](crate::plan::TailPolicy::PadFull): the padding that variant
+    /// names belongs to the element pipeline, where
+    /// [`slice_pad_mask`](crate::pre::slice_pad_mask) pads fixed-width `Copy`
+    /// elements into a full window, and text has no counterpart to it. Rather
+    /// than invent characters — which would move the very boundaries the
+    /// measurer chose — `PadFull` is a named gap here and behaves as
+    /// `KeepWithCoverage`.
     ///
     /// Every returned chunk measures at most the window, with a single
     /// exception: a lone `char` whose own measure exceeds the window is
@@ -706,6 +726,43 @@ const _: () = {
     Ok(())
   }
 
+  /// Whether the packing's final chunk survives `opts.tail()`.
+  ///
+  /// The chunker's counterpart to the `keep` test in `WindowPlan::spans`, and
+  /// deliberately the same rule — keep when `len >= minimum || len == window`.
+  /// Only the unit differs: a [`Chunk`] carries no element count, so its length
+  /// here is its measure under the caller's [`MeasureText`], the same units the
+  /// window itself is in. A span knows its length for nothing; a chunk must be
+  /// measured for it, so this costs one measurement of the final chunk, bounded
+  /// by the minimum the caller named rather than by the window.
+  ///
+  /// One [`MeasureText::measure_within`] decides it, bounded by the minimum the
+  /// caller named: `None` means the measure ran past `minimum - 1`, which is
+  /// `len >= minimum`, and `Some(len)` gives the measure outright, leaving only
+  /// a chunk that fills the window to survive. Unlike the span rule this cannot
+  /// be shortened to "did it reach the limit": a chunk can be *wider* than the
+  /// window — a lone `char` that alone exceeds it is emitted as-is — so a
+  /// measure of 6 against a window of 4 and a minimum of 7 must drop, and only
+  /// comparing the measure against the window says so.
+  ///
+  /// [`TailPolicy::PadFull`] keeps the tail here, indistinguishably from
+  /// [`TailPolicy::KeepWithCoverage`]; the variant's own documentation carries
+  /// why text has no padding to apply.
+  fn keep_tail(text: &str, chunk: Chunk, opts: &WindowOptions, measurer: &dyn MeasureText) -> bool {
+    let TailPolicy::DropBelowMin(min) = *opts.tail() else {
+      return true;
+    };
+    // A minimum of zero is below nothing, and is also the one value the query
+    // limit cannot be formed from.
+    let Some(limit) = min.checked_sub(1) else {
+      return true;
+    };
+    match measurer.measure_within(&text[chunk.start()..chunk.end()], limit) {
+      None => true,
+      Some(len) => len == opts.window(),
+    }
+  }
+
   /// Greedily pack `text`'s atoms into chunks no longer than the window,
   /// repeating at most `opts.overlap()` tokens' worth of trailing whole atoms
   /// between consecutive chunks (the overlap is a token budget measured over the
@@ -764,7 +821,16 @@ const _: () = {
         chunk_end = candidate_end;
         j += 1;
       };
-      try_push(&mut chunks, Chunk::new(chunk_start, chunk_end))?;
+      // The tail policy governs the final chunk, and `exhausted` is what names
+      // it: the loop closes a chunk early only when an atom did not fit, and
+      // that atom then opens the next one, so the pass that ran the atoms out is
+      // the pass that built the last chunk. Deciding before the push rather than
+      // popping after it is what keeps a dropped tail out of the `max_windows`
+      // tally too — `WindowPlan::spans` likewise counts only the spans it kept.
+      let chunk = Chunk::new(chunk_start, chunk_end);
+      if !exhausted || keep_tail(text, chunk, opts, measurer) {
+        try_push(&mut chunks, chunk)?;
+      }
       if let Some(max) = opts.max_windows() {
         if chunks.len() > max {
           return Err(WinditError::TooManyWindows {

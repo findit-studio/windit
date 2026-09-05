@@ -29,7 +29,10 @@ mod content_aware {
   use std::string::String;
 
   use super::super::{Chunk, ContentAware, MeasureText};
-  use crate::{plan::WindowOptions, WinditError};
+  use crate::{
+    plan::{TailPolicy, WindowOptions},
+    WinditError,
+  };
 
   /// The mock tokenizer: whitespace-delimited word count.
   fn word_count(s: &str) -> usize {
@@ -558,5 +561,212 @@ mod content_aware {
       .chunk("   \n\n  ", &WindowOptions::new(5))
       .unwrap()
       .is_empty());
+  }
+
+  #[test]
+  fn drop_below_min_drops_the_short_final_chunk() {
+    // 9 single-token words at window 4 pack as 4, 4, 1 — a final chunk one word
+    // long, below a minimum of 2. The same geometry `WindowPlan::spans` drops a
+    // len-1 tail span at, now measured in the chunker's units.
+    let text = "a b c d e f g h i";
+    let len_fn: &dyn MeasureText = &word_count;
+    let chunker = ContentAware::new(len_fn);
+
+    let kept = chunker
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::KeepWithCoverage),
+      )
+      .unwrap();
+    let slices: std::vec::Vec<&str> = kept.iter().map(|c| c.as_str(text).unwrap()).collect();
+    assert_eq!(slices, std::vec!["a b c d", "e f g h", "i"]);
+
+    let dropped = chunker
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(2)),
+      )
+      .unwrap();
+    assert_eq!(dropped.as_slice(), &kept[..2]);
+
+    // `PadFull` is a named gap in the chunker: there is no text padding
+    // primitive, so it keeps the tail exactly as `KeepWithCoverage` does. This
+    // pins that documented behaviour rather than assuming it.
+    let padded = chunker
+      .chunk(text, &WindowOptions::new(4).with_tail(TailPolicy::PadFull))
+      .unwrap();
+    assert_eq!(padded, kept);
+  }
+
+  #[test]
+  fn drop_below_min_keeps_a_final_chunk_that_fills_the_window() {
+    // The other half of the rule `WindowPlan::spans` states: a tail that fills
+    // the window is kept whatever the minimum is. 8 words at window 4 pack as
+    // 4, 4, so the final chunk measures a full window under a minimum of 6.
+    let text = "a b c d e f g h";
+    let len_fn: &dyn MeasureText = &word_count;
+    let chunker = ContentAware::new(len_fn);
+
+    let chunks = chunker
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(6)),
+      )
+      .unwrap();
+    let slices: std::vec::Vec<&str> = chunks.iter().map(|c| c.as_str(text).unwrap()).collect();
+    assert_eq!(slices, std::vec!["a b c d", "e f g h"]);
+  }
+
+  #[test]
+  fn drop_below_min_can_empty_a_non_empty_input() {
+    // The documented consequence, and the one that surprises: the sole chunk of
+    // a short input is also its tail, so a minimum above it leaves nothing —
+    // exactly as `WindowPlan::spans` can return an empty plan for a non-empty
+    // input.
+    let text = "a b";
+    let len_fn: &dyn MeasureText = &word_count;
+    let chunks = ContentAware::new(len_fn)
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(3)),
+      )
+      .unwrap();
+    assert!(chunks.is_empty());
+
+    // A minimum of zero is below nothing and drops nothing, the boundary the
+    // limit arithmetic has to survive.
+    let chunks = ContentAware::new(len_fn)
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(0)),
+      )
+      .unwrap();
+    assert_eq!(chunks.len(), 1);
+  }
+
+  #[test]
+  fn drop_below_min_judges_an_oversized_final_chunk_by_the_exact_rule() {
+    // The case a "did the measure reach the limit" shortcut gets wrong. A lone
+    // `char` that alone exceeds the window is emitted as-is — the documented
+    // exception to the window guarantee — so a final chunk can measure MORE than
+    // the window, and `len >= minimum || len == window` is then neither
+    // trivially true nor implied by the measure passing any window-sized bound.
+    let text = "ab";
+    let len3 = |s: &str| s.chars().count() * 3; // each char measures 3
+    let len_fn: &dyn MeasureText = &len3;
+    let chunker = ContentAware::new(len_fn);
+
+    // Window 2, so each 3-measure char is its own oversized chunk; the tail
+    // measures 3.
+    let base = WindowOptions::new(2);
+    assert_eq!(chunker.chunk(text, &base).unwrap().len(), 2);
+
+    // 3 >= 4 is false and 3 == 2 is false, so the oversized tail must go.
+    let dropped = chunker
+      .chunk(text, &base.with_tail(TailPolicy::DropBelowMin(4)))
+      .unwrap();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].as_str(text).unwrap(), "a");
+
+    // 3 >= 3 is true, so at the minimum it measures it stays.
+    assert_eq!(
+      chunker
+        .chunk(text, &base.with_tail(TailPolicy::DropBelowMin(3)))
+        .unwrap()
+        .len(),
+      2
+    );
+  }
+
+  #[test]
+  fn drop_below_min_keeps_a_full_window_under_a_minimum_above_it() {
+    // The other arm of the exact rule, where the measure is known and below the
+    // minimum yet the chunk still survives because it fills the window. 8 words
+    // at window 4 pack as 4, 4 under a minimum of 7: the measured tail is 4,
+    // `4 >= 7` is false, `4 == 4` is true.
+    let text = "a b c d e f g h";
+    let len_fn: &dyn MeasureText = &word_count;
+    assert_eq!(
+      ContentAware::new(len_fn)
+        .chunk(
+          text,
+          &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(7))
+        )
+        .unwrap()
+        .len(),
+      2
+    );
+
+    // And a short tail under the same minimum still goes: 9 words pack as
+    // 4, 4, 1, and `1 >= 7 || 1 == 4` is false.
+    assert_eq!(
+      ContentAware::new(len_fn)
+        .chunk(
+          "a b c d e f g h i",
+          &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(7))
+        )
+        .unwrap()
+        .len(),
+      2
+    );
+  }
+
+  #[test]
+  fn drop_below_min_leaves_earlier_chunks_and_the_cap_alone() {
+    // The policy is the *tail's*: an interior chunk shorter than the minimum —
+    // here the 1-word chunk a sentence boundary forces in the middle — is not
+    // its business. And a dropped tail is not counted against `max_windows`,
+    // matching `WindowPlan::spans`, which caps only the spans it kept.
+    //
+    // The sentences start with capitals deliberately: UAX #29 suppresses a
+    // sentence break after a period followed by a *lowercase* word (the
+    // abbreviation rule), so an all-lowercase fixture would be one sentence and
+    // pack as plain words with no short interior chunk at all.
+    let text = "A b c d. E. F g h i. J";
+    let len_fn: &dyn MeasureText = &word_count;
+    let chunker = ContentAware::new(len_fn);
+    let opts = WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(2));
+
+    let chunks = chunker.chunk(text, &opts).unwrap();
+    let counts: std::vec::Vec<usize> = chunks
+      .iter()
+      .map(|c| word_count(c.as_str(text).unwrap()))
+      .collect();
+    // The interior 1-word chunk `E.` survives at index 1 — below the minimum,
+    // but not the tail — while the 1-word tail `J` is gone.
+    assert_eq!(counts, std::vec![4, 1, 4]);
+    assert!(chunks[1].as_str(text).unwrap().contains('E'));
+    assert!(!chunks[2].as_str(text).unwrap().contains('J'));
+
+    // Three chunks survive; a cap of three therefore holds, though four chunks
+    // were built.
+    assert_eq!(
+      chunker
+        .chunk(text, &opts.with_max_windows(3))
+        .unwrap()
+        .len(),
+      3
+    );
+    assert!(matches!(
+      chunker.chunk(text, &opts.with_max_windows(2)),
+      Err(WinditError::TooManyWindows { got: 3, max: 2 })
+    ));
+  }
+
+  #[test]
+  fn a_measurer_that_stops_early_still_decides_the_tail() {
+    // `keep_tail` asks `measure_within` with a limit below the window, so a
+    // measurer that stops early answers it without reading the whole chunk. The
+    // decision must be the one a full measure would give.
+    let text = "a b c d e f g h i";
+    let meter = Meter::words(text);
+    let chunks = ContentAware::new(&meter)
+      .chunk(
+        text,
+        &WindowOptions::new(4).with_tail(TailPolicy::DropBelowMin(2)),
+      )
+      .unwrap();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks.last().unwrap().end(), text.find(" i").unwrap());
   }
 }
