@@ -23,6 +23,9 @@
 //! matrix still builds. (The `Segmenter` itself is featureless; this suite gates
 //! only because it compares against the `alloc`-tier `runs`.)
 #![cfg(any(feature = "std", feature = "alloc"))]
+// Coverage instrumentation allocates inside the guarded window; the sanitizer
+// and plain lanes already cover this guard, so it steps aside under tarpaulin.
+#![cfg(not(tarpaulin))]
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
