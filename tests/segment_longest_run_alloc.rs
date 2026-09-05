@@ -18,6 +18,9 @@
 //! compiles to an empty test binary without it so the rest of the feature matrix
 //! still builds.
 #![cfg(any(feature = "std", feature = "alloc"))]
+// Coverage instrumentation allocates inside the guarded window; the sanitizer
+// and plain lanes already cover this guard, so it steps aside under tarpaulin.
+#![cfg(not(tarpaulin))]
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},

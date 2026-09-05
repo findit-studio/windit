@@ -15,6 +15,9 @@
 //! Gated on `text`: without it there is no chunker, and the file compiles to an
 //! empty test binary so the rest of the feature matrix still builds.
 #![cfg(feature = "text")]
+// Coverage instrumentation allocates inside the guarded window; the sanitizer
+// and plain lanes already cover this guard, so it steps aside under tarpaulin.
+#![cfg(not(tarpaulin))]
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},

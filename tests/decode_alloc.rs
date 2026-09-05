@@ -26,6 +26,9 @@
 //! still builds. (The `Decoder` itself is featureless; this suite gates only
 //! because it compares against the `alloc`-tier batch composition.)
 #![cfg(any(feature = "std", feature = "alloc"))]
+// Coverage instrumentation allocates inside the guarded window; the sanitizer
+// and plain lanes already cover this guard, so it steps aside under tarpaulin.
+#![cfg(not(tarpaulin))]
 
 use core::mem::{align_of, size_of};
 use std::{
