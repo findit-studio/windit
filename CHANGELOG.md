@@ -6,6 +6,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-05
+
 `TailPolicy` reaches the compact formats, and the text chunker starts obeying it.
 Two defects of one shape — a policy declared and then not honoured: once by a
 wire form that could write the value but never read it back, once by a chunker
