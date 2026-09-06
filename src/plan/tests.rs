@@ -1469,3 +1469,44 @@ fn tail_policy_round_trips_as_a_window_options_document_field() {
   let doc = toml::to_string(&opts).unwrap();
   assert_eq!(toml::from_str::<WindowOptions>(&doc).unwrap(), opts);
 }
+
+#[test]
+fn tail_policy_display_is_pinned() {
+  // The exact strings a downstream derivation fingerprint persists —
+  // changing any one of them is a breaking change, not a patch.
+  assert_eq!(
+    TailPolicy::KeepWithCoverage.to_string(),
+    "keep_with_coverage"
+  );
+  assert_eq!(TailPolicy::DropBelowMin(3).to_string(), "drop_below_min(3)");
+  assert_eq!(TailPolicy::DropBelowMin(0).to_string(), "drop_below_min(0)");
+  assert_eq!(TailPolicy::PadFull.to_string(), "pad_full");
+}
+
+#[test]
+fn window_options_display_is_pinned() {
+  // The motivating example: `window`, `hop`, and a `DropBelowMin` tail nested
+  // through its own `Display` — the fingerprint is the document spelling, so
+  // `hop` prints under its own field name.
+  let opts = WindowOptions::new(512)
+    .with_hop(256)
+    .with_tail(TailPolicy::DropBelowMin(3));
+  assert_eq!(
+    opts.to_string(),
+    "window=512,hop=256,tail=drop_below_min(3),max_windows=none"
+  );
+
+  // The default geometry (`hop == window`, `KeepWithCoverage`, no cap): all
+  // four segments still appear, `max_windows` folding to `none`.
+  assert_eq!(
+    WindowOptions::new(4).to_string(),
+    "window=4,hop=4,tail=keep_with_coverage,max_windows=none"
+  );
+
+  // A configured cap prints its value in place of `none`, in the same
+  // position.
+  assert_eq!(
+    WindowOptions::new(4).with_max_windows(8).to_string(),
+    "window=4,hop=4,tail=keep_with_coverage,max_windows=8"
+  );
+}
