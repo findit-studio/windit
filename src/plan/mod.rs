@@ -306,6 +306,24 @@ pub enum TailPolicy {
   PadFull,
 }
 
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a breaking bump.**
+///
+/// Unit variants print their snake_case name — `keep_with_coverage`,
+/// `pad_full` — and [`DropBelowMin`](TailPolicy::DropBelowMin) prints
+/// `drop_below_min(<min>)`, its minimum through `usize`'s own `Display`. These
+/// are the same three names the `serde` wire form tags each variant with (see
+/// below): one vocabulary, not two.
+impl core::fmt::Display for TailPolicy {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self {
+      Self::KeepWithCoverage => f.write_str("keep_with_coverage"),
+      Self::DropBelowMin(min) => write!(f, "drop_below_min({min})"),
+      Self::PadFull => f.write_str("pad_full"),
+    }
+  }
+}
+
 // `TailPolicy`'s wire form has exactly one declaration. The `wire_tail_policy!`
 // invocation below lists the variants, their wire names, and their payloads
 // once, and everything the wire needs is generated from that list: the derived
@@ -683,6 +701,36 @@ impl WindowOptions {
       });
     }
     Ok(())
+  }
+}
+
+/// **This spelling is persisted by downstream derivation fingerprints — change
+/// it only with a breaking bump.**
+///
+/// `key=value` pairs in declaration order, joined by `,`, one key per document
+/// field — the fingerprint is the document spelling, so a field with no serde
+/// rename (every field here) prints under its own name: `window`, `hop`,
+/// `tail` (nesting [`TailPolicy`]'s own `Display`), and `max_windows`. All four
+/// always appear; `max_windows` prints `none` when absent rather than omitting
+/// the segment (the identity-fold law: `Option` folds to `none`, never to a
+/// gap).
+///
+/// For example, `WindowOptions::new(512).with_hop(256)
+/// .with_tail(TailPolicy::DropBelowMin(3))` prints
+/// `window=512,hop=256,tail=drop_below_min(3),max_windows=none`.
+impl core::fmt::Display for WindowOptions {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    let Self {
+      window,
+      hop,
+      tail,
+      max_windows,
+    } = *self;
+    write!(f, "window={window},hop={hop},tail={tail},max_windows=")?;
+    match max_windows {
+      Some(max_windows) => write!(f, "{max_windows}"),
+      None => f.write_str("none"),
+    }
   }
 }
 

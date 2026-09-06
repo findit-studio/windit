@@ -6,6 +6,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- **`TailPolicy` and `WindowOptions` implement `Display`.** `TailPolicy` prints
+  `keep_with_coverage`, `drop_below_min(<min>)`, or `pad_full` — the same three
+  names its `serde` wire form already tags each variant with, so the crate has
+  one vocabulary for the policy rather than two. `WindowOptions` prints
+  `key=value` pairs in declaration order joined by `,`, one key per document
+  field: `window`, `hop`, `tail` (nesting `TailPolicy`'s own `Display`), and
+  `max_windows`. All four always appear; `max_windows` prints `none` when
+  unset rather than omitting the segment. For example,
+  `WindowOptions::new(512).with_hop(256).with_tail(TailPolicy::DropBelowMin(3))`
+  prints `window=512,hop=256,tail=drop_below_min(3),max_windows=none`.
+
+  Both spellings are pinned by tests and are meant to be persisted: downstream
+  crates (`coremlit`'s `LongTextOptions`, and beyond it `mediagraph`'s
+  derivation fingerprints) read these strings as stable identity, so either is
+  a breaking change from here on, never a patch.
+
 ## 0.5.0 - 2026-09-05
 
 `TailPolicy` reaches the compact formats, and the text chunker starts obeying it.
