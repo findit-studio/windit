@@ -6,6 +6,19 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.5.2 - 2026-11-06
+
+### Fixed
+
+- **Documents carrying unknown keys inside a tail policy or an EMA policy are
+  now refused by name.** `TailPolicy`'s map form and
+  `AggregatePolicyKind::Ema` carry `deny_unknown_fields`, as `WindowOptions`
+  always has; before, the key was dropped without a word. The document that
+  made this the rule,
+  `{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}`,
+  put the cap inside the tail policy and loaded with `max_windows` unbounded.
+  `TailPolicy`'s sequence form carries no keys and is unchanged.
+
 ## 0.5.1 - 2026-09-06
 
 ### Added
