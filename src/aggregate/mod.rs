@@ -1234,9 +1234,11 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
 ///
 /// Deserialize a configured choice, then [`into_policy`](AggregatePolicyKind::into_policy)
 /// to obtain a boxed [`AggregatePolicy`]. Requires `alloc` (for the boxed policy)
-/// in addition to `serde`.
+/// in addition to `serde`. An unknown key inside [`Ema`](AggregatePolicyKind::Ema)
+/// is refused by name, as every windit wire type refuses one.
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 #[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum AggregatePolicyKind {
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,

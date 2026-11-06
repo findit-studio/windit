@@ -858,26 +858,33 @@ fn tail_policy_rejects_malformed_documents() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn tail_policy_ignores_an_entry_that_is_neither_field() {
-  // `TailPolicy` never carried `deny_unknown_fields`, so the derived reader
-  // skipped anything that was not the tag or the content. A document written by
-  // a later version, or by a schema that annotates its own values, kept loading;
-  // erroring on it would make this release the one that stops reading a
-  // forward-compatible document. `WindowOptions`, which does deny unknown
-  // fields, is unaffected — that posture is its own and is unchanged.
-  assert_eq!(
-    serde_json::from_str::<TailPolicy>(r#"{"kind":"pad_full","future":1}"#).unwrap(),
-    TailPolicy::PadFull
-  );
-  // The ignored value can be of any shape, and may sit on either side of the
-  // fields that matter.
-  assert_eq!(
-    serde_json::from_str::<TailPolicy>(
-      r#"{"note":{"a":[1,2,null]},"kind":"drop_below_min","value":5,"$schema":"x"}"#
-    )
-    .unwrap(),
-    TailPolicy::DropBelowMin(5)
-  );
+fn tail_policy_refuses_an_entry_that_is_neither_field() {
+  use std::string::ToString;
+
+  // An entry that is neither the tag nor the content is refused by name, as
+  // `WindowOptions` refuses an unknown key. The document that made this the
+  // rule put the cap inside the tail policy: skipped, it left `max_windows`
+  // unbounded without a word.
+  let misplaced =
+    r#"{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}"#;
+  let refused = serde_json::from_str::<WindowOptions>(misplaced).unwrap_err();
+  assert!(refused.to_string().contains("max_windows"), "{refused}");
+  // Whatever the stray entry holds, and on whichever side of the fields that
+  // matter it sits.
+  for (document, key) in [
+    (r#"{"kind":"pad_full","future":1}"#, "future"),
+    (
+      r#"{"kind":"drop_below_min","value":5,"$schema":"x"}"#,
+      "$schema",
+    ),
+    (
+      r#"{"note":{"a":[1,2,null]},"kind":"drop_below_min","value":5}"#,
+      "note",
+    ),
+  ] {
+    let refused = serde_json::from_str::<TailPolicy>(document).unwrap_err();
+    assert!(refused.to_string().contains(key), "{document}: {refused}");
+  }
 }
 
 /// Map and sequence accesses built by hand, for the two grammars no
@@ -1333,15 +1340,12 @@ fn tail_policy_reads_a_map_whose_keys_arrive_as_bytes() {
     .unwrap(),
     TailPolicy::DropBelowMin(5)
   );
-  // A byte key that is neither field is ignored exactly as a string one is.
-  assert_eq!(
-    from_map(&[
-      (Key::Bytes(b"future"), Entry::Number(1)),
-      (Key::Bytes(b"kind"), Entry::Text("keep_with_coverage")),
-    ])
-    .unwrap(),
-    TailPolicy::KeepWithCoverage
-  );
+  // A byte key that is neither field is refused exactly as a string one is.
+  assert!(from_map(&[
+    (Key::Bytes(b"future"), Entry::Number(1)),
+    (Key::Bytes(b"kind"), Entry::Text("keep_with_coverage")),
+  ])
+  .is_err());
 }
 
 #[cfg(feature = "serde")]
@@ -1472,6 +1476,8 @@ fn tail_policy_round_trips_as_a_window_options_document_field() {
 
 #[test]
 fn tail_policy_display_is_pinned() {
+  use std::string::ToString;
+
   // The exact strings a downstream derivation fingerprint persists —
   // changing any one of them is a breaking change, not a patch.
   assert_eq!(
@@ -1485,6 +1491,8 @@ fn tail_policy_display_is_pinned() {
 
 #[test]
 fn window_options_display_is_pinned() {
+  use std::string::ToString;
+
   // The motivating example: `window`, `hop`, and a `DropBelowMin` tail nested
   // through its own `Display` — the fingerprint is the document spelling, so
   // `hop` prints under its own field name.
