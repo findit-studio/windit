@@ -262,11 +262,16 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 ///
 /// A self-describing format writes the two as named fields —
 /// `{"kind":"drop_below_min","value":5}` — and a compact one writes the variant
-/// and then the payload, `[01, 05]` under postcard. `Deserialize` asks for a
-/// struct, which is what lets serde route each format to the road it belongs on:
-/// a self-describing format's map goes straight to serde's own derived
-/// adjacently tagged reader, so that grammar is `0.4.0`'s to the letter, and a
-/// compact format's sequence goes to a small reader written for it.
+/// and then the payload, `[01, 05]` under postcard. An entry that is neither
+/// field is refused, as [`WindowOptions`] refuses an unknown key: a stray key
+/// beside `kind`, such as a `max_windows` misplaced there, would otherwise be
+/// dropped without a word.
+///
+/// `Deserialize` asks for a struct, which is what lets serde route each format
+/// to the road it belongs on: a self-describing format's map goes straight to
+/// serde's own derived adjacently tagged reader, so that grammar is `0.4.0`'s
+/// to the letter but for the stray entry it now refuses, and a compact
+/// format's sequence goes to a small reader written for it.
 ///
 /// The derive alone could not serve both: an adjacent tag is deserialized by
 /// buffering the content, which asks for `deserialize_any`, and a format that
@@ -371,9 +376,10 @@ const _: () = {
       mod wire {
         use serde::{Deserialize, Serialize};
 
-        /// The adjacently tagged document, derived.
+        /// The adjacently tagged document, derived. An entry that is neither
+        /// the tag nor the content is refused.
         #[derive(Clone, Copy, Deserialize, Serialize)]
-        #[serde(tag = $tag, content = $content)]
+        #[serde(tag = $tag, content = $content, deny_unknown_fields)]
         pub(super) enum TailPolicy {
           $( #[serde(rename = $name)] $variant $( ( $payload ) )?, )+
         }
@@ -538,9 +544,10 @@ const _: () = {
     /// The map is handed whole to the wire enum's derived reader, so every
     /// question this road raises — whether the content precedes the tag and must
     /// be buffered, what type to ask the format for once the tag is known,
-    /// whether a key arrived as text or as bytes, what to do with an entry that
-    /// is neither field, and what each failure says — is answered exactly as
-    /// `0.4.0` answered it, because it is the same code.
+    /// whether a key arrived as text or as bytes, and what each failure says —
+    /// is answered exactly as `0.4.0` answered it, because it is the same code.
+    /// The one exception is an entry that is neither field: `0.4.0` skipped it,
+    /// and from `0.5.2` it is refused (`deny_unknown_fields`).
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
       wire::TailPolicy::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
     }

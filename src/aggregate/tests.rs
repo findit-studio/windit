@@ -3816,6 +3816,18 @@ fn kind_serde_wire_format_is_pinned() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn kind_refuses_an_unknown_key_inside_ema() {
+  use std::string::ToString;
+
+  // A key `Ema` does not have is refused by name, as every windit wire type
+  // refuses one; dropped, it would configure nothing without a word.
+  let refused =
+    serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5,"window":3}}"#).unwrap_err();
+  assert!(refused.to_string().contains("window"), "{refused}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn kind_serde_round_trip() {
   for kind in [
     AggregatePolicyKind::CoverageWeightedMean,
