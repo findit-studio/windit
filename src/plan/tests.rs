@@ -1476,6 +1476,8 @@ fn tail_policy_round_trips_as_a_window_options_document_field() {
 
 #[test]
 fn tail_policy_display_is_pinned() {
+  use std::string::ToString;
+
   // The exact strings a downstream derivation fingerprint persists —
   // changing any one of them is a breaking change, not a patch.
   assert_eq!(
@@ -1489,6 +1491,8 @@ fn tail_policy_display_is_pinned() {
 
 #[test]
 fn window_options_display_is_pinned() {
+  use std::string::ToString;
+
   // The motivating example: `window`, `hop`, and a `DropBelowMin` tail nested
   // through its own `Display` — the fingerprint is the document spelling, so
   // `hop` prints under its own field name.
