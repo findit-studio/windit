@@ -4483,3 +4483,44 @@ fn kind_names_its_variant_in_a_refused_yaml_tag() {
     .to_string();
   assert!(refused.contains("MeanRenormalized"), "{refused}");
 }
+
+/// A value refused inside `Ema` is named by its field and by `Ema`, in each
+/// human-readable format and in the tagged YAML form.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_names_the_field_a_value_is_refused_in_inside_ema() {
+  use std::string::{String, ToString};
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    aggregate: AggregatePolicyKind,
+  }
+
+  let refusals: [(&str, Result<AggregatePolicyKind, String>); 4] = [
+    (
+      "JSON",
+      serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":"0.5"}}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "YAML",
+      serde_yaml_ng::from_str::<AggregatePolicyKind>(r#"Ema: {alpha: "0.5"}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "YAML tag",
+      serde_yaml_ng::from_str::<AggregatePolicyKind>(r#"!Ema {alpha: "0.5"}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "TOML",
+      toml::from_str::<Document>(r#"aggregate = { Ema = { alpha = "0.5" } }"#)
+        .map(|document| document.aggregate)
+        .map_err(|e| e.to_string()),
+    ),
+  ];
+  for (format, refused) in refusals {
+    let refused = refused.unwrap_err();
+    assert!(refused.contains("`Ema`'s `alpha`"), "{format}: {refused}");
+  }
+}

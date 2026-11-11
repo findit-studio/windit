@@ -1637,29 +1637,55 @@ fn window_options_refuse_a_trailing_element_in_toml() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn tail_policy_names_a_key_beside_its_kind() {
+fn tail_policy_refuses_a_kind_written_as_a_map() {
   use std::string::ToString;
 
-  // A `kind` written as a map of one entry holds no value, and a second key
-  // is refused by its name, as a key beside an `AggregatePolicyKind` variant
-  // is. Asked for an enum, JSON refused at the comma without naming the key.
-  let refused = serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null,"typo":0}}"#)
-    .unwrap_err()
-    .to_string();
-  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
-  let refused = toml::from_str::<TailPolicy>("kind = { pad_full = {}, typo = 0 }")
-    .unwrap_err()
-    .to_string();
-  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
+  // A `kind` is read by the rule `AggregatePolicyKind`'s unit variants are:
+  // its name, or a YAML tag on no value. A one-entry map is refused by its
+  // variant's name, whatever it holds and whatever stands beside it, in every
+  // human-readable format.
+  for (format, refused) in [
+    (
+      "JSON null",
+      serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null}}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "JSON with a key beside",
+      serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null,"typo":0}}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "TOML empty table",
+      toml::from_str::<TailPolicy>("kind = { pad_full = {} }").map_err(|e| e.to_string()),
+    ),
+    (
+      "TOML empty array",
+      toml::from_str::<TailPolicy>("kind = { pad_full = [] }").map_err(|e| e.to_string()),
+    ),
+    (
+      "YAML null",
+      serde_yaml_ng::from_str::<TailPolicy>("kind: {pad_full: ~}").map_err(|e| e.to_string()),
+    ),
+  ] {
+    let refused = refused.unwrap_err();
+    assert!(
+      refused.contains("`pad_full` takes no value, and the document gives it one"),
+      "{format}: {refused}"
+    );
+  }
 
-  // The one-entry maps `0.4.0` read are still read: JSON's `null`, and the
-  // empty table TOML's own enum reader takes in place of a unit.
+  // The name reads, in each of them.
   assert_eq!(
-    serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null}}"#).unwrap(),
+    serde_json::from_str::<TailPolicy>(r#"{"kind":"pad_full"}"#).unwrap(),
     TailPolicy::PadFull
   );
   assert_eq!(
-    toml::from_str::<TailPolicy>("kind = { pad_full = {} }").unwrap(),
+    toml::from_str::<TailPolicy>(r#"kind = "pad_full""#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<TailPolicy>("kind: pad_full").unwrap(),
     TailPolicy::PadFull
   );
 }
@@ -1676,14 +1702,9 @@ fn tail_policy_names_its_kind_in_a_refused_yaml_tag() {
     .to_string();
   assert!(refused.contains("`pad_full`"), "{refused}");
 
-  // A tag on no value still reads, and YAML's untagged one-entry map, which
-  // its enum reader refused, is read as JSON's is.
+  // A tag on no value reads.
   assert_eq!(
     serde_yaml_ng::from_str::<TailPolicy>("kind: !pad_full").unwrap(),
-    TailPolicy::PadFull
-  );
-  assert_eq!(
-    serde_yaml_ng::from_str::<TailPolicy>("kind: {pad_full: ~}").unwrap(),
     TailPolicy::PadFull
   );
 }
@@ -1693,9 +1714,8 @@ fn tail_policy_names_its_kind_in_a_refused_yaml_tag() {
 fn tail_policy_names_its_kind_on_the_sequence_road() {
   use std::string::ToString;
 
-  // The sequence road reads its tag as the map road does: a key beside the
-  // variant is refused by its name, a refused value names the variant, and a
-  // name alone still reads.
+  // The sequence road reads its tag by the same rule as the map road: a
+  // one-entry map is refused by its variant's name, and a name reads.
   #[derive(Debug, serde::Deserialize)]
   struct Document {
     tail: TailPolicy,
@@ -1704,19 +1724,152 @@ fn tail_policy_names_its_kind_on_the_sequence_road() {
   let refused = serde_json::from_str::<TailPolicy>(r#"[{"pad_full":null,"typo":0}]"#)
     .unwrap_err()
     .to_string();
-  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
-  let refused = toml::from_str::<Document>("tail = [{ pad_full = 7 }]")
+  assert!(refused.contains("`pad_full` takes no value"), "{refused}");
+  let refused = toml::from_str::<Document>("tail = [{ pad_full = {} }]")
     .unwrap_err()
     .to_string();
-  assert!(refused.contains("`pad_full`"), "{refused}");
+  assert!(refused.contains("`pad_full` takes no value"), "{refused}");
   assert_eq!(
     serde_json::from_str::<TailPolicy>(r#"["pad_full"]"#).unwrap(),
     TailPolicy::PadFull
   );
   assert_eq!(
-    toml::from_str::<Document>("tail = [{ pad_full = {} }]")
+    toml::from_str::<Document>(r#"tail = ["pad_full"]"#)
       .unwrap()
       .tail,
     TailPolicy::PadFull
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_a_refused_value_on_the_map_road() {
+  use std::string::ToString;
+
+  // A `value` the variant refuses is named by its field and its variant, on
+  // either side of the `kind`: a `value` read first is held by the derived
+  // reader, and read again once the `kind` is known.
+  for (document, named) in [
+    (
+      r#"{"kind":"drop_below_min","value":"5"}"#,
+      "`drop_below_min`'s `value`",
+    ),
+    (
+      r#"{"value":"5","kind":"drop_below_min"}"#,
+      "`drop_below_min`'s `value`",
+    ),
+    (r#"{"kind":"pad_full","value":5}"#, "`pad_full`'s `value`"),
+    (r#"{"value":5,"kind":"pad_full"}"#, "`pad_full`'s `value`"),
+  ] {
+    let refused = serde_json::from_str::<TailPolicy>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  let refused = toml::from_str::<TailPolicy>("kind = \"drop_below_min\"\nvalue = \"5\"")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`drop_below_min`'s `value`"), "{refused}");
+
+  // A format that is not human-readable names the field; its `kind` is read
+  // by the derive, so the variant is not known here.
+  let mut bytes = Vec::new();
+  ciborium::into_writer(
+    &ciborium::Value::Map(vec![
+      (
+        ciborium::Value::Text("kind".into()),
+        ciborium::Value::Text("drop_below_min".into()),
+      ),
+      (
+        ciborium::Value::Text("value".into()),
+        ciborium::Value::Text("5".into()),
+      ),
+    ]),
+    &mut bytes,
+  )
+  .unwrap();
+  let refused = ciborium::from_reader::<TailPolicy, _>(bytes.as_slice())
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`value`"), "{refused}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_a_refused_value_on_the_sequence_road() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    tail: TailPolicy,
+  }
+
+  // The element after the tag is named by its variant and as the `value`.
+  let refused = serde_json::from_str::<TailPolicy>(r#"["drop_below_min","5"]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`drop_below_min`'s `value`"), "{refused}");
+  let refused = toml::from_str::<Document>(r#"tail = ["pad_full", 5]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`pad_full`'s `value`"), "{refused}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_name_the_field_a_value_is_refused_in() {
+  use std::string::ToString;
+
+  // Each field names the value it refuses. A tail policy names what it
+  // refuses itself, once, so its field adds nothing to the name.
+  for (document, named) in [
+    (
+      r#"{"window":"8","hop":4,"tail":{"kind":"pad_full"}}"#,
+      "`window`",
+    ),
+    (
+      r#"{"window":8,"hop":-4,"tail":{"kind":"pad_full"}}"#,
+      "`hop`",
+    ),
+    (
+      r#"{"window":8,"hop":4,"tail":{"kind":"pad_full"},"max_windows":"9"}"#,
+      "`max_windows`",
+    ),
+    (
+      r#"{"window":8,"hop":4,"tail":{"kind":"drop_below_min","value":"5"}}"#,
+      "`drop_below_min`'s `value`",
+    ),
+  ] {
+    let refused = serde_json::from_str::<WindowOptions>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_name_the_field_a_value_is_refused_in_on_the_sequence_road() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    options: WindowOptions,
+  }
+
+  // The sequence road names each element by the field at its position.
+  let refused = toml::from_str::<Document>(r#"options = ["8", 4, {kind = "pad_full"}]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`window`"), "{refused}");
+  let refused =
+    serde_json::from_str::<WindowOptions>(r#"[8, 4, {"kind":"drop_below_min","value":"5"}, null]"#)
+      .unwrap_err()
+      .to_string();
+  assert!(
+    refused.contains("`drop_below_min`'s `value`") && !refused.contains("`tail`"),
+    "{refused}"
   );
 }

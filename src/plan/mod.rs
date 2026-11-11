@@ -274,14 +274,14 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 /// and the `kind` below, and a compact format's sequence goes to a small
 /// reader written for it.
 ///
-/// In a human-readable format, on either road, the `kind` is read as the value
-/// it is: a name, a map of one entry holding no value (JSON's `null`, TOML's
-/// empty table or array), or a YAML tag on no value. A refusal there names the
-/// variant, or the key beside it, where the format's own enum reader refused
-/// without either. One spelling is read that `0.4.0` refused: YAML's untagged
-/// one-entry map, `kind: {pad_full: ~}`, as JSON's `{"kind":{"pad_full":null}}`
-/// always was. A format that is not human-readable is asked for the enum, as
-/// before.
+/// In a human-readable format, on either road, the `kind` is read by the one
+/// rule windit holds a unit variant to, as `AggregatePolicyKind`'s are: its
+/// name, or a YAML tag on no value (`kind: !pad_full`). Written as a one-entry
+/// map it is refused by name, whatever its value, so JSON's
+/// `{"kind":{"pad_full":null}}` and TOML's `kind = { pad_full = {} }`, which
+/// `0.4.0` read, are refused, as is YAML's `kind: {pad_full: ~}`. A tagged
+/// value the variant refuses names the variant. A format that is not
+/// human-readable is asked for the enum, as before.
 ///
 /// The derive alone could not serve both: an adjacent tag is deserialized by
 /// buffering the content, which asks for `deserialize_any`, and a format that
@@ -353,7 +353,7 @@ impl core::fmt::Display for TailPolicy {
 #[cfg(feature = "serde")]
 #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
 const _: () = {
-  use core::{convert::Infallible, fmt, marker::PhantomData};
+  use core::{fmt, marker::PhantomData};
 
   use serde::{
     de::{
@@ -361,8 +361,8 @@ const _: () = {
         BorrowedBytesDeserializer, BorrowedStrDeserializer, BytesDeserializer,
         MapAccessDeserializer,
       },
-      DeserializeSeed, EnumAccess, Error as _, Expected, IgnoredAny, IntoDeserializer, MapAccess,
-      SeqAccess, Unexpected, VariantAccess, Visitor,
+      DeserializeSeed, EnumAccess, Error as _, Expected, IntoDeserializer, MapAccess, SeqAccess,
+      Unexpected, VariantAccess, Visitor,
     },
     Deserialize, Deserializer, Serialize, Serializer,
   };
@@ -435,7 +435,7 @@ const _: () = {
         Ok(match tag {
           $(
             wire::tag::TailPolicy::$variant =>
-              wire_tail_policy!(@element $variant $( ( $payload ) )?, seq, expected),
+              wire_tail_policy!(@element $variant $( ( $payload ) )?, $name, seq, expected),
           )+
         })
       }
@@ -443,10 +443,9 @@ const _: () = {
 
     // A variant with a payload: the element after the tag is that payload, and
     // it is required.
-    (@element $variant:ident ( $payload:ty ), $seq:expr, $expected:expr) => {
+    (@element $variant:ident ( $payload:ty ), $name:literal, $seq:expr, $expected:expr) => {
       TailPolicy::$variant(
-        $seq
-          .next_element::<$payload>()?
+        payload::<$payload, _>($seq, $name)?
           .ok_or_else(|| serde::de::Error::invalid_length(1, $expected))?,
       )
     };
@@ -457,9 +456,9 @@ const _: () = {
     // consumed one element and accepted a unit there, so a sequence that does
     // carry the trailing unit keeps parsing. The element is optional; present,
     // it must be the unit.
-    (@element $variant:ident, $seq:expr, $expected:expr) => {{
+    (@element $variant:ident, $name:literal, $seq:expr, $expected:expr) => {{
       let _ = $expected;
-      $seq.next_element::<NoContent>()?;
+      payload::<NoContent, _>($seq, $name)?;
       TailPolicy::$variant
     }};
   }
@@ -503,6 +502,19 @@ const _: () = {
       // checks. Nothing here decides a field count, a tag, or a name.
       wire::TailPolicy::from(*self).serialize(serializer)
     }
+  }
+
+  /// The element after the tag on the sequence road, its refusal named by the
+  /// variant and the field it is: `` `drop_below_min`'s `value` ``.
+  fn payload<'de, T: Deserialize<'de>, A: SeqAccess<'de>>(
+    seq: &mut A,
+    variant: &'static str,
+  ) -> Result<Option<T>, A::Error> {
+    seq.next_element_seed(crate::refusal::Named {
+      seed: PhantomData::<T>,
+      owner: Some(variant),
+      field: wire::FIELDS[1],
+    })
   }
 
   /// The content element a payload-free variant may carry in a sequence.
@@ -565,13 +577,25 @@ const _: () = {
     /// be buffered, what type to ask the format for once the tag is known,
     /// whether a key arrived as text or as bytes, and what each failure says —
     /// is answered exactly as `0.4.0` answered it, because it is the same code.
-    /// Two things differ. An entry that is neither field: `0.4.0` skipped it,
-    /// and from `0.5.2` [`KnownKeys`] refuses it, naming its key. And the
+    /// Three things differ. An entry that is neither field: `0.4.0` skipped
+    /// it, and from `0.5.2` [`KnownKeys`] refuses it, naming its key. The
     /// `kind`'s value, which a human-readable format answers through
-    /// [`KindSeed`], so that a refusal names the variant or the key beside it.
+    /// [`KindSeed`], by the one rule windit holds a unit variant to. And a
+    /// refused `value`, named by its field and, where the format named it in
+    /// the document, its variant: on either side of the `kind`, since a
+    /// `value` read first is held by the derived reader and read again after
+    /// the `kind`.
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
-      wire::TailPolicy::deserialize(MapAccessDeserializer::new(KnownKeys { map, kind: false }))
+      let mut keys = KnownKeys::new(map);
+      wire::TailPolicy::deserialize(MapAccessDeserializer::new(&mut keys))
         .map(Into::into)
+        .map_err(|refusal| {
+          if keys.reading_held {
+            value_refused(keys.variant, refusal)
+          } else {
+            refusal
+          }
+        })
     }
 
     /// The shape a format that encodes a struct as a sequence hands over: the
@@ -585,7 +609,10 @@ const _: () = {
     /// the map road's is.
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<TailPolicy, A::Error> {
       let tag = seq
-        .next_element_seed(KindSeed(PhantomData::<wire::tag::TailPolicy>))?
+        .next_element_seed(KindSeed {
+          seed: PhantomData::<wire::tag::TailPolicy>,
+          name: &mut None,
+        })?
         .ok_or_else(|| A::Error::invalid_length(0, &self))?;
       let policy = from_tag(tag, &mut seq, &self)?;
       exhausted(&mut seq, wire::FIELDS.len(), wire::NAME)?;
@@ -597,11 +624,52 @@ const _: () = {
   /// `kind` or `value` (or `0` or `1`, from a format that numbers its fields)
   /// passes through, and any other key is refused by name, a text key as
   /// itself and a byte key as its text, or as hex where it is not UTF-8. The
-  /// value of `kind` is read through [`KindSeed`].
+  /// value of `kind` is read through [`KindSeed`], and a refused `value` is
+  /// named by its field and, once the format has named it, its variant.
   struct KnownKeys<A> {
     map: A,
-    /// Whether the key just read is `kind`, whose value comes next.
-    kind: bool,
+    /// The field the key just read names, whose value comes next.
+    next: Option<Field>,
+    /// The `kind`'s variant, once a human-readable format has named it.
+    variant: Option<&'static str>,
+    /// Whether the `kind`'s value has been read.
+    kind_read: bool,
+    /// Whether the `value` came before the `kind`, so the derived reader
+    /// holds it, to read it again once the `kind` is known.
+    held: bool,
+    /// Whether the derived reader is reading the held `value` again: from the
+    /// `kind`'s value read until it asks for another key, a refusal it makes
+    /// is the held `value`'s.
+    reading_held: bool,
+  }
+
+  /// Which of the two fields a key of the map road names.
+  #[derive(Clone, Copy)]
+  enum Field {
+    Kind,
+    Value,
+  }
+
+  impl<A> KnownKeys<A> {
+    fn new(map: A) -> Self {
+      Self {
+        map,
+        next: None,
+        variant: None,
+        kind_read: false,
+        held: false,
+        reading_held: false,
+      }
+    }
+  }
+
+  /// A refusal of the `value`, named by its field and, where it is known, its
+  /// variant.
+  fn value_refused<E: serde::de::Error>(variant: Option<&str>, refusal: impl fmt::Display) -> E {
+    match variant {
+      Some(variant) => crate::refusal::within_field(variant, wire::FIELDS[1], refusal),
+      None => crate::refusal::within(wire::FIELDS[1], refusal),
+    }
   }
 
   impl<'de, A: MapAccess<'de>> MapAccess<'de> for KnownKeys<A> {
@@ -611,17 +679,33 @@ const _: () = {
       &mut self,
       seed: K,
     ) -> Result<Option<K::Value>, A::Error> {
+      self.reading_held = false;
       self.map.next_key_seed(KnownKey {
         seed,
-        kind: &mut self.kind,
+        field: &mut self.next,
       })
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
-      if core::mem::take(&mut self.kind) {
-        self.map.next_value_seed(KindSeed(seed))
-      } else {
-        self.map.next_value_seed(seed)
+      match self.next.take() {
+        Some(Field::Kind) => {
+          let kind = self.map.next_value_seed(KindSeed {
+            seed,
+            name: &mut self.variant,
+          })?;
+          self.kind_read = true;
+          self.reading_held = self.held;
+          Ok(kind)
+        }
+        Some(Field::Value) => {
+          self.held = !self.kind_read;
+          self.map.next_value_seed(crate::refusal::Named {
+            seed,
+            owner: self.variant,
+            field: wire::FIELDS[1],
+          })
+        }
+        None => self.map.next_value_seed(seed),
       }
     }
 
@@ -630,11 +714,11 @@ const _: () = {
     }
   }
 
-  /// One key of the map road: checked, noted if it is `kind`, then handed to
-  /// the derived reader's own seed in the form it arrived in.
+  /// One key of the map road: checked, noted by the field it names, then
+  /// handed to the derived reader's own seed in the form it arrived in.
   struct KnownKey<'a, K> {
     seed: K,
-    kind: &'a mut bool,
+    field: &'a mut Option<Field>,
   }
 
   impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for KnownKey<'_, K> {
@@ -678,7 +762,7 @@ const _: () = {
 
     fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<K::Value, E> {
       if v < wire::FIELDS.len() as u64 {
-        *self.kind = v == 0;
+        *self.field = Some(if v == 0 { Field::Kind } else { Field::Value });
         self.seed.deserialize(v.into_deserializer())
       } else {
         Err(E::invalid_value(Unexpected::Unsigned(v), &self))
@@ -687,7 +771,11 @@ const _: () = {
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<K::Value, E> {
       if wire::FIELDS.contains(&v) {
-        *self.kind = v == wire::FIELDS[0];
+        *self.field = Some(if v == wire::FIELDS[0] {
+          Field::Kind
+        } else {
+          Field::Value
+        });
         self.seed.deserialize(v.into_deserializer())
       } else {
         Err(E::unknown_field(v, wire::FIELDS))
@@ -696,7 +784,11 @@ const _: () = {
 
     fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<K::Value, E> {
       if wire::FIELDS.contains(&v) {
-        *self.kind = v == wire::FIELDS[0];
+        *self.field = Some(if v == wire::FIELDS[0] {
+          Field::Kind
+        } else {
+          Field::Value
+        });
         self.seed.deserialize(BorrowedStrDeserializer::new(v))
       } else {
         Err(E::unknown_field(v, wire::FIELDS))
@@ -705,7 +797,11 @@ const _: () = {
 
     fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<K::Value, E> {
       if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
-        *self.kind = v == wire::FIELDS[0].as_bytes();
+        *self.field = Some(if v == wire::FIELDS[0].as_bytes() {
+          Field::Kind
+        } else {
+          Field::Value
+        });
         self.seed.deserialize(BytesDeserializer::new(v))
       } else {
         Err(Self::unknown_bytes(v))
@@ -714,7 +810,11 @@ const _: () = {
 
     fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<K::Value, E> {
       if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
-        *self.kind = v == wire::FIELDS[0].as_bytes();
+        *self.field = Some(if v == wire::FIELDS[0].as_bytes() {
+          Field::Kind
+        } else {
+          Field::Value
+        });
         self.seed.deserialize(BorrowedBytesDeserializer::new(v))
       } else {
         Err(Self::unknown_bytes(v))
@@ -724,26 +824,30 @@ const _: () = {
 
   /// The value of a `kind`, on either road.
   ///
-  /// A human-readable format is asked for it as it stands, as
-  /// `AggregatePolicyKind`'s human-readable road asks: a name, a map of one
-  /// entry holding no value, or a YAML tag on no value. A refusal names the
-  /// variant, or the key that stands beside it, and the name read is handed
-  /// on to `S`, the reader the value was meant for. A format that is not
-  /// human-readable is handed to `S` as it is, and asked for the enum as the
-  /// derive asks.
-  struct KindSeed<S>(S);
+  /// A human-readable format is asked for it as it stands, and read by the
+  /// rule `AggregatePolicyKind` holds its unit variants to: a name, or a YAML
+  /// tag on no value. A one-entry map is refused by its variant's name. The
+  /// name read is handed on to `S`, the reader the value was meant for. A
+  /// format that is not human-readable is handed to `S` as it is, and asked
+  /// for the enum as the derive asks.
+  struct KindSeed<'a, S> {
+    seed: S,
+    /// Where the variant's name goes, once a human-readable format names it.
+    name: &'a mut Option<&'static str>,
+  }
 
-  impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for KindSeed<S> {
+  impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for KindSeed<'_, S> {
     type Value = S::Value;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<S::Value, D::Error> {
       if deserializer.is_human_readable() {
         let name = deserializer.deserialize_any(KindValue)?;
+        *self.name = Some(name);
         self
-          .0
+          .seed
           .deserialize(BorrowedStrDeserializer::<D::Error>::new(name))
       } else {
-        self.0.deserialize(deserializer)
+        self.seed.deserialize(deserializer)
       }
     }
   }
@@ -767,19 +871,14 @@ const _: () = {
       variant_named(v)
     }
 
-    /// A map of one entry, the variant's name holding no value. A refused
-    /// value names the variant, and a second key is refused by its name.
+    /// A map of one entry is how a variant carrying a value is written, and
+    /// no `kind` carries one: the variant is named and refused, whatever its
+    /// value, before any of it is read.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<&'static str, A::Error> {
-      let Some(name) = map.next_key_seed(VariantName)? else {
-        return Err(A::Error::invalid_length(0, &self));
-      };
-      map
-        .next_value_seed(NoValue)
-        .map_err(|refused| A::Error::custom(format_args!("`{name}`: {refused}")))?;
-      if let Some(never) = map.next_key_seed(Beside(name))? {
-        match never {}
+      match map.next_key_seed(VariantName)? {
+        Some(name) => Err(crate::refusal::unit_given_a_value(name)),
+        None => Err(A::Error::invalid_length(0, &self)),
       }
-      Ok(name)
     }
 
     /// A tagged value, as YAML writes `!pad_full`: the tag names the variant,
@@ -788,7 +887,7 @@ const _: () = {
       let (name, variant) = data.variant_seed(VariantName)?;
       variant
         .unit_variant()
-        .map_err(|refused| A::Error::custom(format_args!("`{name}`: {refused}")))?;
+        .map_err(|refusal| crate::refusal::within(name, refusal))?;
       Ok(name)
     }
   }
@@ -823,77 +922,6 @@ const _: () = {
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<&'static str, E> {
       variant_named(v)
-    }
-  }
-
-  /// The value a `kind`'s one-entry map holds: none. The format is asked for
-  /// its unit, JSON's `null` or YAML's `~`. TOML has none, and answers with
-  /// the empty table or array its own enum reader takes there.
-  struct NoValue;
-
-  impl<'de> DeserializeSeed<'de> for NoValue {
-    type Value = ();
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-      deserializer.deserialize_unit(self)
-    }
-  }
-
-  impl<'de> Visitor<'de> for NoValue {
-    type Value = ();
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      f.write_str("no value")
-    }
-
-    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
-      Ok(())
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
-      match map.next_key::<IgnoredAny>()? {
-        None => Ok(()),
-        Some(_) => Err(A::Error::invalid_type(Unexpected::Map, &self)),
-      }
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
-      match seq.next_element::<IgnoredAny>()? {
-        None => Ok(()),
-        Some(_) => Err(A::Error::invalid_type(Unexpected::Seq, &self)),
-      }
-    }
-  }
-
-  /// A key past the one entry of a `kind`'s map, refused by its name.
-  struct Beside(&'static str);
-
-  impl<'de> DeserializeSeed<'de> for Beside {
-    type Value = Infallible;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Infallible, D::Error> {
-      deserializer.deserialize_identifier(self)
-    }
-  }
-
-  impl Visitor<'_> for Beside {
-    type Value = Infallible;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      write!(
-        f,
-        "nothing beside `{}`: a `{}` is a map of one entry",
-        self.0,
-        wire::FIELDS[0]
-      )
-    }
-
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Infallible, E> {
-      Err(E::custom(format_args!(
-        "`{v}` beside `{}`: a `{}` is a map of one entry",
-        self.0,
-        wire::FIELDS[0]
-      )))
     }
   }
 
@@ -952,7 +980,9 @@ fn exhausted<'de, A: serde::de::SeqAccess<'de>>(
 }
 
 /// `Deserialize` for [`WindowOptions`]: the derived reader, given a map whole,
-/// or a sequence and then held to its four elements.
+/// or a sequence and then held to its four elements. A value it refuses is
+/// named by its field, on either road, except inside `tail`, whose own reader
+/// names what it refuses.
 #[cfg(feature = "serde")]
 const _: () = {
   use core::fmt;
@@ -980,6 +1010,10 @@ const _: () = {
 
   const FIELDS: &[&str] = &["window", "hop", "tail", "max_windows"];
 
+  /// The field whose own reader names its refusals: a tail policy names its
+  /// variant and its `value` itself.
+  const NESTED: &[&str] = &["tail"];
+
   impl From<wire::WindowOptions> for WindowOptions {
     fn from(options: wire::WindowOptions) -> Self {
       Self {
@@ -1001,11 +1035,16 @@ const _: () = {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<WindowOptions, A::Error> {
-      wire::WindowOptions::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+      wire::WindowOptions::deserialize(MapAccessDeserializer::new(crate::refusal::Fields::new(
+        map, None, FIELDS, NESTED,
+      )))
+      .map(Into::into)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WindowOptions, A::Error> {
-      let options = wire::WindowOptions::deserialize(SeqAccessDeserializer::new(&mut seq))?;
+      let options = wire::WindowOptions::deserialize(SeqAccessDeserializer::new(
+        crate::refusal::Elements::new(&mut seq, FIELDS, NESTED),
+      ))?;
       exhausted(&mut seq, FIELDS.len(), "WindowOptions")?;
       Ok(options.into())
     }

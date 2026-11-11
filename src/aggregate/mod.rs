@@ -1350,10 +1350,14 @@ const _: () = {
     alpha: f64,
   }
 
+  /// `Ema`'s field names, as the derived reader declares them.
+  const EMA_FIELDS: &[&str] = &["alpha"];
+
   /// `Ema`'s fields, read from a map and only from a map: an array, which no
   /// human-readable format writes for a struct variant, is refused naming
   /// `Ema`, where the derive would read its first element as `alpha` and,
-  /// under TOML, drop the rest.
+  /// under TOML, drop the rest. A value the derived reader refuses is named
+  /// by its field and by `Ema`.
   struct EmaFields;
 
   impl<'de> Visitor<'de> for EmaFields {
@@ -1364,7 +1368,9 @@ const _: () = {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(map))?;
+      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(
+        crate::refusal::Fields::new(map, Some("Ema"), EMA_FIELDS, &[]),
+      ))?;
       Ok(AggregatePolicyKind::Ema { alpha })
     }
   }
@@ -1399,10 +1405,7 @@ const _: () = {
         return Err(A::Error::invalid_length(0, &self));
       };
       if tag.unit().is_some() {
-        return Err(A::Error::custom(format_args!(
-          "`{}` takes no value, and the document gives it one",
-          tag.name()
-        )));
+        return Err(crate::refusal::unit_given_a_value(tag.name()));
       }
       let kind = map.next_value_seed(EmaFields)?;
       if let Some(extra) = map.next_key::<String>()? {
@@ -1420,8 +1423,8 @@ const _: () = {
         Some(kind) => variant
           .unit_variant()
           .map(|()| kind)
-          .map_err(|refused| A::Error::custom(format_args!("`{}`: {refused}", tag.name()))),
-        None => variant.struct_variant(&["alpha"], EmaFields),
+          .map_err(|refusal| crate::refusal::within(tag.name(), refusal)),
+        None => variant.struct_variant(EMA_FIELDS, EmaFields),
       }
     }
   }

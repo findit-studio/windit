@@ -36,16 +36,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that format's own unit handling: ciborium 0.2's CBOR reads
   `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
   Compact formats such as postcard and bincode read the selector as before.
-- **In a human-readable format, a `TailPolicy`'s `kind` that is refused names
-  its variant, or the key beside it.** The `kind` is read as a name, a map of
-  one entry holding no value (JSON's `null`, TOML's empty table or array), or
-  a YAML tag on no value, on the map road and the sequence road alike.
-  `{"kind":{"pad_full":null,"typo":0}}` was refused as "expected value" and
-  `kind: !pad_full 7` as an invalid value expecting `null`; the refusals now
-  name `typo` and `pad_full`. YAML's untagged one-entry map,
-  `kind: {pad_full: ~}`, which YAML's enum reader refused, is read as JSON's
-  `{"kind":{"pad_full":null}}` always was. A format that is not
-  human-readable reads the `kind` as before.
+- **In a human-readable format, a `TailPolicy`'s `kind` is read only as its
+  name, or as a YAML tag on no value, as `AggregatePolicyKind`'s unit variants
+  are.** Written as a one-entry map, such as `{"kind":{"pad_full":null}}` in
+  JSON, `kind = { pad_full = {} }` (or `[]`) in TOML or `kind: {pad_full: ~}`
+  in YAML, it is refused by name, whatever its value, on the map road and the
+  sequence road alike; before, JSON read a `null` there and TOML an empty
+  table or array, and YAML refused the map without naming the variant.
+  `{"kind":{"pad_full":null,"typo":0}}`, refused before as "expected value",
+  is refused naming `pad_full`. A tagged YAML value the variant refuses names
+  the variant: `kind: !pad_full 7` was refused as an invalid value expecting
+  `null`, without `pad_full`. A format that is not human-readable reads the
+  `kind` as before.
+- **A value refused inside a field or a variant is named, once, where it is
+  met.** `{"window":"8","hop":4,"tail":{"kind":"pad_full"}}` was refused as
+  `invalid type: string "8", expected usize`; it is refused as
+  `` `window`: invalid type: … ``. A tail policy's refused `value` names its
+  variant, on either side of the `kind` and on the sequence road
+  (`` `drop_below_min`'s `value`: … ``), inside `WindowOptions` as on its
+  own. `Ema`'s refused field reads `` `Ema`'s `alpha`: … ``. TOML still marks
+  the refused value itself, and TOML and YAML add their own key paths. In a
+  format that is not human-readable, a refused `value` names its field; the
+  variant is read there by the derive, which does not report it.
 
 ## 0.5.1 - 2026-09-06
 
