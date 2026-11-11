@@ -958,6 +958,11 @@ mod hand_built {
       visitor.visit_u32(self.0)
     }
 
+    /// A compact format's answer, which is the format this stands in for.
+    fn is_human_readable(&self) -> bool {
+      false
+    }
+
     forward_to_deserialize_any! {
       bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
       option unit unit_struct newtype_struct seq tuple tuple_struct map struct
@@ -1110,7 +1115,7 @@ mod hand_built {
   }
 
   /// Answer an adjacently tagged document while recording every type name the
-  /// reader asks for.
+  /// reader asks for, as a human-readable format or as one that is not.
   ///
   /// The identity a reader requests is part of the wire model — a schema-aware
   /// or name-enforcing format matches on it — and no format here carries it, so
@@ -1122,11 +1127,13 @@ mod hand_built {
   pub fn record_requests(
     variant: &'static str,
     minimum: Option<u64>,
+    human_readable: bool,
   ) -> (Result<TailPolicy, Error>, Requested) {
     let seen = RefCell::new(Requested::default());
     let policy = TailPolicy::deserialize(Recorder {
       variant,
       minimum,
+      human_readable,
       seen: &seen,
     });
     (policy, seen.into_inner())
@@ -1136,6 +1143,8 @@ mod hand_built {
   struct Recorder<'a> {
     variant: &'static str,
     minimum: Option<u64>,
+    /// What the document and its `kind` answer `is_human_readable` with.
+    human_readable: bool,
     seen: &'a RefCell<Requested>,
   }
 
@@ -1154,6 +1163,10 @@ mod hand_built {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
       visitor.visit_map(RecordedMap { at: 0, of: self })
+    }
+
+    fn is_human_readable(&self) -> bool {
+      self.human_readable
     }
 
     forward_to_deserialize_any! {
@@ -1215,6 +1228,10 @@ mod hand_built {
       visitor.visit_str(self.0.variant)
     }
 
+    fn is_human_readable(&self) -> bool {
+      self.0.human_readable
+    }
+
     forward_to_deserialize_any! {
       bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
       option unit unit_struct newtype_struct seq tuple tuple_struct map struct
@@ -1234,6 +1251,11 @@ fn tail_policy_is_read_under_its_own_name() {
   // wire enum is now *named* `TailPolicy` inside a private module instead of
   // renamed, which is what makes both requests agree; nothing but being the
   // deserializer can observe that.
+  //
+  // A format that is not human-readable is asked for the `kind` as that enum.
+  // A human-readable one is asked for the `kind` as the value it is, so that a
+  // refusal can name the variant, and so for no enum at all; its document is
+  // asked for under the same one name.
   use hand_built::record_requests;
   use std::string::String;
 
@@ -1242,7 +1264,7 @@ fn tail_policy_is_read_under_its_own_name() {
     ("drop_below_min", Some(5), TailPolicy::DropBelowMin(5)),
     ("pad_full", None, TailPolicy::PadFull),
   ] {
-    let (policy, seen) = record_requests(variant, minimum);
+    let (policy, seen) = record_requests(variant, minimum, false);
     assert_eq!(policy.unwrap(), expected);
     assert_eq!(
       seen.structs,
@@ -1253,6 +1275,19 @@ fn tail_policy_is_read_under_its_own_name() {
       seen.enums,
       std::vec![String::from("TailPolicy")],
       "the enum identity the `kind` value was asked for, for {variant}"
+    );
+
+    let (policy, seen) = record_requests(variant, minimum, true);
+    assert_eq!(policy.unwrap(), expected);
+    assert_eq!(
+      seen.structs,
+      std::vec![String::from("TailPolicy")],
+      "the document's own name for {variant}, human-readable"
+    );
+    assert!(
+      seen.enums.is_empty(),
+      "a human-readable `kind` is read as the value it is, for {variant}: {:?}",
+      seen.enums
     );
   }
 }
@@ -1598,4 +1633,90 @@ fn window_options_refuse_a_trailing_element_in_toml() {
   let opts = WindowOptions::new(8).with_hop(4).with_max_windows(100);
   let bytes = postcard::to_allocvec(&opts).unwrap();
   assert_eq!(postcard::from_bytes::<WindowOptions>(&bytes).unwrap(), opts);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_a_key_beside_its_kind() {
+  use std::string::ToString;
+
+  // A `kind` written as a map of one entry holds no value, and a second key
+  // is refused by its name, as a key beside an `AggregatePolicyKind` variant
+  // is. Asked for an enum, JSON refused at the comma without naming the key.
+  let refused = serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null,"typo":0}}"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
+  let refused = toml::from_str::<TailPolicy>("kind = { pad_full = {}, typo = 0 }")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
+
+  // The one-entry maps `0.4.0` read are still read: JSON's `null`, and the
+  // empty table TOML's own enum reader takes in place of a unit.
+  assert_eq!(
+    serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null}}"#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    toml::from_str::<TailPolicy>("kind = { pad_full = {} }").unwrap(),
+    TailPolicy::PadFull
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_its_kind_in_a_refused_yaml_tag() {
+  use std::string::ToString;
+
+  // A tagged `kind` whose value YAML's unit refuses names the variant, as a
+  // tagged `AggregatePolicyKind` does; YAML's own refusal named neither.
+  let refused = serde_yaml_ng::from_str::<TailPolicy>("kind: !pad_full 7")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`pad_full`"), "{refused}");
+
+  // A tag on no value still reads, and YAML's untagged one-entry map, which
+  // its enum reader refused, is read as JSON's is.
+  assert_eq!(
+    serde_yaml_ng::from_str::<TailPolicy>("kind: !pad_full").unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<TailPolicy>("kind: {pad_full: ~}").unwrap(),
+    TailPolicy::PadFull
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_its_kind_on_the_sequence_road() {
+  use std::string::ToString;
+
+  // The sequence road reads its tag as the map road does: a key beside the
+  // variant is refused by its name, a refused value names the variant, and a
+  // name alone still reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    tail: TailPolicy,
+  }
+
+  let refused = serde_json::from_str::<TailPolicy>(r#"[{"pad_full":null,"typo":0}]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`typo` beside `pad_full`"), "{refused}");
+  let refused = toml::from_str::<Document>("tail = [{ pad_full = 7 }]")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`pad_full`"), "{refused}");
+  assert_eq!(
+    serde_json::from_str::<TailPolicy>(r#"["pad_full"]"#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    toml::from_str::<Document>("tail = [{ pad_full = {} }]")
+      .unwrap()
+      .tail,
+    TailPolicy::PadFull
+  );
 }

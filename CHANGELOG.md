@@ -28,14 +28,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only as its name.** Written as a one-entry map, such as
   `{"MeanRenormalized": null}` in JSON, `MeanRenormalized: ~` in YAML or
   `{ MeanRenormalized = {} }` in TOML, it is refused by name, whatever its
-  value; before, JSON and YAML read a `null` there and TOML an empty table or
-  array. `Ema` is read from a map only (`{ Ema = [0.5, 0.75] }` loaded with
-  `alpha = 0.5`), a key beside the variant is refused by name, and a tagged
-  YAML value the variant refuses names the variant. In a non-human-readable
-  format, a unit variant follows that format's own unit handling: ciborium
-  0.2's CBOR reads `{"MeanRenormalized": …}` as `MeanRenormalized` without
-  reading the value. Compact formats such as postcard and bincode read the
-  selector as before.
+  value; before, JSON read a `null` there and TOML an empty table or array,
+  and YAML refused the map without naming the variant. `Ema` is read from a
+  map only (`{ Ema = [0.5, 0.75] }` loaded with `alpha = 0.5`), a key beside
+  the variant is refused by name, and a tagged YAML value the variant refuses
+  names the variant. In a non-human-readable format, a unit variant follows
+  that format's own unit handling: ciborium 0.2's CBOR reads
+  `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
+  Compact formats such as postcard and bincode read the selector as before.
+- **In a human-readable format, a `TailPolicy`'s `kind` that is refused names
+  its variant, or the key beside it.** The `kind` is read as a name, a map of
+  one entry holding no value (JSON's `null`, TOML's empty table or array), or
+  a YAML tag on no value, on the map road and the sequence road alike.
+  `{"kind":{"pad_full":null,"typo":0}}` was refused as "expected value" and
+  `kind: !pad_full 7` as an invalid value expecting `null`; the refusals now
+  name `typo` and `pad_full`. YAML's untagged one-entry map,
+  `kind: {pad_full: ~}`, which YAML's enum reader refused, is read as JSON's
+  `{"kind":{"pad_full":null}}` always was. A format that is not
+  human-readable reads the `kind` as before.
 
 ## 0.5.1 - 2026-09-06
 
