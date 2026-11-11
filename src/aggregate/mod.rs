@@ -1243,6 +1243,11 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
 /// format's own unit handling: ciborium 0.2's CBOR, for one, reads
 /// `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
 /// A compact format (postcard, bincode) reads the variant as it writes it.
+///
+/// `Ema`'s `alpha` is read by a reader that names it, so a refused one is
+/// `` expected `Ema`'s `alpha`, a number ``, located by the format at the value;
+/// a number the format cannot hold is refused by the format itself, in its own
+/// words.
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub enum AggregatePolicyKind {
@@ -1295,7 +1300,10 @@ const _: () = {
     pub(super) enum AggregatePolicyKind {
       CoverageWeightedMean,
       MeanRenormalized,
-      Ema { alpha: f64 },
+      Ema {
+        #[serde(deserialize_with = "super::ema_alpha")]
+        alpha: f64,
+      },
       SaliencyWeighted,
     }
   }
@@ -1347,6 +1355,7 @@ const _: () = {
   #[derive(Deserialize)]
   #[serde(deny_unknown_fields)]
   struct Ema {
+    #[serde(deserialize_with = "ema_alpha")]
     alpha: f64,
   }
 
@@ -1356,8 +1365,8 @@ const _: () = {
   /// `Ema`'s fields, read from a map and only from a map: an array, which no
   /// human-readable format writes for a struct variant, is refused naming
   /// `Ema`, where the derive would read its first element as `alpha` and,
-  /// under TOML, drop the rest. A value the derived reader refuses is named
-  /// by its field and by `Ema`.
+  /// under TOML, drop the rest. `alpha` is read through [`AlphaVisitor`], whose
+  /// expected text names it.
   struct EmaFields;
 
   impl<'de> Visitor<'de> for EmaFields {
@@ -1368,9 +1377,7 @@ const _: () = {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(
-        crate::refusal::Fields::new(map, Some("Ema"), EMA_FIELDS, &[]),
-      ))?;
+      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(map))?;
       Ok(AggregatePolicyKind::Ema { alpha })
     }
   }
@@ -1421,9 +1428,8 @@ const _: () = {
       let (tag, variant) = data.variant::<Tag>()?;
       match tag.unit() {
         Some(kind) => variant
-          .unit_variant()
-          .map(|()| kind)
-          .map_err(|refusal| crate::refusal::within(tag.name(), refusal)),
+          .newtype_variant_seed(crate::refusal::UnitTag(tag.name()))
+          .map(|()| kind),
         None => variant.struct_variant(EMA_FIELDS, EmaFields),
       }
     }
@@ -1439,6 +1445,47 @@ const _: () = {
     }
   }
 };
+
+/// `Ema`'s `alpha`, read as serde reads an `f64`, through [`AlphaVisitor`].
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+fn ema_alpha<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+  deserializer.deserialize_f64(AlphaVisitor)
+}
+
+/// `Ema`'s `alpha` as serde reads an `f64` (any number, an integer widened),
+/// its expected text naming the field: the format makes a refusal of it, at the
+/// value, and the name rides in it.
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+struct AlphaVisitor;
+
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+impl serde::de::Visitor<'_> for AlphaVisitor {
+  type Value = f64;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("`Ema`'s `alpha`, a number")
+  }
+
+  fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+    Ok(v)
+  }
+
+  fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+    Ok(v as f64)
+  }
+
+  fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+    Ok(v as f64)
+  }
+
+  fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<f64, E> {
+    Ok(v as f64)
+  }
+
+  fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<f64, E> {
+    Ok(v as f64)
+  }
+}
 
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 impl AggregatePolicyKind {

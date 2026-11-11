@@ -4478,49 +4478,89 @@ fn kind_names_a_key_beside_its_variant() {
 fn kind_names_its_variant_in_a_refused_yaml_tag() {
   use std::string::ToString;
 
-  let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>("!MeanRenormalized {alpha: 0.5}")
-    .unwrap_err()
-    .to_string();
-  assert!(refused.contains("MeanRenormalized"), "{refused}");
-}
-
-/// A value refused inside `Ema` is named by its field and by `Ema`, in each
-/// human-readable format and in the tagged YAML form.
-#[cfg(feature = "serde")]
-#[test]
-fn kind_names_the_field_a_value_is_refused_in_inside_ema() {
-  use std::string::{String, ToString};
-
   #[derive(Debug, serde::Deserialize)]
   struct Document {
+    #[allow(dead_code)]
     aggregate: AggregatePolicyKind,
   }
 
-  let refusals: [(&str, Result<AggregatePolicyKind, String>); 4] = [
-    (
-      "JSON",
-      serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":"0.5"}}"#)
-        .map_err(|e| e.to_string()),
-    ),
-    (
-      "YAML",
-      serde_yaml_ng::from_str::<AggregatePolicyKind>(r#"Ema: {alpha: "0.5"}"#)
-        .map_err(|e| e.to_string()),
-    ),
-    (
-      "YAML tag",
-      serde_yaml_ng::from_str::<AggregatePolicyKind>(r#"!Ema {alpha: "0.5"}"#)
-        .map_err(|e| e.to_string()),
-    ),
-    (
-      "TOML",
-      toml::from_str::<Document>(r#"aggregate = { Ema = { alpha = "0.5" } }"#)
-        .map(|document| document.aggregate)
-        .map_err(|e| e.to_string()),
-    ),
-  ];
-  for (format, refused) in refusals {
-    let refused = refused.unwrap_err();
-    assert!(refused.contains("`Ema`'s `alpha`"), "{format}: {refused}");
+  // The tagged value is refused by the reader YAML asked for it, which names
+  // the variant, and YAML locates the refusal at the tagged value.
+  for doc in [
+    "aggregate: !MeanRenormalized {alpha: 0.5}",
+    "aggregate: !MeanRenormalized 7",
+  ] {
+    let refused = serde_yaml_ng::from_str::<Document>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    let column = doc.find('!').unwrap() + 1;
+    assert_eq!((at.line(), at.column()), (1, column), "{doc}: {refused}");
+    assert!(
+      refused.to_string().contains("`MeanRenormalized`"),
+      "{doc}: {refused}"
+    );
+  }
+}
+
+/// The 1-based column at which serde_json reports a refused `token` in `doc`:
+/// the token's last character.
+#[cfg(feature = "serde")]
+fn json_column(doc: &str, token: &str) -> usize {
+  doc.find(token).expect("the token is in the document") + token.len()
+}
+
+/// `Ema`'s refused `alpha` is named by the reader JSON asked for it, and JSON
+/// places the refusal at the value.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_json() {
+  use std::string::ToString;
+
+  let doc = r#"{"Ema":{"alpha":"0.5"}}"#;
+  let refused = serde_json::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  assert!(
+    refused
+      .to_string()
+      .contains("expected `Ema`'s `alpha`, a number"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, r#""0.5""#)),
+    "{refused}"
+  );
+}
+
+/// TOML marks `Ema`'s refused `alpha` with the value's own span.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_toml() {
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let doc = r#"aggregate = { Ema = { alpha = "0.5" } }"#;
+  let refused = toml::from_str::<Document>(doc).unwrap_err();
+  let at = doc.find(r#""0.5""#).unwrap();
+  assert_eq!(refused.span(), Some(at..at + 5), "{refused}");
+  assert!(refused.message().contains("`Ema`'s `alpha`"), "{refused}");
+}
+
+/// YAML locates `Ema`'s refused `alpha` at the value, in a map and under a tag.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_yaml() {
+  use std::string::ToString;
+
+  for doc in [r#"Ema: {alpha: "0.5"}"#, r#"!Ema {alpha: "0.5"}"#] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    let column = doc.find(r#""0.5""#).unwrap() + 1;
+    assert_eq!((at.line(), at.column()), (1, column), "{doc}: {refused}");
+    assert!(
+      refused.to_string().contains("`Ema`'s `alpha`"),
+      "{doc}: {refused}"
+    );
   }
 }

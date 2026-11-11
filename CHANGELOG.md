@@ -48,16 +48,26 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the variant: `kind: !pad_full 7` was refused as an invalid value expecting
   `null`, without `pad_full`. A format that is not human-readable reads the
   `kind` as before.
-- **A value refused inside a field or a variant is named, once, where it is
-  met.** `{"window":"8","hop":4,"tail":{"kind":"pad_full"}}` was refused as
-  `invalid type: string "8", expected usize`; it is refused as
-  `` `window`: invalid type: … ``. A tail policy's refused `value` names its
-  variant, on either side of the `kind` and on the sequence road
-  (`` `drop_below_min`'s `value`: … ``), inside `WindowOptions` as on its
-  own. `Ema`'s refused field reads `` `Ema`'s `alpha`: … ``. TOML still marks
-  the refused value itself, and TOML and YAML add their own key paths. In a
-  format that is not human-readable, a refused `value` names its field; the
-  variant is read there by the derive, which does not report it.
+- **A refused value names what was expected there, and the format locates it at
+  the value.** windit's readers name the field or variant they read in their
+  expected text, so `{"window":"8","hop":4,"tail":{"kind":"pad_full"}}`, refused
+  before as `invalid type: string "8", expected usize`, is refused as
+  `` invalid type: string "8", expected `window`, an unsigned integer `` at the
+  value's line and column. A tail policy's `value` is refused as
+  `` expected `drop_below_min`'s `value` `` (read directly, held by the derived
+  reader until the `kind` is known, or on the sequence road), `Ema`'s field as
+  `` expected `Ema`'s `alpha`, a number ``, a tagged YAML value as
+  `` expected no value under `pad_full` ``, and a number given for a `kind` as
+  `` expected a `kind` naming one of … ``. The format makes each refusal, so TOML
+  marks the value's own span, an array's element included, YAML's
+  `location()` is the value's, and JSON's line and column are the value's. A
+  held `value` is read from what the derived reader holds, which has no
+  location, so JSON places its refusal at the map's end. Known limits: a
+  refusal a format makes before asking any reader of windit's, such as a
+  number JSON cannot hold (`1e400`, "number out of range") or a syntax error,
+  carries the format's own words and location and names no field; and a
+  value given to a unit variant is refused by serde's derive, which names the
+  variant by its Rust name (`unit variant TailPolicy::PadFull`).
 
 ## 0.5.1 - 2026-09-06
 
