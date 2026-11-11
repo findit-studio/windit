@@ -9,9 +9,9 @@
 //! materializing definition has about 500,000 one-element ranges to store
 //! (roughly 8 MiB of `Vec<Range>` growth) while the fold has one `Option<Range>`.
 //!
-//! A counting global allocator is a process-wide setting, so this suite is one
-//! test in its own binary: nothing else runs while the count is armed. The
-//! counter is armed around the call under test alone — the input is built
+//! A counting global allocator is process-wide, and the harness's own threads
+//! allocate while the test runs, so the count is armed on the test's own thread
+//! alone. It is armed around the call under test alone — the input is built
 //! before it — so every call it records belongs to `longest_run`.
 //!
 //! Gated on `alloc`: `longest_run` is an `alloc`-tier convenience, and the file
@@ -24,7 +24,8 @@
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
-  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
 };
 
 use windit::{
@@ -41,8 +42,13 @@ use windit::{
 /// the complexity claim is about.
 struct Counting;
 
-/// Whether the count is in effect.
-static ARMED: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+  /// Whether the count is in effect on this thread. Only the test's own thread
+  /// arms it, so the harness's threads, which allocate while the test runs, are
+  /// never counted. A `const`-initialized `Cell` has no destructor, so it is
+  /// read without allocating, which is what lets the allocator read it.
+  static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Allocation calls made while armed.
 static CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -56,7 +62,7 @@ static BYTES: AtomicUsize = AtomicUsize::new(0);
 // allocate it.
 unsafe impl GlobalAlloc for Counting {
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) {
+    if ARMED.get() {
       CALLS.fetch_add(1, Ordering::Relaxed);
       BYTES.fetch_add(layout.size(), Ordering::Relaxed);
     }
@@ -68,7 +74,7 @@ unsafe impl GlobalAlloc for Counting {
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) {
+    if ARMED.get() {
       CALLS.fetch_add(1, Ordering::Relaxed);
       BYTES.fetch_add(new_size, Ordering::Relaxed);
     }
@@ -84,9 +90,9 @@ static ALLOC: Counting = Counting;
 fn counted<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
   CALLS.store(0, Ordering::Relaxed);
   BYTES.store(0, Ordering::Relaxed);
-  ARMED.store(true, Ordering::Relaxed);
+  ARMED.set(true);
   let out = f();
-  ARMED.store(false, Ordering::Relaxed);
+  ARMED.set(false);
   (
     out,
     CALLS.load(Ordering::Relaxed),

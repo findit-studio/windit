@@ -16,9 +16,9 @@
 //! or that dropped the reservation and let `push` grow the vector geometrically,
 //! would abort this binary through `handle_alloc_error` instead of returning.
 //!
-//! Proving that needs an allocator that refuses, which is a process-wide setting,
-//! so this suite is one test in its own binary: nothing else runs while the
-//! refusal is armed. The refusal is size-gated above the harness's own small
+//! Proving that needs an allocator that refuses, and the allocator is process-wide:
+//! the harness's own threads allocate while the test runs. So the refusal is armed
+//! on the test's own thread alone, and size-gated above the test's own small
 //! allocations, so the failure observed is the one `smooth` asked for.
 //!
 //! Gated on `alloc`: without it there is no batch driver to drive, and the file
@@ -31,7 +31,8 @@
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
-  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
   vec::Vec,
 };
 
@@ -46,8 +47,14 @@ use windit::{
 /// else to the system allocator.
 struct Refusing;
 
-/// Whether the refusal is in effect.
-static ARMED: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+  /// Whether the refusal is in effect on this thread. Only the test's own
+  /// thread arms it, so the harness's threads, which allocate while the test
+  /// runs, are never refused. A `const`-initialized `Cell` has no destructor,
+  /// so it is read without allocating, which is what lets the allocator read
+  /// it.
+  static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// The size at or above which an armed allocation is refused. Left at `MAX`
 /// (refuse nothing) except around the smoothing call itself.
@@ -59,7 +66,7 @@ static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 // nothing is freed by an allocator that did not allocate it.
 unsafe impl GlobalAlloc for Refusing {
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && layout.size() >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && layout.size() >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.alloc(layout) }
@@ -70,7 +77,7 @@ unsafe impl GlobalAlloc for Refusing {
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && new_size >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && new_size >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.realloc(ptr, layout, new_size) }
@@ -101,9 +108,9 @@ fn batch_smooth_reports_a_refused_output_vector() {
   // layout it is aimed at.
   let output_bytes = N * core::mem::size_of::<Windowed<f32>>();
   LIMIT.store(output_bytes - 64, Ordering::Relaxed);
-  ARMED.store(true, Ordering::Relaxed);
+  ARMED.set(true);
   let refused = cfg.smooth(&input);
-  ARMED.store(false, Ordering::Relaxed);
+  ARMED.set(false);
 
   // Reaching this line at all is half the assertion: a `smooth` that asked for
   // its output infallibly would have aborted this binary instead of returning.

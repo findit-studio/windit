@@ -6,11 +6,11 @@
 //! allocation it cannot get must come back as `WinditError::AllocFailed` — an
 //! abort would break the same contract `try_slice_pad_mask` exists to keep.
 //!
-//! Proving that needs an allocator that refuses, which is a process-wide
-//! setting, so this suite is one test in its own binary: nothing else is running
-//! while the refusal is armed. The refusal is also size-gated, so the harness's
-//! own small allocations still succeed and the failure that is observed is the
-//! one the chunker asked for.
+//! Proving that needs an allocator that refuses, and the allocator is
+//! process-wide: the harness's own threads allocate while the test runs. So the
+//! refusal is armed on the test's own thread alone, and it is size-gated, so the
+//! test's own small allocations still succeed and the failure that is observed
+//! is the one the chunker asked for.
 //!
 //! Gated on `text`: without it there is no chunker, and the file compiles to an
 //! empty test binary so the rest of the feature matrix still builds.
@@ -21,7 +21,8 @@
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
-  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
 };
 
 use windit::{
@@ -34,8 +35,14 @@ use windit::{
 /// else to the system allocator.
 struct Refusing;
 
-/// Whether the refusal is in effect.
-static ARMED: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+  /// Whether the refusal is in effect on this thread. Only the test's own
+  /// thread arms it, so the harness's threads, which allocate while the test
+  /// runs, are never refused. A `const`-initialized `Cell` has no destructor,
+  /// so it is read without allocating, which is what lets the allocator read
+  /// it.
+  static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// The size at or above which an armed allocation is refused. Above the
 /// chunker's own fixed-size scratch (a descent stack of at most one frame per
@@ -49,7 +56,7 @@ static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 // forward, so nothing is freed by an allocator that did not allocate it.
 unsafe impl GlobalAlloc for Refusing {
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && layout.size() >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && layout.size() >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.alloc(layout) }
@@ -60,7 +67,7 @@ unsafe impl GlobalAlloc for Refusing {
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && new_size >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && new_size >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.realloc(ptr, layout, new_size) }
@@ -92,9 +99,9 @@ fn a_refused_output_growth_is_a_typed_error() {
   assert_eq!(chunker.chunk(&text, &opts).unwrap().len(), 1000);
 
   LIMIT.store(4096, Ordering::Relaxed);
-  ARMED.store(true, Ordering::Relaxed);
+  ARMED.set(true);
   let refused = chunker.chunk(&text, &opts);
-  ARMED.store(false, Ordering::Relaxed);
+  ARMED.set(false);
 
   assert!(
     matches!(refused, Err(WinditError::AllocFailed { .. })),

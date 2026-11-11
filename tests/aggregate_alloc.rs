@@ -8,10 +8,11 @@
 //! contract `try_slice_pad_mask` and `ContentAware::chunk` keep; an abort would
 //! break it.
 //!
-//! Proving that needs an allocator that refuses, which is a process-wide setting,
-//! so this suite is one binary: nothing else runs while the refusal is armed. The
-//! refusal is size-gated above the harness's own small allocations, so the
-//! failure observed is the one the aggregation asked for. Each built-in policy
+//! Proving that needs an allocator that refuses, and the allocator is process-wide:
+//! the harness's own threads allocate while the test runs. So the refusal is armed
+//! on the test's own thread alone, and size-gated above the test's own small
+//! allocations, so the failure observed is the one the aggregation asked for.
+//! Each built-in policy
 //! gets its own case: they grow different buffers (`MeanRenormalized` and
 //! `CoverageWeightedMean` the accumulator, `EmaRenormalized` its state,
 //! `SaliencyWeighted` its weights and accumulator), so a sweep that missed one
@@ -27,7 +28,8 @@
 
 use std::{
   alloc::{GlobalAlloc, Layout, System},
-  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
   vec::Vec,
 };
 
@@ -42,8 +44,14 @@ use windit::{
 /// else to the system allocator.
 struct Refusing;
 
-/// Whether the refusal is in effect.
-static ARMED: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+  /// Whether the refusal is in effect on this thread. Only the test's own
+  /// thread arms it, so the harness's threads, which allocate while the test
+  /// runs, are never refused. A `const`-initialized `Cell` has no destructor,
+  /// so it is read without allocating, which is what lets the allocator read
+  /// it.
+  static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// The size at or above which an armed allocation is refused. Set above the
 /// harness's own churn and below the dimension-sized buffer under test, so the
@@ -56,7 +64,7 @@ static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 // so nothing is freed by an allocator that did not allocate it.
 unsafe impl GlobalAlloc for Refusing {
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && layout.size() >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && layout.size() >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.alloc(layout) }
@@ -67,7 +75,7 @@ unsafe impl GlobalAlloc for Refusing {
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && new_size >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && new_size >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.realloc(ptr, layout, new_size) }
@@ -98,9 +106,9 @@ fn refused<P: AggregatePolicy<f64>>(policy: &P, dim: usize) -> Result<Vec<f64>, 
   // A dim-length f64 buffer is 8 * dim bytes; gate just under that so the buffer
   // under test is refused while the harness's smaller allocations pass.
   LIMIT.store(dim * 8 - 64, Ordering::Relaxed);
-  ARMED.store(true, Ordering::Relaxed);
+  ARMED.set(true);
   let out = policy.aggregate_values(&embeddings, &coverages, dim);
-  ARMED.store(false, Ordering::Relaxed);
+  ARMED.set(false);
   out
 }
 
@@ -108,9 +116,9 @@ fn refused<P: AggregatePolicy<f64>>(policy: &P, dim: usize) -> Result<Vec<f64>, 
 /// the harness's own allocations, so the size gate can separate them.
 const DIM: usize = 8192;
 
-/// One test, not four: the refusal is a process-wide setting, and the default
+/// One test, not four: the size gate is a process-wide setting, and the default
 /// harness runs a binary's tests in parallel, so each built-in is checked
-/// sequentially here rather than racing the others to arm the allocator. Each
+/// sequentially here rather than racing the others to set the gate. Each
 /// grows a different buffer — the accumulator for the two means, the state for
 /// the EMA, the weights then accumulator for saliency — so a sweep that left one
 /// on an infallible `Vec::with_capacity`/`vec!`/`to_vec`/`collect` would surface
