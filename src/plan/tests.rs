@@ -1322,10 +1322,41 @@ fn every_road_agrees_on_every_variant_name_and_ordinal() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn tail_policy_names_an_unknown_byte_key() {
+  use ciborium::Value;
+  use std::string::ToString;
+
+  // A CBOR tail map whose stray key is a byte string: the refusal names it,
+  // as text where it is UTF-8 and as hex where it is not.
+  let read = |key: Value| {
+    let map = Value::Map(vec![
+      (
+        Value::Text("kind".into()),
+        Value::Text("keep_with_coverage".into()),
+      ),
+      (key, Value::Integer(1.into())),
+    ]);
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&map, &mut bytes).unwrap();
+    ciborium::from_reader::<TailPolicy, _>(bytes.as_slice())
+      .unwrap_err()
+      .to_string()
+  };
+  let named = read(Value::Bytes(b"max_windows".to_vec()));
+  assert!(named.contains("max_windows"), "{named}");
+  let hex = read(Value::Bytes(vec![0xff, 0xfe]));
+  assert!(hex.contains("0xfffe"), "{hex}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn tail_policy_reads_a_map_whose_keys_arrive_as_bytes() {
+  use std::string::ToString;
+
   // The derived reader recognises byte-form field identifiers, which a CBOR map
   // with byte-string keys produces. Delegating the map to that reader is what
-  // makes this hold; the test is here because no dev-dependency emits them.
+  // makes this hold; the test is here because no dev-dependency's serializer
+  // emits them.
   use hand_built::{from_map, Entry, Key};
 
   assert_eq!(
@@ -1340,12 +1371,14 @@ fn tail_policy_reads_a_map_whose_keys_arrive_as_bytes() {
     .unwrap(),
     TailPolicy::DropBelowMin(5)
   );
-  // A byte key that is neither field is refused exactly as a string one is.
-  assert!(from_map(&[
+  // A byte key that is neither field is refused exactly as a string one is,
+  // by its name.
+  let refused = from_map(&[
     (Key::Bytes(b"future"), Entry::Number(1)),
     (Key::Bytes(b"kind"), Entry::Text("keep_with_coverage")),
   ])
-  .is_err());
+  .unwrap_err();
+  assert!(refused.to_string().contains("future"), "{refused}");
 }
 
 #[cfg(feature = "serde")]

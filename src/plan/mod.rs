@@ -263,15 +263,15 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 /// A self-describing format writes the two as named fields —
 /// `{"kind":"drop_below_min","value":5}` — and a compact one writes the variant
 /// and then the payload, `[01, 05]` under postcard. An entry that is neither
-/// field is refused, as [`WindowOptions`] refuses an unknown key: a stray key
-/// beside `kind`, such as a `max_windows` misplaced there, would otherwise be
-/// dropped without a word.
+/// field is refused by its key, as [`WindowOptions`] refuses an unknown key: a
+/// stray key beside `kind`, such as a `max_windows` misplaced there, would
+/// otherwise be dropped without a word.
 ///
 /// `Deserialize` asks for a struct, which is what lets serde route each format
-/// to the road it belongs on: a self-describing format's map goes straight to
-/// serde's own derived adjacently tagged reader, so that grammar is `0.4.0`'s
-/// to the letter but for the stray entry it now refuses, and a compact
-/// format's sequence goes to a small reader written for it.
+/// to the road it belongs on: a self-describing format's map goes to serde's
+/// own derived adjacently tagged reader, each key checked on the way, so that
+/// grammar is `0.4.0`'s to the letter but for the stray entry it now refuses,
+/// and a compact format's sequence goes to a small reader written for it.
 ///
 /// The derive alone could not serve both: an adjacent tag is deserialized by
 /// buffering the content, which asks for `deserialize_any`, and a format that
@@ -346,7 +346,14 @@ const _: () = {
   use core::fmt;
 
   use serde::{
-    de::{value::MapAccessDeserializer, Error as _, Expected, MapAccess, SeqAccess, Visitor},
+    de::{
+      value::{
+        BorrowedBytesDeserializer, BorrowedStrDeserializer, BytesDeserializer,
+        MapAccessDeserializer,
+      },
+      DeserializeSeed, Error as _, Expected, IntoDeserializer, MapAccess, SeqAccess, Unexpected,
+      Visitor,
+    },
     Deserialize, Deserializer, Serialize, Serializer,
   };
 
@@ -376,10 +383,11 @@ const _: () = {
       mod wire {
         use serde::{Deserialize, Serialize};
 
-        /// The adjacently tagged document, derived. An entry that is neither
-        /// the tag nor the content is refused.
+        /// The adjacently tagged document, derived. The map road hands it its
+        /// map through `KnownKeys`, which refuses an entry that is neither the
+        /// tag nor the content by name before this reader sees it.
         #[derive(Clone, Copy, Deserialize, Serialize)]
-        #[serde(tag = $tag, content = $content, deny_unknown_fields)]
+        #[serde(tag = $tag, content = $content)]
         pub(super) enum TailPolicy {
           $( #[serde(rename = $name)] $variant $( ( $payload ) )?, )+
         }
@@ -547,9 +555,9 @@ const _: () = {
     /// whether a key arrived as text or as bytes, and what each failure says —
     /// is answered exactly as `0.4.0` answered it, because it is the same code.
     /// The one exception is an entry that is neither field: `0.4.0` skipped it,
-    /// and from `0.5.2` it is refused (`deny_unknown_fields`).
+    /// and from `0.5.2` [`KnownKeys`] refuses it, naming its key.
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
-      wire::TailPolicy::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+      wire::TailPolicy::deserialize(MapAccessDeserializer::new(KnownKeys(map))).map(Into::into)
     }
 
     /// The shape a format that encodes a struct as a sequence hands over: the
@@ -565,6 +573,115 @@ const _: () = {
         .next_element::<wire::tag::TailPolicy>()?
         .ok_or_else(|| A::Error::invalid_length(0, &self))?;
       from_tag(tag, &mut seq, &self)
+    }
+  }
+
+  /// The map road's map, each key checked before the derived reader sees it:
+  /// `kind` or `value` (or `0` or `1`, from a format that numbers its fields)
+  /// passes through, and any other key is refused by name, a text key as
+  /// itself and a byte key as its text, or as hex where it is not UTF-8.
+  struct KnownKeys<A>(A);
+
+  impl<'de, A: MapAccess<'de>> MapAccess<'de> for KnownKeys<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+      &mut self,
+      seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+      self.0.next_key_seed(KnownKey(seed))
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+      self.0.next_value_seed(seed)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+      self.0.size_hint()
+    }
+  }
+
+  /// One key of the map road: checked, then handed to the derived reader's
+  /// own seed in the form it arrived in.
+  struct KnownKey<K>(K);
+
+  impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for KnownKey<K> {
+    type Value = K::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<K::Value, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  /// A byte key that is not UTF-8, as lowercase hex.
+  struct Hex<'a>(&'a [u8]);
+
+  impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+  }
+
+  impl<K> KnownKey<K> {
+    /// The refusal of a byte key that is neither field, by its name.
+    fn unknown_bytes<E: serde::de::Error>(bytes: &[u8]) -> E {
+      match core::str::from_utf8(bytes) {
+        Ok(text) => E::unknown_field(text, wire::FIELDS),
+        Err(_) => E::custom(format_args!(
+          "unknown field 0x{}, expected `{}` or `{}`",
+          Hex(bytes),
+          wire::FIELDS[0],
+          wire::FIELDS[1]
+        )),
+      }
+    }
+  }
+
+  impl<'de, K: DeserializeSeed<'de>> Visitor<'de> for KnownKey<K> {
+    type Value = K::Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "`{}` or `{}`", wire::FIELDS[0], wire::FIELDS[1])
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<K::Value, E> {
+      if v < wire::FIELDS.len() as u64 {
+        self.0.deserialize(v.into_deserializer())
+      } else {
+        Err(E::invalid_value(Unexpected::Unsigned(v), &self))
+      }
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<K::Value, E> {
+      if wire::FIELDS.contains(&v) {
+        self.0.deserialize(v.into_deserializer())
+      } else {
+        Err(E::unknown_field(v, wire::FIELDS))
+      }
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<K::Value, E> {
+      if wire::FIELDS.contains(&v) {
+        self.0.deserialize(BorrowedStrDeserializer::new(v))
+      } else {
+        Err(E::unknown_field(v, wire::FIELDS))
+      }
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<K::Value, E> {
+      if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
+        self.0.deserialize(BytesDeserializer::new(v))
+      } else {
+        Err(Self::unknown_bytes(v))
+      }
+    }
+
+    fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<K::Value, E> {
+      if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
+        self.0.deserialize(BorrowedBytesDeserializer::new(v))
+      } else {
+        Err(Self::unknown_bytes(v))
+      }
     }
   }
 
