@@ -3846,6 +3846,150 @@ fn kind_serde_round_trip() {
   assert!(matches!(back, AggregatePolicyKind::Ema { alpha } if alpha == 0.75));
 }
 
+/// Every variant, in each format the crate's laws read: the three
+/// human-readable ones through the strict road, CBOR and postcard through the
+/// derived one. TOML holds the selector inside a document, as a configuration
+/// does.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_round_trips_through_every_format() {
+  #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+  struct Document {
+    aggregate: AggregatePolicyKind,
+  }
+
+  for kind in [
+    AggregatePolicyKind::CoverageWeightedMean,
+    AggregatePolicyKind::MeanRenormalized,
+    AggregatePolicyKind::Ema { alpha: 0.25 },
+    AggregatePolicyKind::SaliencyWeighted,
+  ] {
+    let json = serde_json::to_string(&kind).unwrap();
+    assert_eq!(
+      serde_json::from_str::<AggregatePolicyKind>(&json).unwrap(),
+      kind,
+      "JSON"
+    );
+    let yaml = serde_yaml_ng::to_string(&kind).unwrap();
+    assert_eq!(
+      serde_yaml_ng::from_str::<AggregatePolicyKind>(&yaml).unwrap(),
+      kind,
+      "YAML {yaml}"
+    );
+    let document = Document { aggregate: kind };
+    let toml = toml::to_string(&document).unwrap();
+    assert_eq!(
+      toml::from_str::<Document>(&toml).unwrap(),
+      document,
+      "TOML {toml}"
+    );
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&kind, &mut cbor).unwrap();
+    assert_eq!(
+      ciborium::from_reader::<AggregatePolicyKind, _>(cbor.as_slice()).unwrap(),
+      kind,
+      "CBOR"
+    );
+    let compact = postcard::to_allocvec(&kind).unwrap();
+    assert_eq!(
+      postcard::from_bytes::<AggregatePolicyKind>(&compact).unwrap(),
+      kind,
+      "postcard"
+    );
+  }
+}
+
+/// In JSON, a unit variant is a name: written as a one-entry map, it is
+/// refused by name whatever its value, `null` included.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_json() {
+  use std::string::ToString;
+
+  for (document, named) in [
+    (r#"{"MeanRenormalized":null}"#, "MeanRenormalized"),
+    (r#"{"CoverageWeightedMean":{}}"#, "CoverageWeightedMean"),
+    (r#"{"SaliencyWeighted":{"alpha":0.5}}"#, "SaliencyWeighted"),
+  ] {
+    let refused = serde_json::from_str::<AggregatePolicyKind>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    serde_json::from_str::<AggregatePolicyKind>(r#""MeanRenormalized""#).unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5}}"#).unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+}
+
+/// In TOML, the same: a unit variant written as a table, empty or not, or as
+/// an array, is refused by name.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_toml() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    aggregate: AggregatePolicyKind,
+  }
+
+  let read = |text: &str| toml::from_str::<Document>(text).map(|document| document.aggregate);
+  for (document, named) in [
+    ("aggregate = { MeanRenormalized = {} }", "MeanRenormalized"),
+    ("aggregate = { SaliencyWeighted = [] }", "SaliencyWeighted"),
+    (
+      "aggregate = { CoverageWeightedMean = { alpha = 0.5 } }",
+      "CoverageWeightedMean",
+    ),
+  ] {
+    let refused = read(document).unwrap_err().to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    read("aggregate = \"MeanRenormalized\"").unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    read("aggregate = { Ema = { alpha = 0.5 } }").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+}
+
+/// In YAML, the same, and the tagged forms YAML writes an enum in still read.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_yaml() {
+  use std::string::ToString;
+
+  for (document, named) in [
+    ("MeanRenormalized: ~", "MeanRenormalized"),
+    ("CoverageWeightedMean: {}", "CoverageWeightedMean"),
+    ("SaliencyWeighted: {alpha: 0.5}", "SaliencyWeighted"),
+  ] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("MeanRenormalized").unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("Ema: {alpha: 0.5}").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("!Ema {alpha: 0.5}").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+}
+
 // Shared quantized fixture: W = 3, D = 8, mixed-sign non-cancelling codes with
 // distinct per-window (scale, zero_point) and coverages (1.0, 0.75, 0.5 at
 // window 4), exercising asymmetric and per-window-scale dequantization together.

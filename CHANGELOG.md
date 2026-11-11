@@ -19,6 +19,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}`,
   put the cap inside the tail policy and loaded with `max_windows` unbounded.
   `TailPolicy`'s sequence form carries no keys and is unchanged.
+- **In a human-readable format, an `AggregatePolicyKind` unit variant is read
+  only as its name.** Written as a one-entry map, such as
+  `{"MeanRenormalized": null}` in JSON, `MeanRenormalized: ~` in YAML or
+  `{ MeanRenormalized = {} }` in TOML, it is refused by name, whatever its
+  value; before, JSON and YAML read a `null` there and TOML an empty table or
+  array. In a non-human-readable format, a unit variant follows that format's
+  own unit handling: ciborium 0.2's CBOR reads `{"MeanRenormalized": …}` as
+  `MeanRenormalized` without reading the value. Compact formats such as
+  postcard and bincode read the selector as before.
 
 ## 0.5.1 - 2026-09-06
 

@@ -1236,9 +1236,15 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
 /// to obtain a boxed [`AggregatePolicy`]. Requires `alloc` (for the boxed policy)
 /// in addition to `serde`. An unknown key inside [`Ema`](AggregatePolicyKind::Ema)
 /// is refused by name, as every windit wire type refuses one.
+///
+/// In a human-readable format (JSON, YAML, TOML), a unit variant is read only
+/// as its name: written as a one-entry map, it is refused whatever its value,
+/// `null` included. In a non-human-readable format, a unit variant follows that
+/// format's own unit handling: ciborium 0.2's CBOR, for one, reads
+/// `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
+/// A compact format (postcard, bincode) reads the variant as it writes it.
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
-#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub enum AggregatePolicyKind {
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,
@@ -1259,6 +1265,160 @@ pub enum AggregatePolicyKind {
   /// Selects [`SaliencyWeighted`].
   SaliencyWeighted,
 }
+
+/// `Deserialize`, split on [`is_human_readable`](serde::Deserializer::is_human_readable).
+///
+/// A human-readable format is asked for the value as it stands, a name or a
+/// one-entry map, so a unit variant's map form is refused before any of its
+/// value is read. A format that is not human-readable is asked for an enum, as
+/// serde's derive asks: a compact format cannot describe a value as it stands,
+/// and its unit variants carry no value to refuse.
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+const _: () = {
+  use core::fmt;
+
+  use serde::{
+    de::{
+      self,
+      value::{MapAccessDeserializer, StrDeserializer},
+      EnumAccess, Error as _, IgnoredAny, MapAccess, Unexpected, VariantAccess, Visitor,
+    },
+    Deserialize, Deserializer,
+  };
+
+  /// The derived reader the non-human-readable formats are given: the same
+  /// variants, in the same order, under the same name.
+  mod wire {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) enum AggregatePolicyKind {
+      CoverageWeightedMean,
+      MeanRenormalized,
+      Ema { alpha: f64 },
+      SaliencyWeighted,
+    }
+  }
+
+  impl From<wire::AggregatePolicyKind> for AggregatePolicyKind {
+    fn from(kind: wire::AggregatePolicyKind) -> Self {
+      match kind {
+        wire::AggregatePolicyKind::CoverageWeightedMean => Self::CoverageWeightedMean,
+        wire::AggregatePolicyKind::MeanRenormalized => Self::MeanRenormalized,
+        wire::AggregatePolicyKind::Ema { alpha } => Self::Ema { alpha },
+        wire::AggregatePolicyKind::SaliencyWeighted => Self::SaliencyWeighted,
+      }
+    }
+  }
+
+  /// A variant's name, read as serde's derive reads it.
+  #[derive(Clone, Copy, Deserialize)]
+  #[serde(variant_identifier)]
+  enum Tag {
+    CoverageWeightedMean,
+    MeanRenormalized,
+    Ema,
+    SaliencyWeighted,
+  }
+
+  impl Tag {
+    /// The unit variant this names; `None` for `Ema`, which carries its
+    /// `alpha`.
+    const fn unit(self) -> Option<AggregatePolicyKind> {
+      match self {
+        Self::CoverageWeightedMean => Some(AggregatePolicyKind::CoverageWeightedMean),
+        Self::MeanRenormalized => Some(AggregatePolicyKind::MeanRenormalized),
+        Self::Ema => None,
+        Self::SaliencyWeighted => Some(AggregatePolicyKind::SaliencyWeighted),
+      }
+    }
+
+    const fn name(self) -> &'static str {
+      match self {
+        Self::CoverageWeightedMean => "CoverageWeightedMean",
+        Self::MeanRenormalized => "MeanRenormalized",
+        Self::Ema => "Ema",
+        Self::SaliencyWeighted => "SaliencyWeighted",
+      }
+    }
+  }
+
+  /// `Ema`'s fields.
+  #[derive(Deserialize)]
+  #[serde(deny_unknown_fields)]
+  struct Ema {
+    alpha: f64,
+  }
+
+  /// `Ema`'s fields as a struct variant's map, for a format that reads an enum
+  /// by its tag (YAML's `!Ema`).
+  struct EmaFields;
+
+  impl<'de> Visitor<'de> for EmaFields {
+    type Value = AggregatePolicyKind;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("`Ema`'s `alpha`")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(map))?;
+      Ok(AggregatePolicyKind::Ema { alpha })
+    }
+  }
+
+  /// The human-readable road: a name, a one-entry map, or a tagged value.
+  struct Strict;
+
+  impl<'de> Visitor<'de> for Strict {
+    type Value = AggregatePolicyKind;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("a policy's name, or `Ema` with its `alpha`")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+      let tag = Tag::deserialize(StrDeserializer::<E>::new(v))?;
+      tag
+        .unit()
+        .ok_or_else(|| E::invalid_type(Unexpected::UnitVariant, &"`Ema` with its `alpha`"))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+      let Some(tag) = map.next_key::<Tag>()? else {
+        return Err(A::Error::invalid_length(0, &self));
+      };
+      if tag.unit().is_some() {
+        return Err(A::Error::custom(format_args!(
+          "`{}` takes no value, and the document gives it one",
+          tag.name()
+        )));
+      }
+      let Ema { alpha } = map.next_value()?;
+      if map.next_key::<IgnoredAny>()?.is_some() {
+        return Err(A::Error::invalid_length(2, &"a map of one entry"));
+      }
+      Ok(AggregatePolicyKind::Ema { alpha })
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+      let (tag, variant) = data.variant::<Tag>()?;
+      match tag.unit() {
+        Some(kind) => variant.unit_variant().map(|()| kind),
+        None => variant.struct_variant(&["alpha"], EmaFields),
+      }
+    }
+  }
+
+  impl<'de> Deserialize<'de> for AggregatePolicyKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      if deserializer.is_human_readable() {
+        deserializer.deserialize_any(Strict)
+      } else {
+        wire::AggregatePolicyKind::deserialize(deserializer).map(Into::into)
+      }
+    }
+  }
+};
 
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 impl AggregatePolicyKind {

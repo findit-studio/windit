@@ -106,6 +106,12 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # split turns on. `default-features = false` drops its `std` default, matching
 # the dev-dependencies above.
 ciborium = { version = "0.2", default-features = false }
+# YAML, the third human-readable format a configuration is written in, beside
+# JSON and TOML, for the laws `AggregatePolicyKind`'s strict road is held to.
+# `serde_yaml_ng` is the maintained continuation of `serde_yaml`. It has no
+# `alloc`-only build, so it is `std`; criterion already brings serde's `std` to
+# every test build.
+serde_yaml_ng = "0.10"
 
 [profile.bench]
 opt-level = 3
