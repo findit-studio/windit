@@ -4440,3 +4440,46 @@ fn half_stored_non_finite_is_rejected() {
     ));
   }
 }
+
+/// `Ema` is read from a map only: TOML's array form, which the derive read
+/// as `alpha` with the rest dropped, is refused naming `Ema`.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_reads_ema_from_a_map_only_in_toml() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let refused = toml::from_str::<Document>("aggregate = { Ema = [0.5, 0.75] }")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("Ema"), "{refused}");
+}
+
+/// A key beside the variant is refused by its name.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_names_a_key_beside_its_variant() {
+  use std::string::ToString;
+
+  let refused = serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5},"bogus":1}"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("bogus"), "{refused}");
+}
+
+/// A tagged YAML value that a unit variant refuses names the variant.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_names_its_variant_in_a_refused_yaml_tag() {
+  use std::string::ToString;
+
+  let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>("!MeanRenormalized {alpha: 0.5}")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("MeanRenormalized"), "{refused}");
+}

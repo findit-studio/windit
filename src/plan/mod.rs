@@ -572,7 +572,9 @@ const _: () = {
       let tag = seq
         .next_element::<wire::tag::TailPolicy>()?
         .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-      from_tag(tag, &mut seq, &self)
+      let policy = from_tag(tag, &mut seq, &self)?;
+      exhausted(&mut seq, wire::FIELDS.len(), wire::NAME)?;
+      Ok(policy)
     }
   }
 
@@ -709,16 +711,102 @@ const _: () = {
 /// With the `serde` feature every field is serialized, so a self-persisted
 /// geometry always round-trips exactly. On deserialization the `window`, `hop`,
 /// and `tail` fields are required; `max_windows` may be omitted and then
-/// defaults to no cap (`None`). Unknown keys are rejected.
+/// defaults to no cap (`None`). Unknown keys are rejected by name, and a
+/// sequence form with more than its four elements is refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,
   tail: TailPolicy,
   max_windows: Option<usize>,
 }
+
+/// Refuses an element past the `declared` ones a sequence road has read.
+///
+/// A format that does not check an array's end (TOML) would otherwise drop
+/// it. A compact format's sequence holds exactly the declared elements, so it
+/// has none to show, and nothing more is read from its buffer.
+#[cfg(feature = "serde")]
+fn exhausted<'de, A: serde::de::SeqAccess<'de>>(
+  seq: &mut A,
+  declared: usize,
+  name: &str,
+) -> Result<(), A::Error> {
+  match seq.next_element::<serde::de::IgnoredAny>()? {
+    None => Ok(()),
+    Some(_) => Err(serde::de::Error::custom(format_args!(
+      "`{name}`: {declared} elements expected, found more"
+    ))),
+  }
+}
+
+/// `Deserialize` for [`WindowOptions`]: the derived reader, given a map whole,
+/// or a sequence and then held to its four elements.
+#[cfg(feature = "serde")]
+const _: () = {
+  use core::fmt;
+
+  use serde::{
+    de::{
+      value::{MapAccessDeserializer, SeqAccessDeserializer},
+      MapAccess, SeqAccess, Visitor,
+    },
+    Deserialize, Deserializer,
+  };
+
+  /// The derived reader: the same fields, in the same order, under the same
+  /// name.
+  mod wire {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct WindowOptions {
+      pub(super) window: usize,
+      pub(super) hop: usize,
+      pub(super) tail: super::TailPolicy,
+      pub(super) max_windows: Option<usize>,
+    }
+  }
+
+  const FIELDS: &[&str] = &["window", "hop", "tail", "max_windows"];
+
+  impl From<wire::WindowOptions> for WindowOptions {
+    fn from(options: wire::WindowOptions) -> Self {
+      Self {
+        window: options.window,
+        hop: options.hop,
+        tail: options.tail,
+        max_windows: options.max_windows,
+      }
+    }
+  }
+
+  struct OptionsVisitor;
+
+  impl<'de> Visitor<'de> for OptionsVisitor {
+    type Value = WindowOptions;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("struct WindowOptions")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<WindowOptions, A::Error> {
+      wire::WindowOptions::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WindowOptions, A::Error> {
+      let options = wire::WindowOptions::deserialize(SeqAccessDeserializer::new(&mut seq))?;
+      exhausted(&mut seq, FIELDS.len(), "WindowOptions")?;
+      Ok(options.into())
+    }
+  }
+
+  impl<'de> Deserialize<'de> for WindowOptions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      deserializer.deserialize_struct("WindowOptions", FIELDS, OptionsVisitor)
+    }
+  }
+};
 
 impl WindowOptions {
   /// A geometry with the given window size, no overlap (`hop == window`),

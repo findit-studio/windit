@@ -18,16 +18,24 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key was dropped without a word. The document that made this the rule,
   `{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}`,
   put the cap inside the tail policy and loaded with `max_windows` unbounded.
-  `TailPolicy`'s sequence form carries no keys and is unchanged.
+- **A sequence form with more elements than its type declares is refused,
+  naming the count.** `WindowOptions` read from an array takes its four
+  elements and `TailPolicy` its tag and value; a further element is refused
+  as "N elements expected, found more". TOML's arrays do not check their own
+  end, so `options = [8, 4, {kind = "keep_with_coverage"}, 100, 999]` and
+  `tail = ["drop_below_min", 5, 99]` loaded with the last element dropped.
 - **In a human-readable format, an `AggregatePolicyKind` unit variant is read
   only as its name.** Written as a one-entry map, such as
   `{"MeanRenormalized": null}` in JSON, `MeanRenormalized: ~` in YAML or
   `{ MeanRenormalized = {} }` in TOML, it is refused by name, whatever its
   value; before, JSON and YAML read a `null` there and TOML an empty table or
-  array. In a non-human-readable format, a unit variant follows that format's
-  own unit handling: ciborium 0.2's CBOR reads `{"MeanRenormalized": …}` as
-  `MeanRenormalized` without reading the value. Compact formats such as
-  postcard and bincode read the selector as before.
+  array. `Ema` is read from a map only (`{ Ema = [0.5, 0.75] }` loaded with
+  `alpha = 0.5`), a key beside the variant is refused by name, and a tagged
+  YAML value the variant refuses names the variant. In a non-human-readable
+  format, a unit variant follows that format's own unit handling: ciborium
+  0.2's CBOR reads `{"MeanRenormalized": …}` as `MeanRenormalized` without
+  reading the value. Compact formats such as postcard and bincode read the
+  selector as before.
 
 ## 0.5.1 - 2026-09-06
 

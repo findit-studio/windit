@@ -1276,12 +1276,13 @@ pub enum AggregatePolicyKind {
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
 const _: () = {
   use core::fmt;
+  use std::string::String;
 
   use serde::{
     de::{
       self,
       value::{MapAccessDeserializer, StrDeserializer},
-      EnumAccess, Error as _, IgnoredAny, MapAccess, Unexpected, VariantAccess, Visitor,
+      DeserializeSeed, EnumAccess, Error as _, MapAccess, Unexpected, VariantAccess, Visitor,
     },
     Deserialize, Deserializer,
   };
@@ -1349,20 +1350,30 @@ const _: () = {
     alpha: f64,
   }
 
-  /// `Ema`'s fields as a struct variant's map, for a format that reads an enum
-  /// by its tag (YAML's `!Ema`).
+  /// `Ema`'s fields, read from a map and only from a map: an array, which no
+  /// human-readable format writes for a struct variant, is refused naming
+  /// `Ema`, where the derive would read its first element as `alpha` and,
+  /// under TOML, drop the rest.
   struct EmaFields;
 
   impl<'de> Visitor<'de> for EmaFields {
     type Value = AggregatePolicyKind;
 
     fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-      f.write_str("`Ema`'s `alpha`")
+      f.write_str("`Ema` with its `alpha`, as a map")
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
       let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(map))?;
       Ok(AggregatePolicyKind::Ema { alpha })
+    }
+  }
+
+  impl<'de> DeserializeSeed<'de> for EmaFields {
+    type Value = AggregatePolicyKind;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+      deserializer.deserialize_map(self)
     }
   }
 
@@ -1393,17 +1404,23 @@ const _: () = {
           tag.name()
         )));
       }
-      let Ema { alpha } = map.next_value()?;
-      if map.next_key::<IgnoredAny>()?.is_some() {
-        return Err(A::Error::invalid_length(2, &"a map of one entry"));
+      let kind = map.next_value_seed(EmaFields)?;
+      if let Some(extra) = map.next_key::<String>()? {
+        return Err(A::Error::custom(format_args!(
+          "`{extra}` beside `{}`: a policy is a map of one entry",
+          tag.name()
+        )));
       }
-      Ok(AggregatePolicyKind::Ema { alpha })
+      Ok(kind)
     }
 
     fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
       let (tag, variant) = data.variant::<Tag>()?;
       match tag.unit() {
-        Some(kind) => variant.unit_variant().map(|()| kind),
+        Some(kind) => variant
+          .unit_variant()
+          .map(|()| kind)
+          .map_err(|refused| A::Error::custom(format_args!("`{}`: {refused}", tag.name()))),
         None => variant.struct_variant(&["alpha"], EmaFields),
       }
     }

@@ -1551,3 +1551,51 @@ fn window_options_display_is_pinned() {
     "window=4,hop=4,tail=keep_with_coverage,max_windows=8"
   );
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_refuses_a_trailing_element_in_toml() {
+  use std::string::ToString;
+
+  // TOML's arrays do not check their own end, so the sequence road holds
+  // itself to the tag and the value: a third element is refused by count,
+  // and the two-element form still reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    tail: TailPolicy,
+  }
+
+  let refused = toml::from_str::<Document>(r#"tail = ["drop_below_min", 5, 99]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("2 elements expected"), "{refused}");
+  assert_eq!(
+    toml::from_str::<Document>(r#"tail = ["drop_below_min", 5]"#)
+      .unwrap()
+      .tail,
+    TailPolicy::DropBelowMin(5)
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_refuse_a_trailing_element_in_toml() {
+  use std::string::ToString;
+
+  // The same for the options' own sequence form: four elements, and a fifth
+  // is refused by count. A compact format's sequence still reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    options: WindowOptions,
+  }
+
+  let refused =
+    toml::from_str::<Document>(r#"options = [8, 4, {kind = "keep_with_coverage"}, 100, 999]"#)
+      .unwrap_err()
+      .to_string();
+  assert!(refused.contains("4 elements expected"), "{refused}");
+  let opts = WindowOptions::new(8).with_hop(4).with_max_windows(100);
+  let bytes = postcard::to_allocvec(&opts).unwrap();
+  assert_eq!(postcard::from_bytes::<WindowOptions>(&bytes).unwrap(), opts);
+}
