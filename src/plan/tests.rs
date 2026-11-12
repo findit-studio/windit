@@ -901,8 +901,8 @@ mod hand_built {
 
   use serde::de::{
     value::{
-      Error, MapAccessDeserializer, SeqAccessDeserializer, StrDeserializer, U32Deserializer,
-      U64Deserializer, UnitDeserializer,
+      Error, I128Deserializer, MapAccessDeserializer, SeqAccessDeserializer, StrDeserializer,
+      U32Deserializer, U64Deserializer, UnitDeserializer,
     },
     DeserializeSeed, EnumAccess, Error as _, MapAccess, SeqAccess, VariantAccess, Visitor,
   };
@@ -923,6 +923,8 @@ mod hand_built {
     /// A variant named by its ordinal rather than by its name — what a compact
     /// format writes for a tag.
     Variant(u32),
+    /// An integer offered as an `i128`, as a format does for one past `i64`.
+    Wide(i128),
   }
 
   impl Entry<'_> {
@@ -932,6 +934,7 @@ mod hand_built {
         Self::Number(number) => seed.deserialize(U64Deserializer::new(number)),
         Self::Unit => seed.deserialize(UnitDeserializer::new()),
         Self::Variant(index) => seed.deserialize(VariantIndex(index)),
+        Self::Wide(number) => seed.deserialize(I128Deserializer::new(number)),
       }
     }
   }
@@ -1949,4 +1952,78 @@ fn tail_policy_names_a_kind_that_is_a_number() {
   // A known limit: a number JSON cannot hold is refused by JSON itself, before
   // any reader of ours is asked, as "number out of range".
   assert!(serde_json::from_str::<TailPolicy>(r#"{"kind":1e400}"#).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_count_refuses_a_128_bit_integer_as_usize_does() {
+  use hand_built::{from_map, Entry, Key};
+  use std::string::ToString;
+
+  // serde's `usize` takes no integer offered as an `i128`, however small, and
+  // neither does the reader of a count: it is refused, named, as `usize`
+  // refused it.
+  let refused = from_map(&[
+    (Key::Text("kind"), Entry::Text("drop_below_min")),
+    (Key::Text("value"), Entry::Wide(5)),
+  ])
+  .unwrap_err()
+  .to_string();
+  assert!(
+    refused.contains("as i128, expected `drop_below_min`'s `value`"),
+    "{refused}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn keys_are_named_and_located() {
+  use std::string::ToString;
+
+  // A key is read by windit's own key reader, whatever its shape: a key that
+  // is not a name (YAML's `? [window]`) is refused naming the fields, and a
+  // repeated one as a duplicate, each where the format places the key.
+  for (doc, (line, column), named) in [
+    (
+      "? [window]\n: 4\nhop: 4\ntail: {kind: pad_full}",
+      (1, 3),
+      "expected a field of `WindowOptions`: `window`, `hop`, `tail`, `max_windows`",
+    ),
+    (
+      "window: 4\nwindow: 4\nhop: 4\ntail: {kind: pad_full}",
+      (2, 1),
+      "duplicate field `window`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<WindowOptions>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+  for (doc, (line, column), named) in [
+    ("? [kind]\n: pad_full", (1, 3), "expected `kind` or `value`"),
+    (
+      "kind: pad_full\nkind: pad_full",
+      (2, 1),
+      "duplicate field `kind`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<TailPolicy>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+
+  // JSON's keys are text, so its one key shape to refuse is the repeat.
+  let doc = r#"{"window":8,"window":8,"hop":4,"tail":{"kind":"pad_full"}}"#;
+  let refused = serde_json::from_str::<WindowOptions>(doc).unwrap_err();
+  assert!(
+    refused.to_string().contains("duplicate field `window`"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, doc.match_indices(r#""window""#).nth(1).unwrap().0 + 8),
+    "{refused}"
+  );
 }

@@ -4564,3 +4564,88 @@ fn ema_alpha_is_named_and_located_in_yaml() {
     );
   }
 }
+
+/// serde's `f64` takes no integer offered as an `i128` or a `u128`, and neither
+/// does `alpha`'s reader: TOML offers an integer past `u64` as one, and it is
+/// refused, named, at the value.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_refuses_a_128_bit_integer_as_f64_does() {
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let doc = "aggregate = { Ema = { alpha = 18446744073709551616 } }";
+  let refused = toml::from_str::<Document>(doc).unwrap_err();
+  let at = doc.find("18446744073709551616").unwrap();
+  assert_eq!(refused.span(), Some(at..at + 20), "{refused}");
+  assert!(
+    refused
+      .message()
+      .contains("expected `Ema`'s `alpha`, a number"),
+    "{refused}"
+  );
+}
+
+/// A key beside the variant is refused by its own reader, so the format places
+/// the refusal at that key.
+#[cfg(feature = "serde")]
+#[test]
+fn a_key_beside_the_variant_is_named_and_located() {
+  use std::string::ToString;
+
+  let doc = "Ema: {alpha: 0.5}\nbogus: 1";
+  let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  let at = refused.location().expect("a located refusal");
+  assert_eq!((at.line(), at.column()), (2, 1), "{refused}");
+  assert!(
+    refused.to_string().contains("`bogus` beside `Ema`"),
+    "{refused}"
+  );
+
+  let doc = r#"{"Ema":{"alpha":0.5},"bogus":1}"#;
+  let refused = serde_json::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  assert!(
+    refused.to_string().contains("`bogus` beside `Ema`"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, r#""bogus""#)),
+    "{refused}"
+  );
+}
+
+/// A policy's keys and `Ema`'s are read by windit's own readers, whatever their
+/// shape: a key that is not a name is refused naming what is expected, and a
+/// repeated field as a duplicate, each at the key.
+#[cfg(feature = "serde")]
+#[test]
+fn policy_keys_are_named_and_located() {
+  use std::string::ToString;
+
+  for (doc, (line, column), named) in [
+    (
+      "? [Ema]\n: {alpha: 0.5}",
+      (1, 3),
+      "expected a policy's name: `CoverageWeightedMean`, `MeanRenormalized`, `Ema`, `SaliencyWeighted`",
+    ),
+    (
+      "Ema: {? [alpha] : 0.5}",
+      (1, 9),
+      "expected a field of `Ema`: `alpha`",
+    ),
+    (
+      "Ema: {alpha: 0.5, alpha: 0.6}",
+      (1, 19),
+      "duplicate field `alpha`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+}

@@ -289,10 +289,14 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 /// So the format makes the refusal itself, at the value: TOML's span, YAML's
 /// `location()`, JSON's line and column. Known limits: a refusal a format makes
 /// before asking any of windit's readers (a number it cannot hold, such as
-/// `1e400`; a syntax error) names nothing of windit's; a `value` written before
-/// its `kind` is held by the derived reader and read from what it holds, which
-/// has no location; and a value given to a unit variant is refused by serde's
-/// derive, which names the variant by its Rust name.
+/// `1e400`; a syntax error; in CBOR, a value of the wrong type, which
+/// ciborium's typed readers refuse first, and a key that is neither text nor
+/// bytes) names nothing of windit's; a `value` written before its `kind` is
+/// held by the derived reader and read from what it holds, which has no
+/// location; and a value given to a unit variant is refused by serde's derive,
+/// which names the variant by its Rust name. Keys are read by windit's own
+/// reader: a key that is not `kind` or `value`, whatever its shape, and a
+/// repeated one are refused at the key, named.
 ///
 /// The derive alone could not serve both: an adjacent tag is deserialized by
 /// buffering the content, which asks for `deserialize_any`, and a format that
@@ -605,8 +609,12 @@ const _: () = {
     /// text names it: read directly, or held by the derived reader until the
     /// `kind` is known and read from what it holds.
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
-      wire::TailPolicy::deserialize(MapAccessDeserializer::new(KnownKeys { map, kind: false }))
-        .map(Into::into)
+      wire::TailPolicy::deserialize(MapAccessDeserializer::new(KnownKeys {
+        map,
+        kind: false,
+        seen: 0,
+      }))
+      .map(Into::into)
     }
 
     /// The shape a format that encodes a struct as a sequence hands over: the
@@ -637,6 +645,8 @@ const _: () = {
     map: A,
     /// Whether the key just read is `kind`, whose value comes next.
     kind: bool,
+    /// The fields already read, one bit each.
+    seen: u8,
   }
 
   impl<'de, A: MapAccess<'de>> MapAccess<'de> for KnownKeys<A> {
@@ -649,6 +659,7 @@ const _: () = {
       self.map.next_key_seed(KnownKey {
         seed,
         kind: &mut self.kind,
+        seen: &mut self.seen,
       })
     }
 
@@ -665,11 +676,27 @@ const _: () = {
     }
   }
 
-  /// One key of the map road: checked, noted if it is `kind`, then handed to
-  /// the derived reader's own seed in the form it arrived in.
+  /// One key of the map road: checked, refused at the key where it repeats a
+  /// field, noted if it is `kind`, then handed to the derived reader's own seed
+  /// in the form it arrived in.
   struct KnownKey<'a, K> {
     seed: K,
     kind: &'a mut bool,
+    seen: &'a mut u8,
+  }
+
+  impl<K> KnownKey<'_, K> {
+    /// The field at `at` (`0` the `kind`, `1` the `value`), refused where it
+    /// was read already, and noted.
+    fn first<E: serde::de::Error>(&mut self, at: usize) -> Result<(), E> {
+      let bit = 1u8 << at;
+      if *self.seen & bit != 0 {
+        return Err(E::duplicate_field(wire::FIELDS[at]));
+      }
+      *self.seen |= bit;
+      *self.kind = at == 0;
+      Ok(())
+    }
   }
 
   impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for KnownKey<'_, K> {
@@ -711,48 +738,56 @@ const _: () = {
       write!(f, "`{}` or `{}`", wire::FIELDS[0], wire::FIELDS[1])
     }
 
-    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<K::Value, E> {
-      if v < wire::FIELDS.len() as u64 {
-        *self.kind = v == 0;
-        self.seed.deserialize(v.into_deserializer())
-      } else {
-        Err(E::invalid_value(Unexpected::Unsigned(v), &self))
+    fn visit_u64<E: serde::de::Error>(mut self, v: u64) -> Result<K::Value, E> {
+      match usize::try_from(v)
+        .ok()
+        .filter(|at| *at < wire::FIELDS.len())
+      {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(v.into_deserializer())
+        }
+        None => Err(E::invalid_value(Unexpected::Unsigned(v), &self)),
       }
     }
 
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<K::Value, E> {
-      if wire::FIELDS.contains(&v) {
-        *self.kind = v == wire::FIELDS[0];
-        self.seed.deserialize(v.into_deserializer())
-      } else {
-        Err(E::unknown_field(v, wire::FIELDS))
+    fn visit_str<E: serde::de::Error>(mut self, v: &str) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| *field == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(v.into_deserializer())
+        }
+        None => Err(E::unknown_field(v, wire::FIELDS)),
       }
     }
 
-    fn visit_borrowed_str<E: serde::de::Error>(self, v: &'de str) -> Result<K::Value, E> {
-      if wire::FIELDS.contains(&v) {
-        *self.kind = v == wire::FIELDS[0];
-        self.seed.deserialize(BorrowedStrDeserializer::new(v))
-      } else {
-        Err(E::unknown_field(v, wire::FIELDS))
+    fn visit_borrowed_str<E: serde::de::Error>(mut self, v: &'de str) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| *field == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BorrowedStrDeserializer::new(v))
+        }
+        None => Err(E::unknown_field(v, wire::FIELDS)),
       }
     }
 
-    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<K::Value, E> {
-      if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
-        *self.kind = v == wire::FIELDS[0].as_bytes();
-        self.seed.deserialize(BytesDeserializer::new(v))
-      } else {
-        Err(Self::unknown_bytes(v))
+    fn visit_bytes<E: serde::de::Error>(mut self, v: &[u8]) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| field.as_bytes() == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BytesDeserializer::new(v))
+        }
+        None => Err(Self::unknown_bytes(v)),
       }
     }
 
-    fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> Result<K::Value, E> {
-      if wire::FIELDS.iter().any(|field| field.as_bytes() == v) {
-        *self.kind = v == wire::FIELDS[0].as_bytes();
-        self.seed.deserialize(BorrowedBytesDeserializer::new(v))
-      } else {
-        Err(Self::unknown_bytes(v))
+    fn visit_borrowed_bytes<E: serde::de::Error>(mut self, v: &'de [u8]) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| field.as_bytes() == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BorrowedBytesDeserializer::new(v))
+        }
+        None => Err(Self::unknown_bytes(v)),
       }
     }
   }
@@ -928,7 +963,11 @@ const _: () = {
 /// defaults to no cap (`None`). Unknown keys are rejected by name, and a
 /// sequence form with more than its four elements is refused. A refused count
 /// is refused by a reader that names its field, `` expected `window`, an
-/// unsigned integer ``, so the format locates the refusal at the value.
+/// unsigned integer ``, so the format locates the refusal at the value; its
+/// keys are read by windit's own reader, so a key that is not a field's name,
+/// whatever its shape, and a repeated field are refused at the key, named. In
+/// CBOR, a count of the wrong type is refused by ciborium itself, before this
+/// reader is asked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct WindowOptions {
@@ -994,14 +1033,6 @@ impl serde::de::Visitor<'_> for Count {
   fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<usize, E> {
     usize::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
   }
-
-  fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<usize, E> {
-    usize::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Other("u128"), &self))
-  }
-
-  fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<usize, E> {
-    usize::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Other("i128"), &self))
-  }
 }
 
 /// Refuses an element past the `declared` ones a sequence road has read.
@@ -1024,9 +1055,11 @@ fn exhausted<'de, A: serde::de::SeqAccess<'de>>(
 }
 
 /// `Deserialize` for [`WindowOptions`]: the derived reader, given a map whole,
-/// or a sequence and then held to its four elements. Its counts are read
-/// through [`Count`], so a refused one names its field, on either road; a
-/// tail policy names what it refuses itself.
+/// or a sequence and then held to its four elements. Its keys are read by
+/// windit's own key reader, so a key that is not a field's name is refused
+/// at the key, named; its counts are read through [`Count`], so a refused one
+/// names its field, on either road; a tail policy names what it refuses
+/// itself.
 #[cfg(feature = "serde")]
 const _: () = {
   use core::fmt;
@@ -1100,7 +1133,12 @@ const _: () = {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<WindowOptions, A::Error> {
-      wire::WindowOptions::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+      wire::WindowOptions::deserialize(MapAccessDeserializer::new(crate::keys::Fields::new(
+        map,
+        "`WindowOptions`",
+        FIELDS,
+      )))
+      .map(Into::into)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WindowOptions, A::Error> {

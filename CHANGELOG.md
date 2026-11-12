@@ -65,9 +65,21 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   location, so JSON places its refusal at the map's end. Known limits: a
   refusal a format makes before asking any reader of windit's, such as a
   number JSON cannot hold (`1e400`, "number out of range") or a syntax error,
-  carries the format's own words and location and names no field; and a
-  value given to a unit variant is refused by serde's derive, which names the
-  variant by its Rust name (`unit variant TailPolicy::PadFull`).
+  carries the format's own words and location and names no field. CBOR is
+  one such format for a value of the wrong type: ciborium's typed readers
+  refuse it before windit's reader is asked (`expected integer`, `expected
+  float`, `expected unit`), and refuse any map key that is neither text nor
+  bytes (`expected str or bytes`). A value given to a unit variant is refused
+  by serde's derive, which names the variant by its Rust name
+  (`unit variant TailPolicy::PadFull`).
+- **Keys are read by windit's own readers, and refused at the key.** A key
+  that is not a field's name, such as YAML's `? [window]`, was refused by
+  serde's derive as "expected field identifier"; it is refused as
+  `` expected a field of `WindowOptions`: `window`, `hop`, `tail`, `max_windows` ``,
+  and likewise for `Ema`'s fields, a tail policy's keys and a policy's name. A
+  repeated field and a key beside a policy's variant are refused at that
+  key. `Ema`'s `alpha` and a count no longer take an integer offered as an
+  `i128` or a `u128`, as serde's `f64` and `usize` never did.
 
 ## 0.5.1 - 2026-09-06
 
