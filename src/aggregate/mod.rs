@@ -1287,8 +1287,7 @@ const _: () = {
 
   use serde::{
     de::{
-      self, value::MapAccessDeserializer, DeserializeSeed, EnumAccess, Error as _, MapAccess,
-      Unexpected, VariantAccess, Visitor,
+      self, DeserializeSeed, EnumAccess, Error as _, MapAccess, Unexpected, VariantAccess, Visitor,
     },
     Deserialize, Deserializer,
   };
@@ -1461,22 +1460,26 @@ const _: () = {
     }
   }
 
-  /// `Ema`'s fields.
-  #[derive(Deserialize)]
-  #[serde(deny_unknown_fields)]
-  struct Ema {
-    #[serde(deserialize_with = "ema_alpha")]
-    alpha: f64,
-  }
-
-  /// `Ema`'s field names, as the derived reader declares them.
+  /// `Ema`'s field names.
   const EMA_FIELDS: &[&str] = &["alpha"];
 
-  /// `Ema`'s fields, read from a map and only from a map: an array, which no
-  /// human-readable format writes for a struct variant, is refused naming
-  /// `Ema`, where the derive would read its first element as `alpha` and,
-  /// under TOML, drop the rest. `alpha` is read through [`AlphaVisitor`], whose
-  /// expected text names it.
+  /// `alpha`, read through [`AlphaVisitor`].
+  struct Alpha;
+
+  impl<'de> DeserializeSeed<'de> for Alpha {
+    type Value = f64;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<f64, D::Error> {
+      ema_alpha(deserializer)
+    }
+  }
+
+  /// `Ema`'s fields, read by windit alone, from a map and only from a map:
+  /// an array, which no human-readable format writes for a struct variant, is
+  /// refused naming `Ema`, where the derive would read its first element as
+  /// `alpha` and, under TOML, drop the rest. Its keys are read by
+  /// [`Keys`](crate::keys::Keys) and `alpha` through [`AlphaVisitor`], whose
+  /// expected texts name them; no derived reader is asked.
   struct EmaFields;
 
   impl<'de> Visitor<'de> for EmaFields {
@@ -1486,10 +1489,13 @@ const _: () = {
       f.write_str("`Ema` with its `alpha`, as a map")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-      let Ema { alpha } = Ema::deserialize(MapAccessDeserializer::new(crate::keys::Fields::new(
-        map, "`Ema`", EMA_FIELDS,
-      )))?;
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+      let mut keys = crate::keys::Keys::new("`Ema`", EMA_FIELDS);
+      let mut alpha = None;
+      while keys.next(&mut map)?.is_some() {
+        alpha = Some(map.next_value_seed(Alpha)?);
+      }
+      let alpha = alpha.ok_or_else(|| A::Error::missing_field(EMA_FIELDS[0]))?;
       Ok(AggregatePolicyKind::Ema { alpha })
     }
   }

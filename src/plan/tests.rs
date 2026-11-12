@@ -1895,40 +1895,85 @@ fn refusals_are_named_and_located_in_yaml() {
 fn tail_policy_names_a_held_value() {
   use std::string::ToString;
 
-  // A `value` before its `kind` is held by the derived reader and read again
-  // once the `kind` is known, through the same reader as ever, so its refusal
-  // is named too. What it is read from holds no location, so JSON places it
-  // where it was read: the map's end.
+  // A `value` before its `kind` is read by windit at once, as what it is:
+  // nothing, or a count. Any other shape is refused there, at the value,
+  // named as the `value` written before its `kind`.
   let doc = r#"{"value":"5","kind":"drop_below_min"}"#;
   let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
   assert!(
     refused
       .to_string()
-      .contains("expected `drop_below_min`'s `value`"),
+      .contains("expected `value` written before its `kind`"),
     "{refused}"
   );
   assert_eq!(
     (refused.line(), refused.column()),
-    (1, doc.len()),
+    (1, json_column(doc, r#""5""#)),
     "{refused}"
   );
 
-  // A value given to a unit variant is refused by the derived reader, which
-  // names the variant by its Rust name, on either side of the `kind`.
-  for doc in [
-    r#"{"kind":"pad_full","value":5}"#,
-    r#"{"value":5,"kind":"pad_full"}"#,
+  // What the variant then asks of a held value is checked once the `kind` is
+  // known: named, at the map's end, the held value having no place of its
+  // own any more.
+  for (doc, named) in [
+    (
+      r#"{"value":null,"kind":"drop_below_min"}"#,
+      "expected `drop_below_min`'s `value`, an unsigned integer",
+    ),
+    (
+      r#"{"value":5,"kind":"pad_full"}"#,
+      "expected no `value`: `pad_full` carries none",
+    ),
   ] {
-    let refused = serde_json::from_str::<TailPolicy>(doc)
-      .unwrap_err()
-      .to_string();
+    let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+    assert_eq!(
+      (refused.line(), refused.column()),
+      (1, doc.len()),
+      "{refused}"
+    );
+  }
+
+  // After the `kind`, a variant that carries no value refuses one itself,
+  // at the value.
+  let doc = r#"{"kind":"pad_full","value":5}"#;
+  let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
+  assert!(
+    refused
+      .to_string()
+      .contains("expected no `value`: `pad_full` carries none"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, "5")),
+    "{refused}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_held_value_is_named_and_located_in_yaml() {
+  use std::string::ToString;
+
+  // A `value` before its `kind` is read by windit's own reader, never by a
+  // buffering one, so YAML's 128-bit integer and a local tag there are
+  // refused at the value, named.
+  for (doc, (line, column)) in [
+    ("value: 18446744073709551616\nkind: drop_below_min", (1, 8)),
+    ("value: !wide 5\nkind: drop_below_min", (1, 8)),
+  ] {
+    let refused = serde_yaml_ng::from_str::<TailPolicy>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
     assert!(
-      refused.contains("unit variant TailPolicy::PadFull"),
+      refused
+        .to_string()
+        .contains("expected `value` written before its `kind`"),
       "{doc}: {refused}"
     );
   }
 }
-
 #[cfg(feature = "serde")]
 #[test]
 fn tail_policy_names_a_kind_that_is_a_number() {
@@ -2001,7 +2046,11 @@ fn keys_are_named_and_located() {
     assert!(refused.to_string().contains(named), "{doc}: {refused}");
   }
   for (doc, (line, column), named) in [
-    ("? [kind]\n: pad_full", (1, 3), "expected `kind` or `value`"),
+    (
+      "? [kind]\n: pad_full",
+      (1, 3),
+      "expected a field of `TailPolicy`: `kind`, `value`",
+    ),
     (
       "kind: pad_full\nkind: pad_full",
       (2, 1),

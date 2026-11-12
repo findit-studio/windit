@@ -54,24 +54,35 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before as `invalid type: string "8", expected usize`, is refused as
   `` invalid type: string "8", expected `window`, an unsigned integer `` at the
   value's line and column. A tail policy's `value` is refused as
-  `` expected `drop_below_min`'s `value` `` (read directly, held by the derived
-  reader until the `kind` is known, or on the sequence road), `Ema`'s field as
+  `` expected `drop_below_min`'s `value` `` (read after the `kind`, or on the
+  sequence road), a value given to a variant that carries none as
+  `` expected no `value`: `pad_full` carries none ``, `Ema`'s field as
   `` expected `Ema`'s `alpha`, a number ``, a tagged YAML value as
   `` expected no value under `pad_full` ``, and a number given for a `kind` as
   `` expected a `kind` naming one of … ``. The format makes each refusal, so TOML
   marks the value's own span, an array's element included, YAML's
   `location()` is the value's, and JSON's line and column are the value's. A
-  held `value` is read from what the derived reader holds, which has no
-  location, so JSON places its refusal at the map's end. Known limits: a
+  `value` written before its `kind` is read at once by windit, as nothing or a
+  count, and any other shape is refused there, at the value; what the variant
+  then asks of it is checked once the `kind` is known, named, with no
+  location of its own (JSON places it at the map's end). Known limits: a
   refusal a format makes before asking any reader of windit's, such as a
   number JSON cannot hold (`1e400`, "number out of range") or a syntax error,
   carries the format's own words and location and names no field. CBOR is
   one such format for a value of the wrong type: ciborium's typed readers
   refuse it before windit's reader is asked (`expected integer`, `expected
   float`, `expected unit`), and refuse any map key that is neither text nor
-  bytes (`expected str or bytes`). A value given to a unit variant is refused
-  by serde's derive, which names the variant by its Rust name
+  bytes (`expected str or bytes`). In CBOR, a value given to a unit variant
+  is refused by serde's derive, which names the variant by its Rust name
   (`unit variant TailPolicy::PadFull`).
+- **No derived reader runs on a human-readable road.** windit reads a tail
+  policy's map in JSON, YAML and TOML itself, `WindowOptions` in every format,
+  and an aggregate policy and `Ema`'s fields in the human-readable formats;
+  serde's derive remains only for a format that is not human-readable (a tail
+  policy's map in CBOR and its tag in postcard and bincode, and an aggregate
+  policy there). In CBOR a struct is always a map: ciborium sends a struct read
+  to its map reader, so an array is refused as "expected map" before any
+  reader of windit's is asked.
 - **Keys are read by windit's own readers, and refused at the key.** A key
   that is not a field's name, such as YAML's `? [window]`, was refused by
   serde's derive as "expected field identifier"; it is refused as
