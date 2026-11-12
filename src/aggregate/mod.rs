@@ -1234,9 +1234,25 @@ fn ema_formation_slack<C: Real>(weights: &[C], embeddings: &[&[C]], alpha: C, b:
 ///
 /// Deserialize a configured choice, then [`into_policy`](AggregatePolicyKind::into_policy)
 /// to obtain a boxed [`AggregatePolicy`]. Requires `alloc` (for the boxed policy)
-/// in addition to `serde`.
+/// in addition to `serde`. An unknown key inside [`Ema`](AggregatePolicyKind::Ema)
+/// is refused by name, as every windit wire type refuses one.
+///
+/// In a human-readable format (JSON, YAML, TOML), a unit variant is read only
+/// as its name: written as a one-entry map, it is refused whatever its value,
+/// `null` included. In a non-human-readable format, a unit variant follows that
+/// format's own unit handling: ciborium 0.2's CBOR, for one, reads
+/// `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
+/// A compact format (postcard, bincode) reads the variant as it writes it.
+///
+/// `Ema`'s `alpha` is read by a reader that names it, so a refused one is
+/// `` expected `Ema`'s `alpha`, a number ``, located by the format at the value;
+/// a number the format cannot hold, and in CBOR an `alpha` of the wrong type
+/// (ciborium's float reader refuses it first), is refused by the format
+/// itself, in its own words. A policy's name and `Ema`'s keys are read by
+/// windit's own readers, so a key of any shape that names nothing, a repeated
+/// field and a key beside the variant are refused at the key, named.
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
-#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub enum AggregatePolicyKind {
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,
@@ -1256,6 +1272,326 @@ pub enum AggregatePolicyKind {
   },
   /// Selects [`SaliencyWeighted`].
   SaliencyWeighted,
+}
+
+/// `Deserialize`, split on [`is_human_readable`](serde::Deserializer::is_human_readable).
+///
+/// A human-readable format is asked for the value as it stands, a name or a
+/// one-entry map, so a unit variant's map form is refused before any of its
+/// value is read. A format that is not human-readable is asked for an enum, as
+/// serde's derive asks: a compact format cannot describe a value as it stands,
+/// and its unit variants carry no value to refuse.
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+const _: () = {
+  use core::{convert::Infallible, fmt};
+
+  use serde::{
+    de::{
+      self, DeserializeSeed, EnumAccess, Error as _, MapAccess, Unexpected, VariantAccess, Visitor,
+    },
+    Deserialize, Deserializer,
+  };
+
+  /// The derived reader the non-human-readable formats are given: the same
+  /// variants, in the same order, under the same name.
+  mod wire {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) enum AggregatePolicyKind {
+      CoverageWeightedMean,
+      MeanRenormalized,
+      Ema {
+        #[serde(deserialize_with = "super::ema_alpha")]
+        alpha: f64,
+      },
+      SaliencyWeighted,
+    }
+  }
+
+  impl From<wire::AggregatePolicyKind> for AggregatePolicyKind {
+    fn from(kind: wire::AggregatePolicyKind) -> Self {
+      match kind {
+        wire::AggregatePolicyKind::CoverageWeightedMean => Self::CoverageWeightedMean,
+        wire::AggregatePolicyKind::MeanRenormalized => Self::MeanRenormalized,
+        wire::AggregatePolicyKind::Ema { alpha } => Self::Ema { alpha },
+        wire::AggregatePolicyKind::SaliencyWeighted => Self::SaliencyWeighted,
+      }
+    }
+  }
+
+  /// A variant's name, read by [`TagName`].
+  #[derive(Clone, Copy)]
+  enum Tag {
+    CoverageWeightedMean,
+    MeanRenormalized,
+    Ema,
+    SaliencyWeighted,
+  }
+
+  impl Tag {
+    /// Every variant, in declaration order: a variant's index is its place.
+    const ALL: [Self; 4] = [
+      Self::CoverageWeightedMean,
+      Self::MeanRenormalized,
+      Self::Ema,
+      Self::SaliencyWeighted,
+    ];
+
+    /// Every variant's name, in the same order.
+    const NAMES: &'static [&'static str] = &[
+      "CoverageWeightedMean",
+      "MeanRenormalized",
+      "Ema",
+      "SaliencyWeighted",
+    ];
+
+    /// The variant `name` names, refused by name where there is none.
+    fn named<E: de::Error>(name: &str) -> Result<Self, E> {
+      Self::ALL
+        .into_iter()
+        .find(|tag| tag.name() == name)
+        .ok_or_else(|| E::unknown_variant(name, Self::NAMES))
+    }
+
+    /// The unit variant this names; `None` for `Ema`, which carries its
+    /// `alpha`.
+    const fn unit(self) -> Option<AggregatePolicyKind> {
+      match self {
+        Self::CoverageWeightedMean => Some(AggregatePolicyKind::CoverageWeightedMean),
+        Self::MeanRenormalized => Some(AggregatePolicyKind::MeanRenormalized),
+        Self::Ema => None,
+        Self::SaliencyWeighted => Some(AggregatePolicyKind::SaliencyWeighted),
+      }
+    }
+
+    const fn name(self) -> &'static str {
+      match self {
+        Self::CoverageWeightedMean => "CoverageWeightedMean",
+        Self::MeanRenormalized => "MeanRenormalized",
+        Self::Ema => "Ema",
+        Self::SaliencyWeighted => "SaliencyWeighted",
+      }
+    }
+  }
+
+  /// A variant's name, read as an identifier, as serde's derive reads one (by
+  /// name, by its bytes, or by its index), through a visitor whose expected
+  /// text names the policies: a key or a tag of another kind is refused by the
+  /// format there, named.
+  struct TagName;
+
+  impl<'de> DeserializeSeed<'de> for TagName {
+    type Value = Tag;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Tag, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  impl Visitor<'_> for TagName {
+    type Value = Tag;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("a policy's name: ")?;
+      for (at, name) in Tag::NAMES.iter().enumerate() {
+        if at > 0 {
+          f.write_str(", ")?;
+        }
+        write!(f, "`{name}`")?;
+      }
+      Ok(())
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Tag, E> {
+      usize::try_from(v)
+        .ok()
+        .and_then(|at| Tag::ALL.get(at).copied())
+        .ok_or_else(|| E::invalid_value(Unexpected::Unsigned(v), &self))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Tag, E> {
+      Tag::named(v)
+    }
+
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Tag, E> {
+      match core::str::from_utf8(v) {
+        Ok(text) => Tag::named(text),
+        Err(_) => Err(E::invalid_value(Unexpected::Bytes(v), &self)),
+      }
+    }
+  }
+
+  /// A key past the one entry of a policy's map, refused by its own reader, so
+  /// the format locates the refusal at the key: by its name where it is text,
+  /// and by this reader's expected text where it is not.
+  struct Beside(&'static str);
+
+  impl<'de> DeserializeSeed<'de> for Beside {
+    type Value = Infallible;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Infallible, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  impl Visitor<'_> for Beside {
+    type Value = Infallible;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(
+        f,
+        "nothing beside `{}`: a policy is a map of one entry",
+        self.0
+      )
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Infallible, E> {
+      Err(E::custom(format_args!(
+        "`{v}` beside `{}`: a policy is a map of one entry",
+        self.0
+      )))
+    }
+
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Infallible, E> {
+      match core::str::from_utf8(v) {
+        Ok(text) => self.visit_str(text),
+        Err(_) => Err(E::invalid_value(Unexpected::Bytes(v), &self)),
+      }
+    }
+  }
+
+  /// `Ema`'s field names.
+  const EMA_FIELDS: &[&str] = &["alpha"];
+
+  /// `alpha`, read through [`AlphaVisitor`].
+  struct Alpha;
+
+  impl<'de> DeserializeSeed<'de> for Alpha {
+    type Value = f64;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<f64, D::Error> {
+      ema_alpha(deserializer)
+    }
+  }
+
+  /// `Ema`'s fields, read by windit alone, from a map and only from a map:
+  /// an array, which no human-readable format writes for a struct variant, is
+  /// refused naming `Ema`, where the derive would read its first element as
+  /// `alpha` and, under TOML, drop the rest. Its keys are read by
+  /// [`Keys`](crate::keys::Keys) and `alpha` through [`AlphaVisitor`], whose
+  /// expected texts name them; no derived reader is asked.
+  struct EmaFields;
+
+  impl<'de> Visitor<'de> for EmaFields {
+    type Value = AggregatePolicyKind;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("`Ema` with its `alpha`, as a map")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+      let mut keys = crate::keys::Keys::new("`Ema`", EMA_FIELDS);
+      let mut alpha = None;
+      while keys.next(&mut map)?.is_some() {
+        alpha = Some(map.next_value_seed(Alpha)?);
+      }
+      let alpha = alpha.ok_or_else(|| A::Error::missing_field(EMA_FIELDS[0]))?;
+      Ok(AggregatePolicyKind::Ema { alpha })
+    }
+  }
+
+  impl<'de> DeserializeSeed<'de> for EmaFields {
+    type Value = AggregatePolicyKind;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+      deserializer.deserialize_map(self)
+    }
+  }
+
+  /// The human-readable road: a name, a one-entry map, or a tagged value.
+  struct Strict;
+
+  impl<'de> Visitor<'de> for Strict {
+    type Value = AggregatePolicyKind;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("a policy's name, or `Ema` with its `alpha`")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+      let tag = Tag::named(v)?;
+      tag
+        .unit()
+        .ok_or_else(|| E::invalid_type(Unexpected::UnitVariant, &"`Ema` with its `alpha`"))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+      let Some(tag) = map.next_key_seed(TagName)? else {
+        return Err(A::Error::invalid_length(0, &self));
+      };
+      if tag.unit().is_some() {
+        return Err(crate::refusal::unit_given_a_value(tag.name()));
+      }
+      let kind = map.next_value_seed(EmaFields)?;
+      if let Some(never) = map.next_key_seed(Beside(tag.name()))? {
+        match never {}
+      }
+      Ok(kind)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+      let (tag, variant) = data.variant_seed(TagName)?;
+      match tag.unit() {
+        Some(kind) => variant
+          .newtype_variant_seed(crate::refusal::UnitTag(tag.name()))
+          .map(|()| kind),
+        None => variant.struct_variant(EMA_FIELDS, EmaFields),
+      }
+    }
+  }
+
+  impl<'de> Deserialize<'de> for AggregatePolicyKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      if deserializer.is_human_readable() {
+        deserializer.deserialize_any(Strict)
+      } else {
+        wire::AggregatePolicyKind::deserialize(deserializer).map(Into::into)
+      }
+    }
+  }
+};
+
+/// `Ema`'s `alpha`, read as serde reads an `f64`, through [`AlphaVisitor`].
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+fn ema_alpha<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+  deserializer.deserialize_f64(AlphaVisitor)
+}
+
+/// `Ema`'s `alpha` as serde reads an `f64` (any number, an integer widened),
+/// its expected text naming the field: the format makes a refusal of it, at the
+/// value, and the name rides in it.
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+struct AlphaVisitor;
+
+#[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]
+impl serde::de::Visitor<'_> for AlphaVisitor {
+  type Value = f64;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("`Ema`'s `alpha`, a number")
+  }
+
+  fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f64, E> {
+    Ok(v)
+  }
+
+  fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<f64, E> {
+    Ok(v as f64)
+  }
+
+  fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<f64, E> {
+    Ok(v as f64)
+  }
 }
 
 #[cfg(all(feature = "serde", any(feature = "std", feature = "alloc")))]

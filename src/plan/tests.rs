@@ -858,26 +858,33 @@ fn tail_policy_rejects_malformed_documents() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn tail_policy_ignores_an_entry_that_is_neither_field() {
-  // `TailPolicy` never carried `deny_unknown_fields`, so the derived reader
-  // skipped anything that was not the tag or the content. A document written by
-  // a later version, or by a schema that annotates its own values, kept loading;
-  // erroring on it would make this release the one that stops reading a
-  // forward-compatible document. `WindowOptions`, which does deny unknown
-  // fields, is unaffected — that posture is its own and is unchanged.
-  assert_eq!(
-    serde_json::from_str::<TailPolicy>(r#"{"kind":"pad_full","future":1}"#).unwrap(),
-    TailPolicy::PadFull
-  );
-  // The ignored value can be of any shape, and may sit on either side of the
-  // fields that matter.
-  assert_eq!(
-    serde_json::from_str::<TailPolicy>(
-      r#"{"note":{"a":[1,2,null]},"kind":"drop_below_min","value":5,"$schema":"x"}"#
-    )
-    .unwrap(),
-    TailPolicy::DropBelowMin(5)
-  );
+fn tail_policy_refuses_an_entry_that_is_neither_field() {
+  use std::string::ToString;
+
+  // An entry that is neither the tag nor the content is refused by name, as
+  // `WindowOptions` refuses an unknown key. The document that made this the
+  // rule put the cap inside the tail policy: skipped, it left `max_windows`
+  // unbounded without a word.
+  let misplaced =
+    r#"{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}"#;
+  let refused = serde_json::from_str::<WindowOptions>(misplaced).unwrap_err();
+  assert!(refused.to_string().contains("max_windows"), "{refused}");
+  // Whatever the stray entry holds, and on whichever side of the fields that
+  // matter it sits.
+  for (document, key) in [
+    (r#"{"kind":"pad_full","future":1}"#, "future"),
+    (
+      r#"{"kind":"drop_below_min","value":5,"$schema":"x"}"#,
+      "$schema",
+    ),
+    (
+      r#"{"note":{"a":[1,2,null]},"kind":"drop_below_min","value":5}"#,
+      "note",
+    ),
+  ] {
+    let refused = serde_json::from_str::<TailPolicy>(document).unwrap_err();
+    assert!(refused.to_string().contains(key), "{document}: {refused}");
+  }
 }
 
 /// Map and sequence accesses built by hand, for the two grammars no
@@ -894,8 +901,8 @@ mod hand_built {
 
   use serde::de::{
     value::{
-      Error, MapAccessDeserializer, SeqAccessDeserializer, StrDeserializer, U32Deserializer,
-      U64Deserializer, UnitDeserializer,
+      Error, I128Deserializer, MapAccessDeserializer, SeqAccessDeserializer, StrDeserializer,
+      U32Deserializer, U64Deserializer, UnitDeserializer,
     },
     DeserializeSeed, EnumAccess, Error as _, MapAccess, SeqAccess, VariantAccess, Visitor,
   };
@@ -916,6 +923,8 @@ mod hand_built {
     /// A variant named by its ordinal rather than by its name — what a compact
     /// format writes for a tag.
     Variant(u32),
+    /// An integer offered as an `i128`, as a format does for one past `i64`.
+    Wide(i128),
   }
 
   impl Entry<'_> {
@@ -925,6 +934,7 @@ mod hand_built {
         Self::Number(number) => seed.deserialize(U64Deserializer::new(number)),
         Self::Unit => seed.deserialize(UnitDeserializer::new()),
         Self::Variant(index) => seed.deserialize(VariantIndex(index)),
+        Self::Wide(number) => seed.deserialize(I128Deserializer::new(number)),
       }
     }
   }
@@ -949,6 +959,11 @@ mod hand_built {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
       visitor.visit_u32(self.0)
+    }
+
+    /// A compact format's answer, which is the format this stands in for.
+    fn is_human_readable(&self) -> bool {
+      false
     }
 
     forward_to_deserialize_any! {
@@ -1103,7 +1118,7 @@ mod hand_built {
   }
 
   /// Answer an adjacently tagged document while recording every type name the
-  /// reader asks for.
+  /// reader asks for, as a human-readable format or as one that is not.
   ///
   /// The identity a reader requests is part of the wire model — a schema-aware
   /// or name-enforcing format matches on it — and no format here carries it, so
@@ -1115,11 +1130,13 @@ mod hand_built {
   pub fn record_requests(
     variant: &'static str,
     minimum: Option<u64>,
+    human_readable: bool,
   ) -> (Result<TailPolicy, Error>, Requested) {
     let seen = RefCell::new(Requested::default());
     let policy = TailPolicy::deserialize(Recorder {
       variant,
       minimum,
+      human_readable,
       seen: &seen,
     });
     (policy, seen.into_inner())
@@ -1129,6 +1146,8 @@ mod hand_built {
   struct Recorder<'a> {
     variant: &'static str,
     minimum: Option<u64>,
+    /// What the document and its `kind` answer `is_human_readable` with.
+    human_readable: bool,
     seen: &'a RefCell<Requested>,
   }
 
@@ -1147,6 +1166,10 @@ mod hand_built {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
       visitor.visit_map(RecordedMap { at: 0, of: self })
+    }
+
+    fn is_human_readable(&self) -> bool {
+      self.human_readable
     }
 
     forward_to_deserialize_any! {
@@ -1208,6 +1231,10 @@ mod hand_built {
       visitor.visit_str(self.0.variant)
     }
 
+    fn is_human_readable(&self) -> bool {
+      self.0.human_readable
+    }
+
     forward_to_deserialize_any! {
       bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
       option unit unit_struct newtype_struct seq tuple tuple_struct map struct
@@ -1227,6 +1254,11 @@ fn tail_policy_is_read_under_its_own_name() {
   // wire enum is now *named* `TailPolicy` inside a private module instead of
   // renamed, which is what makes both requests agree; nothing but being the
   // deserializer can observe that.
+  //
+  // A format that is not human-readable is asked for the `kind` as that enum.
+  // A human-readable one is asked for the `kind` as the value it is, so that a
+  // refusal can name the variant, and so for no enum at all; its document is
+  // asked for under the same one name.
   use hand_built::record_requests;
   use std::string::String;
 
@@ -1235,7 +1267,7 @@ fn tail_policy_is_read_under_its_own_name() {
     ("drop_below_min", Some(5), TailPolicy::DropBelowMin(5)),
     ("pad_full", None, TailPolicy::PadFull),
   ] {
-    let (policy, seen) = record_requests(variant, minimum);
+    let (policy, seen) = record_requests(variant, minimum, false);
     assert_eq!(policy.unwrap(), expected);
     assert_eq!(
       seen.structs,
@@ -1246,6 +1278,19 @@ fn tail_policy_is_read_under_its_own_name() {
       seen.enums,
       std::vec![String::from("TailPolicy")],
       "the enum identity the `kind` value was asked for, for {variant}"
+    );
+
+    let (policy, seen) = record_requests(variant, minimum, true);
+    assert_eq!(policy.unwrap(), expected);
+    assert_eq!(
+      seen.structs,
+      std::vec![String::from("TailPolicy")],
+      "the document's own name for {variant}, human-readable"
+    );
+    assert!(
+      seen.enums.is_empty(),
+      "a human-readable `kind` is read as the value it is, for {variant}: {:?}",
+      seen.enums
     );
   }
 }
@@ -1315,10 +1360,41 @@ fn every_road_agrees_on_every_variant_name_and_ordinal() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn tail_policy_names_an_unknown_byte_key() {
+  use ciborium::Value;
+  use std::string::ToString;
+
+  // A CBOR tail map whose stray key is a byte string: the refusal names it,
+  // as text where it is UTF-8 and as hex where it is not.
+  let read = |key: Value| {
+    let map = Value::Map(vec![
+      (
+        Value::Text("kind".into()),
+        Value::Text("keep_with_coverage".into()),
+      ),
+      (key, Value::Integer(1.into())),
+    ]);
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&map, &mut bytes).unwrap();
+    ciborium::from_reader::<TailPolicy, _>(bytes.as_slice())
+      .unwrap_err()
+      .to_string()
+  };
+  let named = read(Value::Bytes(b"max_windows".to_vec()));
+  assert!(named.contains("max_windows"), "{named}");
+  let hex = read(Value::Bytes(vec![0xff, 0xfe]));
+  assert!(hex.contains("0xfffe"), "{hex}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn tail_policy_reads_a_map_whose_keys_arrive_as_bytes() {
+  use std::string::ToString;
+
   // The derived reader recognises byte-form field identifiers, which a CBOR map
   // with byte-string keys produces. Delegating the map to that reader is what
-  // makes this hold; the test is here because no dev-dependency emits them.
+  // makes this hold; the test is here because no dev-dependency's serializer
+  // emits them.
   use hand_built::{from_map, Entry, Key};
 
   assert_eq!(
@@ -1333,15 +1409,14 @@ fn tail_policy_reads_a_map_whose_keys_arrive_as_bytes() {
     .unwrap(),
     TailPolicy::DropBelowMin(5)
   );
-  // A byte key that is neither field is ignored exactly as a string one is.
-  assert_eq!(
-    from_map(&[
-      (Key::Bytes(b"future"), Entry::Number(1)),
-      (Key::Bytes(b"kind"), Entry::Text("keep_with_coverage")),
-    ])
-    .unwrap(),
-    TailPolicy::KeepWithCoverage
-  );
+  // A byte key that is neither field is refused exactly as a string one is,
+  // by its name.
+  let refused = from_map(&[
+    (Key::Bytes(b"future"), Entry::Number(1)),
+    (Key::Bytes(b"kind"), Entry::Text("keep_with_coverage")),
+  ])
+  .unwrap_err();
+  assert!(refused.to_string().contains("future"), "{refused}");
 }
 
 #[cfg(feature = "serde")]
@@ -1472,6 +1547,8 @@ fn tail_policy_round_trips_as_a_window_options_document_field() {
 
 #[test]
 fn tail_policy_display_is_pinned() {
+  use std::string::ToString;
+
   // The exact strings a downstream derivation fingerprint persists —
   // changing any one of them is a breaking change, not a patch.
   assert_eq!(
@@ -1485,6 +1562,8 @@ fn tail_policy_display_is_pinned() {
 
 #[test]
 fn window_options_display_is_pinned() {
+  use std::string::ToString;
+
   // The motivating example: `window`, `hop`, and a `DropBelowMin` tail nested
   // through its own `Display` — the fingerprint is the document spelling, so
   // `hop` prints under its own field name.
@@ -1508,5 +1587,492 @@ fn window_options_display_is_pinned() {
   assert_eq!(
     WindowOptions::new(4).with_max_windows(8).to_string(),
     "window=4,hop=4,tail=keep_with_coverage,max_windows=8"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_refuses_a_trailing_element_in_toml() {
+  use std::string::ToString;
+
+  // TOML's arrays do not check their own end, so the sequence road holds
+  // itself to the tag and the value: a third element is refused by count,
+  // and the two-element form still reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    tail: TailPolicy,
+  }
+
+  let refused = toml::from_str::<Document>(r#"tail = ["drop_below_min", 5, 99]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("2 elements expected"), "{refused}");
+  assert_eq!(
+    toml::from_str::<Document>(r#"tail = ["drop_below_min", 5]"#)
+      .unwrap()
+      .tail,
+    TailPolicy::DropBelowMin(5)
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn window_options_refuse_a_trailing_element_in_toml() {
+  use std::string::ToString;
+
+  // The same for the options' own sequence form: four elements, and a fifth
+  // is refused by count. A compact format's sequence still reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    options: WindowOptions,
+  }
+
+  let refused =
+    toml::from_str::<Document>(r#"options = [8, 4, {kind = "keep_with_coverage"}, 100, 999]"#)
+      .unwrap_err()
+      .to_string();
+  assert!(refused.contains("4 elements expected"), "{refused}");
+  let opts = WindowOptions::new(8).with_hop(4).with_max_windows(100);
+  let bytes = postcard::to_allocvec(&opts).unwrap();
+  assert_eq!(postcard::from_bytes::<WindowOptions>(&bytes).unwrap(), opts);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_refuses_a_kind_written_as_a_map() {
+  use std::string::ToString;
+
+  // A `kind` is read by the rule `AggregatePolicyKind`'s unit variants are:
+  // its name, or a YAML tag on no value. A one-entry map is refused by its
+  // variant's name, whatever it holds and whatever stands beside it, in every
+  // human-readable format.
+  for (format, refused) in [
+    (
+      "JSON null",
+      serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null}}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "JSON with a key beside",
+      serde_json::from_str::<TailPolicy>(r#"{"kind":{"pad_full":null,"typo":0}}"#)
+        .map_err(|e| e.to_string()),
+    ),
+    (
+      "TOML empty table",
+      toml::from_str::<TailPolicy>("kind = { pad_full = {} }").map_err(|e| e.to_string()),
+    ),
+    (
+      "TOML empty array",
+      toml::from_str::<TailPolicy>("kind = { pad_full = [] }").map_err(|e| e.to_string()),
+    ),
+    (
+      "YAML null",
+      serde_yaml_ng::from_str::<TailPolicy>("kind: {pad_full: ~}").map_err(|e| e.to_string()),
+    ),
+  ] {
+    let refused = refused.unwrap_err();
+    assert!(
+      refused.contains("`pad_full` takes no value, and the document gives it one"),
+      "{format}: {refused}"
+    );
+  }
+
+  // The name reads, in each of them.
+  assert_eq!(
+    serde_json::from_str::<TailPolicy>(r#"{"kind":"pad_full"}"#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    toml::from_str::<TailPolicy>(r#"kind = "pad_full""#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<TailPolicy>("kind: pad_full").unwrap(),
+    TailPolicy::PadFull
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_its_kind_in_a_refused_yaml_tag() {
+  use std::string::ToString;
+
+  // A tagged `kind` whose value is refused names the variant, as a tagged
+  // `AggregatePolicyKind` does, and YAML locates the refusal at the tagged
+  // value itself: the reader that refuses it is the one YAML asked.
+  let refused = serde_yaml_ng::from_str::<TailPolicy>("kind: !pad_full 7").unwrap_err();
+  let at = refused.location().expect("a located refusal");
+  assert_eq!((at.line(), at.column()), (1, 7), "{refused}");
+  assert!(refused.to_string().contains("`pad_full`"), "{refused}");
+
+  // A tag on no value reads.
+  assert_eq!(
+    serde_yaml_ng::from_str::<TailPolicy>("kind: !pad_full").unwrap(),
+    TailPolicy::PadFull
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_its_kind_on_the_sequence_road() {
+  use std::string::ToString;
+
+  // The sequence road reads its tag by the same rule as the map road: a
+  // one-entry map is refused by its variant's name, and a name reads.
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    tail: TailPolicy,
+  }
+
+  let refused = serde_json::from_str::<TailPolicy>(r#"[{"pad_full":null,"typo":0}]"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`pad_full` takes no value"), "{refused}");
+  let refused = toml::from_str::<Document>("tail = [{ pad_full = {} }]")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("`pad_full` takes no value"), "{refused}");
+  assert_eq!(
+    serde_json::from_str::<TailPolicy>(r#"["pad_full"]"#).unwrap(),
+    TailPolicy::PadFull
+  );
+  assert_eq!(
+    toml::from_str::<Document>(r#"tail = ["pad_full"]"#)
+      .unwrap()
+      .tail,
+    TailPolicy::PadFull
+  );
+}
+
+/// The 1-based column at which serde_json reports a refused `token` in `doc`:
+/// the token's last character.
+#[cfg(feature = "serde")]
+fn json_column(doc: &str, token: &str) -> usize {
+  doc.find(token).expect("the token is in the document") + token.len()
+}
+
+/// The byte range TOML marks for `token` in `doc`.
+#[cfg(feature = "serde")]
+fn toml_span(doc: &str, token: &str) -> core::ops::Range<usize> {
+  let at = doc.find(token).expect("the token is in the document");
+  at..at + token.len()
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn refusals_are_named_and_located_in_json() {
+  use std::string::ToString;
+
+  // A refused value is named by the reader JSON asked for it, in its expected
+  // text, and JSON places the refusal at the value: the line and column of
+  // its last character.
+  for (doc, token, named) in [
+    (
+      r#"{"window":8,"hop":"4","tail":{"kind":"pad_full"}}"#,
+      r#""4""#,
+      "expected `hop`, an unsigned integer",
+    ),
+    (
+      r#"{"window":"8","hop":4,"tail":{"kind":"pad_full"}}"#,
+      r#""8""#,
+      "expected `window`, an unsigned integer",
+    ),
+    (
+      r#"{"kind":"drop_below_min","value":"5"}"#,
+      r#""5""#,
+      "expected `drop_below_min`'s `value`",
+    ),
+    (
+      r#"["drop_below_min","5"]"#,
+      r#""5""#,
+      "expected `drop_below_min`'s `value`",
+    ),
+    (
+      r#"{"window":8,"hop":4,"tail":{"kind":"drop_below_min","value":"5"}}"#,
+      r#""5""#,
+      "expected `drop_below_min`'s `value`",
+    ),
+    (
+      r#"["8",4,{"kind":"pad_full"},null]"#,
+      r#""8""#,
+      "expected `window`, an unsigned integer",
+    ),
+  ] {
+    let refused = if doc.contains("window") || doc.starts_with(r#"["8""#) {
+      serde_json::from_str::<WindowOptions>(doc).unwrap_err()
+    } else {
+      serde_json::from_str::<TailPolicy>(doc).unwrap_err()
+    };
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+    assert_eq!(
+      (refused.line(), refused.column()),
+      (1, json_column(doc, token)),
+      "{doc}: {refused}"
+    );
+  }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn refusals_are_named_and_located_in_toml() {
+  // TOML marks a refused value with its own span, an array's element
+  // included, because the refusal is made by the reader TOML asked for that
+  // value.
+  #[derive(Debug, serde::Deserialize)]
+  struct Tail {
+    #[allow(dead_code)]
+    tail: TailPolicy,
+  }
+  #[derive(Debug, serde::Deserialize)]
+  struct Options {
+    #[allow(dead_code)]
+    options: WindowOptions,
+  }
+
+  let doc = r#"tail = ["drop_below_min", "5"]"#;
+  let refused = toml::from_str::<Tail>(doc).unwrap_err();
+  assert_eq!(refused.span(), Some(toml_span(doc, r#""5""#)), "{refused}");
+  assert!(
+    refused.message().contains("`drop_below_min`'s `value`"),
+    "{refused}"
+  );
+
+  let doc = r#"options = ["8", 4, { kind = "pad_full" }]"#;
+  let refused = toml::from_str::<Options>(doc).unwrap_err();
+  assert_eq!(refused.span(), Some(toml_span(doc, r#""8""#)), "{refused}");
+  assert!(refused.message().contains("`window`"), "{refused}");
+
+  let doc = "kind = \"drop_below_min\"\nvalue = \"5\"";
+  let refused = toml::from_str::<TailPolicy>(doc).unwrap_err();
+  assert_eq!(refused.span(), Some(toml_span(doc, r#""5""#)), "{refused}");
+  assert!(
+    refused.message().contains("`drop_below_min`'s `value`"),
+    "{refused}"
+  );
+
+  let doc = "window = 8\nhop = 4\n[tail]\nkind = \"drop_below_min\"\nvalue = \"5\"";
+  let refused = toml::from_str::<WindowOptions>(doc).unwrap_err();
+  assert_eq!(refused.span(), Some(toml_span(doc, r#""5""#)), "{refused}");
+  assert!(
+    refused.message().contains("`drop_below_min`'s `value`"),
+    "{refused}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn refusals_are_named_and_located_in_yaml() {
+  use std::string::ToString;
+
+  // YAML's `location()` is the refused value's own, because the refusal is
+  // made by the reader YAML asked for that value.
+  for (doc, (line, column), named) in [
+    (
+      "window: \"8\"\nhop: 4\ntail: {kind: pad_full}",
+      (1, 9),
+      "expected `window`, an unsigned integer",
+    ),
+    (
+      "kind: drop_below_min\nvalue: \"5\"",
+      (2, 8),
+      "expected `drop_below_min`'s `value`",
+    ),
+  ] {
+    let refused = if doc.starts_with("window") {
+      serde_yaml_ng::from_str::<WindowOptions>(doc).unwrap_err()
+    } else {
+      serde_yaml_ng::from_str::<TailPolicy>(doc).unwrap_err()
+    };
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_a_held_value() {
+  use std::string::ToString;
+
+  // A `value` before its `kind` is read by windit at once, as what it is:
+  // nothing, or a count. Any other shape is refused there, at the value,
+  // named as the `value` written before its `kind`.
+  let doc = r#"{"value":"5","kind":"drop_below_min"}"#;
+  let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
+  assert!(
+    refused
+      .to_string()
+      .contains("expected `value` written before its `kind`"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, r#""5""#)),
+    "{refused}"
+  );
+
+  // What the variant then asks of a held value is checked once the `kind` is
+  // known: named, at the map's end, the held value having no place of its
+  // own any more.
+  for (doc, named) in [
+    (
+      r#"{"value":null,"kind":"drop_below_min"}"#,
+      "expected `drop_below_min`'s `value`, an unsigned integer",
+    ),
+    (
+      r#"{"value":5,"kind":"pad_full"}"#,
+      "expected no `value`: `pad_full` carries none",
+    ),
+  ] {
+    let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+    assert_eq!(
+      (refused.line(), refused.column()),
+      (1, doc.len()),
+      "{refused}"
+    );
+  }
+
+  // After the `kind`, a variant that carries no value refuses one itself,
+  // at the value.
+  let doc = r#"{"kind":"pad_full","value":5}"#;
+  let refused = serde_json::from_str::<TailPolicy>(doc).unwrap_err();
+  assert!(
+    refused
+      .to_string()
+      .contains("expected no `value`: `pad_full` carries none"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, "5")),
+    "{refused}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_held_value_is_named_and_located_in_yaml() {
+  use std::string::ToString;
+
+  // A `value` before its `kind` is read by windit's own reader, never by a
+  // buffering one, so YAML's 128-bit integer and a local tag there are
+  // refused at the value, named.
+  for (doc, (line, column)) in [
+    ("value: 18446744073709551616\nkind: drop_below_min", (1, 8)),
+    ("value: !wide 5\nkind: drop_below_min", (1, 8)),
+  ] {
+    let refused = serde_yaml_ng::from_str::<TailPolicy>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(
+      refused
+        .to_string()
+        .contains("expected `value` written before its `kind`"),
+      "{doc}: {refused}"
+    );
+  }
+}
+#[cfg(feature = "serde")]
+#[test]
+fn tail_policy_names_a_kind_that_is_a_number() {
+  use std::string::ToString;
+
+  // A number for a `kind` is refused naming the `kind`: as itself, and as the
+  // map `arbitrary_precision` hands a number over as.
+  for doc in [
+    r#"{"kind":0.5}"#,
+    r#"{"kind":{"$serde_json::private::Number":"0.5"}}"#,
+  ] {
+    let refused = serde_json::from_str::<TailPolicy>(doc)
+      .unwrap_err()
+      .to_string();
+    assert!(
+      refused.contains("expected a `kind` naming one of"),
+      "{doc}: {refused}"
+    );
+  }
+
+  // A known limit: a number JSON cannot hold is refused by JSON itself, before
+  // any reader of ours is asked, as "number out of range".
+  assert!(serde_json::from_str::<TailPolicy>(r#"{"kind":1e400}"#).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn a_count_refuses_a_128_bit_integer_as_usize_does() {
+  use hand_built::{from_map, Entry, Key};
+  use std::string::ToString;
+
+  // serde's `usize` takes no integer offered as an `i128`, however small, and
+  // neither does the reader of a count: it is refused, named, as `usize`
+  // refused it.
+  let refused = from_map(&[
+    (Key::Text("kind"), Entry::Text("drop_below_min")),
+    (Key::Text("value"), Entry::Wide(5)),
+  ])
+  .unwrap_err()
+  .to_string();
+  assert!(
+    refused.contains("as i128, expected `drop_below_min`'s `value`"),
+    "{refused}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn keys_are_named_and_located() {
+  use std::string::ToString;
+
+  // A key is read by windit's own key reader, whatever its shape: a key that
+  // is not a name (YAML's `? [window]`) is refused naming the fields, and a
+  // repeated one as a duplicate, each where the format places the key.
+  for (doc, (line, column), named) in [
+    (
+      "? [window]\n: 4\nhop: 4\ntail: {kind: pad_full}",
+      (1, 3),
+      "expected a field of `WindowOptions`: `window`, `hop`, `tail`, `max_windows`",
+    ),
+    (
+      "window: 4\nwindow: 4\nhop: 4\ntail: {kind: pad_full}",
+      (2, 1),
+      "duplicate field `window`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<WindowOptions>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+  for (doc, (line, column), named) in [
+    (
+      "? [kind]\n: pad_full",
+      (1, 3),
+      "expected a field of `TailPolicy`: `kind`, `value`",
+    ),
+    (
+      "kind: pad_full\nkind: pad_full",
+      (2, 1),
+      "duplicate field `kind`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<TailPolicy>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
+  }
+
+  // JSON's keys are text, so its one key shape to refuse is the repeat.
+  let doc = r#"{"window":8,"window":8,"hop":4,"tail":{"kind":"pad_full"}}"#;
+  let refused = serde_json::from_str::<WindowOptions>(doc).unwrap_err();
+  assert!(
+    refused.to_string().contains("duplicate field `window`"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, doc.match_indices(r#""window""#).nth(1).unwrap().0 + 8),
+    "{refused}"
   );
 }

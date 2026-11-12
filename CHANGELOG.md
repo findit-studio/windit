@@ -6,6 +6,92 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.5.2 - 2026-11-06
+
+### Fixed
+
+- **Documents carrying unknown keys inside a tail policy or an EMA policy are
+  now refused by name.** `TailPolicy`'s map form refuses every key that is
+  neither `kind` nor `value`, naming it: a text key as itself, a byte key as
+  its text, or as hex where it is not UTF-8. `AggregatePolicyKind::Ema`
+  carries `deny_unknown_fields`, as `WindowOptions` always has. Before, the
+  key was dropped without a word. The document that made this the rule,
+  `{"window":512,"hop":512,"tail":{"kind":"keep_with_coverage","max_windows":1}}`,
+  put the cap inside the tail policy and loaded with `max_windows` unbounded.
+- **A sequence form with more elements than its type declares is refused,
+  naming the count.** `WindowOptions` read from an array takes its four
+  elements and `TailPolicy` its tag and value; a further element is refused
+  as "N elements expected, found more". TOML's arrays do not check their own
+  end, so `options = [8, 4, {kind = "keep_with_coverage"}, 100, 999]` and
+  `tail = ["drop_below_min", 5, 99]` loaded with the last element dropped.
+- **In a human-readable format, an `AggregatePolicyKind` unit variant is read
+  only as its name.** Written as a one-entry map, such as
+  `{"MeanRenormalized": null}` in JSON, `MeanRenormalized: ~` in YAML or
+  `{ MeanRenormalized = {} }` in TOML, it is refused by name, whatever its
+  value; before, JSON read a `null` there and TOML an empty table or array,
+  and YAML refused the map without naming the variant. `Ema` is read from a
+  map only (`{ Ema = [0.5, 0.75] }` loaded with `alpha = 0.5`), a key beside
+  the variant is refused by name, and a tagged YAML value the variant refuses
+  names the variant. In a non-human-readable format, a unit variant follows
+  that format's own unit handling: ciborium 0.2's CBOR reads
+  `{"MeanRenormalized": …}` as `MeanRenormalized` without reading the value.
+  Compact formats such as postcard and bincode read the selector as before.
+- **In a human-readable format, a `TailPolicy`'s `kind` is read only as its
+  name, or as a YAML tag on no value, as `AggregatePolicyKind`'s unit variants
+  are.** Written as a one-entry map, such as `{"kind":{"pad_full":null}}` in
+  JSON, `kind = { pad_full = {} }` (or `[]`) in TOML or `kind: {pad_full: ~}`
+  in YAML, it is refused by name, whatever its value, on the map road and the
+  sequence road alike; before, JSON read a `null` there and TOML an empty
+  table or array, and YAML refused the map without naming the variant.
+  `{"kind":{"pad_full":null,"typo":0}}`, refused before as "expected value",
+  is refused naming `pad_full`. A tagged YAML value the variant refuses names
+  the variant: `kind: !pad_full 7` was refused as an invalid value expecting
+  `null`, without `pad_full`. A format that is not human-readable reads the
+  `kind` as before.
+- **A refused value names what was expected there, and the format locates it at
+  the value.** windit's readers name the field or variant they read in their
+  expected text, so `{"window":"8","hop":4,"tail":{"kind":"pad_full"}}`, refused
+  before as `invalid type: string "8", expected usize`, is refused as
+  `` invalid type: string "8", expected `window`, an unsigned integer `` at the
+  value's line and column. A tail policy's `value` is refused as
+  `` expected `drop_below_min`'s `value` `` (read after the `kind`, or on the
+  sequence road), a value given to a variant that carries none as
+  `` expected no `value`: `pad_full` carries none ``, `Ema`'s field as
+  `` expected `Ema`'s `alpha`, a number ``, a tagged YAML value as
+  `` expected no value under `pad_full` ``, and a number given for a `kind` as
+  `` expected a `kind` naming one of … ``. The format makes each refusal, so TOML
+  marks the value's own span, an array's element included, YAML's
+  `location()` is the value's, and JSON's line and column are the value's. A
+  `value` written before its `kind` is read at once by windit, as nothing or a
+  count, and any other shape is refused there, at the value; what the variant
+  then asks of it is checked once the `kind` is known, named, with no
+  location of its own (JSON places it at the map's end). Known limits: a
+  refusal a format makes before asking any reader of windit's, such as a
+  number JSON cannot hold (`1e400`, "number out of range") or a syntax error,
+  carries the format's own words and location and names no field. CBOR is
+  one such format for a value of the wrong type: ciborium's typed readers
+  refuse it before windit's reader is asked (`expected integer`, `expected
+  float`, `expected unit`), and refuse any map key that is neither text nor
+  bytes (`expected str or bytes`). In CBOR, a value given to a unit variant
+  is refused by serde's derive, which names the variant by its Rust name
+  (`unit variant TailPolicy::PadFull`).
+- **No derived reader runs on a human-readable road.** windit reads a tail
+  policy's map in JSON, YAML and TOML itself, `WindowOptions` in every format,
+  and an aggregate policy and `Ema`'s fields in the human-readable formats;
+  serde's derive remains only for a format that is not human-readable (a tail
+  policy's map in CBOR and its tag in postcard and bincode, and an aggregate
+  policy there). In CBOR a struct is always a map: ciborium sends a struct read
+  to its map reader, so an array is refused as "expected map" before any
+  reader of windit's is asked.
+- **Keys are read by windit's own readers, and refused at the key.** A key
+  that is not a field's name, such as YAML's `? [window]`, was refused by
+  serde's derive as "expected field identifier"; it is refused as
+  `` expected a field of `WindowOptions`: `window`, `hop`, `tail`, `max_windows` ``,
+  and likewise for `Ema`'s fields, a tail policy's keys and a policy's name. A
+  repeated field and a key beside a policy's variant are refused at that
+  key. `Ema`'s `alpha` and a count no longer take an integer offered as an
+  `i128` or a `u128`, as serde's `f64` and `usize` never did.
+
 ## 0.5.1 - 2026-09-06
 
 ### Added

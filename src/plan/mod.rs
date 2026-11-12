@@ -262,11 +262,46 @@ fn ratio_to_f64(numer: usize, denom: usize) -> f64 {
 ///
 /// A self-describing format writes the two as named fields —
 /// `{"kind":"drop_below_min","value":5}` — and a compact one writes the variant
-/// and then the payload, `[01, 05]` under postcard. `Deserialize` asks for a
-/// struct, which is what lets serde route each format to the road it belongs on:
-/// a self-describing format's map goes straight to serde's own derived
-/// adjacently tagged reader, so that grammar is `0.4.0`'s to the letter, and a
-/// compact format's sequence goes to a small reader written for it.
+/// and then the payload, `[01, 05]` under postcard. An entry that is neither
+/// field is refused by its key, as [`WindowOptions`] refuses an unknown key: a
+/// stray key beside `kind`, such as a `max_windows` misplaced there, would
+/// otherwise be dropped without a word.
+///
+/// `Deserialize` asks for a struct, which is what lets serde route each format
+/// to the road it belongs on. A human-readable format's map (JSON, YAML, TOML)
+/// is read by windit alone, its keys, its `kind` and its `value` in either
+/// order, so no derived reader runs there. A map in a format that is not
+/// human-readable (CBOR) goes to serde's own derived adjacently tagged reader,
+/// each key checked on the way, so that grammar is `0.4.0`'s but for the
+/// stray entry it now refuses. A compact format's sequence goes to a small
+/// reader written for it.
+///
+/// In a human-readable format, on either road, the `kind` is read by the one
+/// rule windit holds a unit variant to, as `AggregatePolicyKind`'s are: its
+/// name, or a YAML tag on no value (`kind: !pad_full`). Written as a one-entry
+/// map it is refused by name, whatever its value, so JSON's
+/// `{"kind":{"pad_full":null}}` and TOML's `kind = { pad_full = {} }`, which
+/// `0.4.0` read, are refused, as is YAML's `kind: {pad_full: ~}`. A tagged
+/// value the variant refuses names the variant. A format that is not
+/// human-readable is asked for the enum, as before.
+///
+/// A refused value is named in the expected text of the reader windit hands
+/// the format for it: `` expected `drop_below_min`'s `value` ``,
+/// `` expected a `kind` naming one of … ``, `` expected no value under `pad_full` ``.
+/// So the format makes the refusal itself, at the value: TOML's span, YAML's
+/// `location()`, JSON's line and column. Known limits: a refusal a format makes
+/// before asking any of windit's readers (a number it cannot hold, such as
+/// `1e400`; a syntax error; in CBOR, a value of the wrong type, which
+/// ciborium's typed readers refuse first, and a key that is neither text nor
+/// bytes) names nothing of windit's. A `value` written before its `kind` is
+/// read at once, as nothing or a count, and any other shape is refused there,
+/// at the value, as `` expected `value` written before its `kind` ``; what the
+/// variant then asks of it is checked once the `kind` is known, named, with no
+/// location of its own. In CBOR, whose map goes to the derive, a value given
+/// to a unit variant is refused by serde's derive, which names the variant by
+/// its Rust name. Keys are read by windit's own reader: a key that is not
+/// `kind` or `value`, whatever its shape, and a repeated one are refused at
+/// the key, named.
 ///
 /// The derive alone could not serve both: an adjacent tag is deserialized by
 /// buffering the content, which asks for `deserialize_any`, and a format that
@@ -341,7 +376,14 @@ const _: () = {
   use core::fmt;
 
   use serde::{
-    de::{value::MapAccessDeserializer, Error as _, Expected, MapAccess, SeqAccess, Visitor},
+    de::{
+      value::{
+        BorrowedBytesDeserializer, BorrowedStrDeserializer, BytesDeserializer,
+        MapAccessDeserializer,
+      },
+      DeserializeSeed, EnumAccess, Error as _, Expected, IntoDeserializer, MapAccess, SeqAccess,
+      Unexpected, VariantAccess, Visitor,
+    },
     Deserialize, Deserializer, Serialize, Serializer,
   };
 
@@ -371,7 +413,11 @@ const _: () = {
       mod wire {
         use serde::{Deserialize, Serialize};
 
-        /// The adjacently tagged document, derived.
+        /// The adjacently tagged document, derived: the reader of a map in a
+        /// format that is not human-readable, handed its map through
+        /// `KnownKeys`, which refuses an entry that is neither the tag nor the
+        /// content by name before this reader sees it. A human-readable map is
+        /// read by `human_map`, which asks no derived reader.
         #[derive(Clone, Copy, Deserialize, Serialize)]
         #[serde(tag = $tag, content = $content)]
         pub(super) enum TailPolicy {
@@ -414,6 +460,21 @@ const _: () = {
           )+
         })
       }
+
+      /// The tag a wire name names, from the same list.
+      fn tag_named(name: &str) -> Option<wire::tag::TailPolicy> {
+        match name {
+          $( $name => Some(wire::tag::TailPolicy::$variant), )+
+          _ => None,
+        }
+      }
+
+      /// A tag's wire name, from the same list.
+      const fn tag_name(tag: wire::tag::TailPolicy) -> &'static str {
+        match tag {
+          $( wire::tag::TailPolicy::$variant => $name, )+
+        }
+      }
     };
 
     // A variant with a payload: the element after the tag is that payload, and
@@ -422,7 +483,8 @@ const _: () = {
       TailPolicy::$variant(
         $seq
           .next_element::<$payload>()?
-          .ok_or_else(|| serde::de::Error::invalid_length(1, $expected))?,
+          .ok_or_else(|| serde::de::Error::invalid_length(1, $expected))?
+          .into(),
       )
     };
 
@@ -442,7 +504,7 @@ const _: () = {
   wire_tail_policy! {
     tag: "kind", content: "value";
     KeepWithCoverage => "keep_with_coverage",
-    DropBelowMin(usize) => "drop_below_min",
+    DropBelowMin(crate::plan::Minimum) => "drop_below_min",
     PadFull => "pad_full",
   }
 
@@ -452,7 +514,7 @@ const _: () = {
     fn from(policy: TailPolicy) -> Self {
       match policy {
         TailPolicy::KeepWithCoverage => Self::KeepWithCoverage,
-        TailPolicy::DropBelowMin(min) => Self::DropBelowMin(min),
+        TailPolicy::DropBelowMin(min) => Self::DropBelowMin(Minimum(min)),
         TailPolicy::PadFull => Self::PadFull,
       }
     }
@@ -465,7 +527,7 @@ const _: () = {
     fn from(policy: wire::TailPolicy) -> Self {
       match policy {
         wire::TailPolicy::KeepWithCoverage => Self::KeepWithCoverage,
-        wire::TailPolicy::DropBelowMin(min) => Self::DropBelowMin(min),
+        wire::TailPolicy::DropBelowMin(Minimum(min)) => Self::DropBelowMin(min),
         wire::TailPolicy::PadFull => Self::PadFull,
       }
     }
@@ -477,6 +539,26 @@ const _: () = {
       // code that wrote it then, reached through a conversion the compiler
       // checks. Nothing here decides a field count, a tag, or a name.
       wire::TailPolicy::from(*self).serialize(serializer)
+    }
+  }
+
+  impl Serialize for Minimum {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+      self.0.serialize(serializer)
+    }
+  }
+
+  impl<'de> Deserialize<'de> for Minimum {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      deserializer
+        .deserialize_u64(Count::of(wire::VARIANTS[1], wire::FIELDS[1]))
+        .map(Minimum)
+    }
+  }
+
+  impl From<Minimum> for usize {
+    fn from(Minimum(min): Minimum) -> usize {
+      min
     }
   }
 
@@ -516,7 +598,12 @@ const _: () = {
     }
   }
 
-  struct TailPolicyVisitor;
+  /// The reader of either road. `human_readable` is the format's own answer,
+  /// taken before the struct is asked for: a human-readable map is read by
+  /// windit alone, and any other by the derive.
+  struct TailPolicyVisitor {
+    human_readable: bool,
+  }
 
   impl<'de> Visitor<'de> for TailPolicyVisitor {
     type Value = TailPolicy;
@@ -531,33 +618,464 @@ const _: () = {
       )
     }
 
-    /// The shape a self-describing format hands over — JSON and TOML, and the
-    /// binary ones that report `is_human_readable() == false` while still naming
-    /// their fields, CBOR and MessagePack among them.
+    /// The shape a self-describing format hands over.
     ///
-    /// The map is handed whole to the wire enum's derived reader, so every
-    /// question this road raises — whether the content precedes the tag and must
-    /// be buffered, what type to ask the format for once the tag is known,
-    /// whether a key arrived as text or as bytes, what to do with an entry that
-    /// is neither field, and what each failure says — is answered exactly as
-    /// `0.4.0` answered it, because it is the same code.
+    /// A human-readable format's map (JSON, YAML, TOML) is read by windit
+    /// alone, in either order: its keys by [`Keys`](crate::keys::Keys), its
+    /// `kind` by [`KindValue`], a `value` after the `kind` by the variant's own
+    /// reader, and a `value` before it by [`HeldValue`]. The policy is then
+    /// built here, `drop_below_min`'s minimum by [`Count`]'s rule. No derived
+    /// reader is asked, so every refusal on this road is windit's own, named,
+    /// and made inside the reader the format asked, at the value or the key.
+    ///
+    /// Any other map (CBOR among them) is handed whole to the wire enum's
+    /// derived reader, as `0.4.0` handed it, through [`KnownKeys`], which
+    /// refuses an entry that is neither field, naming its key.
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<TailPolicy, A::Error> {
-      wire::TailPolicy::deserialize(MapAccessDeserializer::new(map)).map(Into::into)
+      if self.human_readable {
+        human_map(map)
+      } else {
+        wire::TailPolicy::deserialize(MapAccessDeserializer::new(KnownKeys { map, seen: 0 }))
+          .map(Into::into)
+      }
     }
 
     /// The shape a format that encodes a struct as a sequence hands over: the
     /// tag, then the content the tag calls for.
     ///
-    /// The derive cannot serve this road — it reads an adjacent tag by buffering
-    /// the content, which asks for `deserialize_any`, and postcard answers
-    /// `WontImplement` — so the tag is resolved by deserializing the tag twin,
-    /// whose names and ordinals are the derive's own, and `from_tag` reads what
-    /// the resolved variant declares.
+    /// The tag is read through [`TagSeed`]: by [`KindValue`] in a
+    /// human-readable format, and as the derive's tag twin otherwise, whose
+    /// names and ordinals are the derive's own. `from_tag` reads what the
+    /// resolved variant declares.
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<TailPolicy, A::Error> {
       let tag = seq
-        .next_element::<wire::tag::TailPolicy>()?
+        .next_element_seed(TagSeed)?
         .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-      from_tag(tag, &mut seq, &self)
+      let policy = from_tag(tag, &mut seq, &self)?;
+      exhausted(&mut seq, wire::FIELDS.len(), wire::NAME)?;
+      Ok(policy)
+    }
+  }
+
+  /// A human-readable format's map, read by windit alone.
+  ///
+  /// A `value` read before the `kind` is held as what it is, nothing or a
+  /// count, by a reader that refuses every other shape at the value; once the
+  /// `kind` is known, the held value is checked against the variant here, so
+  /// a refusal of it names the variant but has no location of its own.
+  fn human_map<'de, A: MapAccess<'de>>(mut map: A) -> Result<TailPolicy, A::Error> {
+    let mut keys = crate::keys::Keys::new("`TailPolicy`", wire::FIELDS);
+    let mut kind = None;
+    let mut min = None;
+    let mut held = None;
+    while let Some(at) = keys.next(&mut map)? {
+      if at == 0 {
+        kind = Some(map.next_value_seed(TagSeed)?);
+        continue;
+      }
+      match kind {
+        Some(wire::tag::TailPolicy::DropBelowMin) => min = Some(map.next_value::<Minimum>()?.0),
+        Some(tag) => map.next_value_seed(NoValueOf(tag_name(tag)))?,
+        None => held = Some(map.next_value_seed(HeldValue)?),
+      }
+    }
+    let tag = kind.ok_or_else(|| A::Error::missing_field(wire::FIELDS[0]))?;
+    let name = tag_name(tag);
+    Ok(match tag {
+      wire::tag::TailPolicy::DropBelowMin => {
+        let count = Count::of(name, wire::FIELDS[1]);
+        TailPolicy::DropBelowMin(match (min, held) {
+          (Some(min), _) => min,
+          (None, Some(Held::Count(n))) => usize::try_from(n)
+            .map_err(|_| A::Error::invalid_value(Unexpected::Unsigned(n), &count))?,
+          (None, Some(Held::Nothing)) => {
+            return Err(A::Error::invalid_type(Unexpected::Unit, &count));
+          }
+          (None, None) => return Err(A::Error::missing_field(wire::FIELDS[1])),
+        })
+      }
+      wire::tag::TailPolicy::KeepWithCoverage => {
+        no_count::<A::Error>(held, name)?;
+        TailPolicy::KeepWithCoverage
+      }
+      wire::tag::TailPolicy::PadFull => {
+        no_count::<A::Error>(held, name)?;
+        TailPolicy::PadFull
+      }
+    })
+  }
+
+  /// A held `value` checked against a variant that carries none.
+  fn no_count<E: serde::de::Error>(held: Option<Held>, name: &'static str) -> Result<(), E> {
+    match held {
+      Some(Held::Count(n)) => Err(E::invalid_type(Unexpected::Unsigned(n), &NoValueOf(name))),
+      Some(Held::Nothing) | None => Ok(()),
+    }
+  }
+
+  /// A `value` read before its `kind`: nothing, or a count.
+  #[derive(Clone, Copy)]
+  enum Held {
+    Nothing,
+    Count(u64),
+  }
+
+  /// The reader of a `value` written before its `kind`: the shapes some
+  /// variant's reader would take, nothing (unit or none) or an unsigned
+  /// integer, held as what they are; any other shape refused here, at the
+  /// value, its expected text naming the `value`.
+  struct HeldValue;
+
+  impl<'de> DeserializeSeed<'de> for HeldValue {
+    type Value = Held;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Held, D::Error> {
+      deserializer.deserialize_any(self)
+    }
+  }
+
+  impl Visitor<'_> for HeldValue {
+    type Value = Held;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(
+        f,
+        "`{}` written before its `{}`: nothing, or `drop_below_min`'s unsigned integer",
+        wire::FIELDS[1],
+        wire::FIELDS[0]
+      )
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Held, E> {
+      Ok(Held::Nothing)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Held, E> {
+      Ok(Held::Nothing)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Held, E> {
+      Ok(Held::Count(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Held, E> {
+      u64::try_from(v)
+        .map(Held::Count)
+        .map_err(|_| E::invalid_value(Unexpected::Signed(v), &self))
+    }
+  }
+
+  /// The `value` of a variant that carries none, read after its `kind`:
+  /// nothing, unit or none, and every other shape refused at the value, the
+  /// expected text naming the variant.
+  struct NoValueOf(&'static str);
+
+  impl<'de> DeserializeSeed<'de> for NoValueOf {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+      deserializer.deserialize_any(self)
+    }
+  }
+
+  impl Visitor<'_> for NoValueOf {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "no `{}`: `{}` carries none", wire::FIELDS[1], self.0)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+      Ok(())
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<(), E> {
+      Ok(())
+    }
+  }
+
+  /// The derived reader's map, for a format that is not human-readable, each
+  /// key checked before the derived reader sees it: `kind` or `value` (or `0`
+  /// or `1`, from a format that numbers its fields) passes through, a repeated
+  /// field is refused at the key, and any other key is refused by name, a text
+  /// key as itself and a byte key as its text, or as hex where it is not UTF-8.
+  struct KnownKeys<A> {
+    map: A,
+    /// The fields already read, one bit each.
+    seen: u8,
+  }
+
+  impl<'de, A: MapAccess<'de>> MapAccess<'de> for KnownKeys<A> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+      &mut self,
+      seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+      self.map.next_key_seed(KnownKey {
+        seed,
+        seen: &mut self.seen,
+      })
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+      self.map.next_value_seed(seed)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+      self.map.size_hint()
+    }
+  }
+
+  /// One key of the derived road: checked, refused at the key where it
+  /// repeats a field, then handed to the derived reader's own seed in the form
+  /// it arrived in.
+  struct KnownKey<'a, K> {
+    seed: K,
+    seen: &'a mut u8,
+  }
+
+  impl<K> KnownKey<'_, K> {
+    /// The field at `at` (`0` the `kind`, `1` the `value`), refused where it
+    /// was read already.
+    fn first<E: serde::de::Error>(&mut self, at: usize) -> Result<(), E> {
+      let bit = 1u8 << at;
+      if *self.seen & bit != 0 {
+        return Err(E::duplicate_field(wire::FIELDS[at]));
+      }
+      *self.seen |= bit;
+      Ok(())
+    }
+  }
+
+  impl<'de, K: DeserializeSeed<'de>> DeserializeSeed<'de> for KnownKey<'_, K> {
+    type Value = K::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<K::Value, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  /// A byte key that is not UTF-8, as lowercase hex.
+  struct Hex<'a>(&'a [u8]);
+
+  impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+  }
+
+  impl<K> KnownKey<'_, K> {
+    /// The refusal of a byte key that is neither field, by its name.
+    fn unknown_bytes<E: serde::de::Error>(bytes: &[u8]) -> E {
+      match core::str::from_utf8(bytes) {
+        Ok(text) => E::unknown_field(text, wire::FIELDS),
+        Err(_) => E::custom(format_args!(
+          "unknown field 0x{}, expected `{}` or `{}`",
+          Hex(bytes),
+          wire::FIELDS[0],
+          wire::FIELDS[1]
+        )),
+      }
+    }
+  }
+
+  impl<'de, K: DeserializeSeed<'de>> Visitor<'de> for KnownKey<'_, K> {
+    type Value = K::Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "`{}` or `{}`", wire::FIELDS[0], wire::FIELDS[1])
+    }
+
+    fn visit_u64<E: serde::de::Error>(mut self, v: u64) -> Result<K::Value, E> {
+      match usize::try_from(v)
+        .ok()
+        .filter(|at| *at < wire::FIELDS.len())
+      {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(v.into_deserializer())
+        }
+        None => Err(E::invalid_value(Unexpected::Unsigned(v), &self)),
+      }
+    }
+
+    fn visit_str<E: serde::de::Error>(mut self, v: &str) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| *field == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(v.into_deserializer())
+        }
+        None => Err(E::unknown_field(v, wire::FIELDS)),
+      }
+    }
+
+    fn visit_borrowed_str<E: serde::de::Error>(mut self, v: &'de str) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| *field == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BorrowedStrDeserializer::new(v))
+        }
+        None => Err(E::unknown_field(v, wire::FIELDS)),
+      }
+    }
+
+    fn visit_bytes<E: serde::de::Error>(mut self, v: &[u8]) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| field.as_bytes() == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BytesDeserializer::new(v))
+        }
+        None => Err(Self::unknown_bytes(v)),
+      }
+    }
+
+    fn visit_borrowed_bytes<E: serde::de::Error>(mut self, v: &'de [u8]) -> Result<K::Value, E> {
+      match wire::FIELDS.iter().position(|field| field.as_bytes() == v) {
+        Some(at) => {
+          self.first(at)?;
+          self.seed.deserialize(BorrowedBytesDeserializer::new(v))
+        }
+        None => Err(Self::unknown_bytes(v)),
+      }
+    }
+  }
+
+  /// A `kind`, on either road: read by [`KindValue`] where the format is
+  /// human-readable, by the rule `AggregatePolicyKind` holds its unit
+  /// variants to (a name, or a YAML tag on no value; a one-entry map refused
+  /// by its variant's name), and as the derive's tag twin otherwise, the enum
+  /// asked for as the derive asks.
+  struct TagSeed;
+
+  impl<'de> DeserializeSeed<'de> for TagSeed {
+    type Value = wire::tag::TailPolicy;
+
+    fn deserialize<D: Deserializer<'de>>(
+      self,
+      deserializer: D,
+    ) -> Result<wire::tag::TailPolicy, D::Error> {
+      if deserializer.is_human_readable() {
+        deserializer.deserialize_any(KindValue)
+      } else {
+        wire::tag::TailPolicy::deserialize(deserializer)
+      }
+    }
+  }
+
+  /// A `kind` as a human-readable format writes it, read to its variant.
+  struct KindValue;
+
+  impl<'de> Visitor<'de> for KindValue {
+    type Value = wire::tag::TailPolicy;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(
+        f,
+        "a `{}` naming one of {:?}",
+        wire::FIELDS[0],
+        wire::VARIANTS
+      )
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<wire::tag::TailPolicy, E> {
+      variant_named(v)
+    }
+
+    /// A map of one entry is how a variant carrying a value is written, and
+    /// no `kind` carries one: a map whose key names a variant is refused by
+    /// that name, whatever its value, before any of it is read. Any other map,
+    /// a number `arbitrary_precision` hands over as one among them, is refused
+    /// as a map, this reader's expected text naming the `kind`.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<wire::tag::TailPolicy, A::Error> {
+      match map.next_key_seed(MaybeVariant)? {
+        Some(Some(tag)) => Err(crate::refusal::unit_given_a_value(tag_name(tag))),
+        Some(None) | None => Err(A::Error::invalid_type(Unexpected::Map, &self)),
+      }
+    }
+
+    /// A tagged value, as YAML writes `!pad_full`: the tag names the variant,
+    /// and its value is read through `UnitTag`, which takes none and names
+    /// the variant when it refuses one.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<wire::tag::TailPolicy, A::Error> {
+      let (tag, variant) = data.variant_seed(VariantName)?;
+      variant.newtype_variant_seed(crate::refusal::UnitTag(tag_name(tag)))?;
+      Ok(tag)
+    }
+  }
+
+  /// The variant `name` names, refused by name where there is none.
+  fn variant_named<E: serde::de::Error>(name: &str) -> Result<wire::tag::TailPolicy, E> {
+    tag_named(name).ok_or_else(|| E::unknown_variant(name, wire::VARIANTS))
+  }
+
+  /// The key of a map a `kind` is written as: the variant it names, if any.
+  /// A key that names none is not refused here, so the map it opens is
+  /// refused as a map, naming the `kind`.
+  struct MaybeVariant;
+
+  impl<'de> DeserializeSeed<'de> for MaybeVariant {
+    type Value = Option<wire::tag::TailPolicy>;
+
+    fn deserialize<D: Deserializer<'de>>(
+      self,
+      deserializer: D,
+    ) -> Result<Option<wire::tag::TailPolicy>, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  impl Visitor<'_> for MaybeVariant {
+    type Value = Option<wire::tag::TailPolicy>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "a key of a `{}`", wire::FIELDS[0])
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<wire::tag::TailPolicy>, E> {
+      Ok(tag_named(v))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(
+      self,
+      v: &[u8],
+    ) -> Result<Option<wire::tag::TailPolicy>, E> {
+      Ok(core::str::from_utf8(v).ok().and_then(tag_named))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Option<wire::tag::TailPolicy>, E> {
+      Ok(None)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Option<wire::tag::TailPolicy>, E> {
+      Ok(None)
+    }
+  }
+
+  /// A variant's name where a YAML tag gives it, `!pad_full`: an unknown one
+  /// is refused by name.
+  struct VariantName;
+
+  impl<'de> DeserializeSeed<'de> for VariantName {
+    type Value = wire::tag::TailPolicy;
+
+    fn deserialize<D: Deserializer<'de>>(
+      self,
+      deserializer: D,
+    ) -> Result<wire::tag::TailPolicy, D::Error> {
+      deserializer.deserialize_identifier(self)
+    }
+  }
+
+  impl Visitor<'_> for VariantName {
+    type Value = wire::tag::TailPolicy;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      write!(f, "one of {:?}", wire::VARIANTS)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<wire::tag::TailPolicy, E> {
+      variant_named(v)
     }
   }
 
@@ -565,10 +1083,16 @@ const _: () = {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
       // Asking for the adjacent shape itself, rather than for whatever the value
       // happens to be, is what keeps this readable by a format that cannot
-      // answer `deserialize_any` — and serde routes the request to `visit_seq`
-      // or `visit_map` by what the format encodes a struct as, which is the line
-      // the wire actually splits on.
-      deserializer.deserialize_struct(wire::NAME, wire::FIELDS, TailPolicyVisitor)
+      // answer `deserialize_any`, and serde routes the request to `visit_seq`
+      // or `visit_map` by what the format encodes a struct as. Whether the
+      // format is human-readable is asked first, so the map road knows whose
+      // it is.
+      let human_readable = deserializer.is_human_readable();
+      deserializer.deserialize_struct(
+        wire::NAME,
+        wire::FIELDS,
+        TailPolicyVisitor { human_readable },
+      )
     }
   }
 };
@@ -585,16 +1109,200 @@ const _: () = {
 /// With the `serde` feature every field is serialized, so a self-persisted
 /// geometry always round-trips exactly. On deserialization the `window`, `hop`,
 /// and `tail` fields are required; `max_windows` may be omitted and then
-/// defaults to no cap (`None`). Unknown keys are rejected.
+/// defaults to no cap (`None`). Unknown keys are rejected by name, and a
+/// sequence form with more than its four elements is refused. A refused count
+/// is refused by a reader that names its field, `` expected `window`, an
+/// unsigned integer ``, so the format locates the refusal at the value; its
+/// keys are read by windit's own reader, so a key that is not a field's name,
+/// whatever its shape, and a repeated field are refused at the key, named. In
+/// CBOR, a count of the wrong type is refused by ciborium itself, before this
+/// reader is asked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct WindowOptions {
   window: usize,
   hop: usize,
   tail: TailPolicy,
   max_windows: Option<usize>,
 }
+
+/// `drop_below_min`'s minimum on the wire: written as the `usize` it is, and
+/// read as one through [`Count`], whose expected text names it, so that a
+/// refusal of it is made by the format at the value and names
+/// `` `drop_below_min`'s `value` ``. In CBOR, where the derived reader holds a
+/// `value` written before its `kind`, it reads the held value through this
+/// same type; on a human-readable road a held count is checked by [`Count`]'s
+/// rule once the `kind` is known.
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy)]
+struct Minimum(usize);
+
+/// A count, read as serde reads a `usize`, through a visitor whose expected
+/// text names the field it fills: `` expected `window`, an unsigned integer ``.
+///
+/// The format makes the refusal, at the value, and the name rides in it; no
+/// error is ever rebuilt around another.
+#[cfg(feature = "serde")]
+#[derive(Clone, Copy)]
+struct Count {
+  owner: Option<&'static str>,
+  field: &'static str,
+}
+
+#[cfg(feature = "serde")]
+impl Count {
+  /// A count that is a field of its own.
+  const fn field(field: &'static str) -> Self {
+    Self { owner: None, field }
+  }
+
+  /// A count that is `owner`'s `field`.
+  const fn of(owner: &'static str, field: &'static str) -> Self {
+    Self {
+      owner: Some(owner),
+      field,
+    }
+  }
+}
+
+#[cfg(feature = "serde")]
+impl serde::de::Visitor<'_> for Count {
+  type Value = usize;
+
+  fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    match self.owner {
+      Some(owner) => write!(f, "`{owner}`'s `{}`, an unsigned integer", self.field),
+      None => write!(f, "`{}`, an unsigned integer", self.field),
+    }
+  }
+
+  fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<usize, E> {
+    usize::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+  }
+
+  fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<usize, E> {
+    usize::try_from(v).map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+  }
+}
+
+/// Refuses an element past the `declared` ones a sequence road has read.
+///
+/// A format that does not check an array's end (TOML) would otherwise drop
+/// it. A compact format's sequence holds exactly the declared elements, so it
+/// has none to show, and nothing more is read from its buffer.
+#[cfg(feature = "serde")]
+fn exhausted<'de, A: serde::de::SeqAccess<'de>>(
+  seq: &mut A,
+  declared: usize,
+  name: &str,
+) -> Result<(), A::Error> {
+  match seq.next_element::<serde::de::IgnoredAny>()? {
+    None => Ok(()),
+    Some(_) => Err(serde::de::Error::custom(format_args!(
+      "`{name}`: {declared} elements expected, found more"
+    ))),
+  }
+}
+
+/// `Deserialize` for [`WindowOptions`]: windit's own reader, in every format,
+/// of a map or of a sequence held to its four elements. No derived reader is
+/// asked. Its keys are read by [`Keys`](crate::keys::Keys), so a key that is
+/// not a field's name, whatever its shape, and a repeated field are refused at
+/// the key, named; its counts are read through [`Count`], so a refused one
+/// names its field; a tail policy names what it refuses itself.
+#[cfg(feature = "serde")]
+const _: () = {
+  use core::fmt;
+
+  use serde::{
+    de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+  };
+
+  const FIELDS: &[&str] = &["window", "hop", "tail", "max_windows"];
+
+  /// What a sequence that is too short is refused as expecting, in the
+  /// derive's words.
+  const ELEMENTS: &str = "struct WindowOptions with 4 elements";
+
+  /// A count, read through [`Count`](super::Count).
+  struct CountOf(&'static str);
+
+  impl<'de> DeserializeSeed<'de> for CountOf {
+    type Value = usize;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<usize, D::Error> {
+      deserializer.deserialize_u64(Count::field(self.0))
+    }
+  }
+
+  /// The cap, read through serde's own `Option`, so that `null` and an absent
+  /// key are no cap, and a value is a count.
+  struct MaxWindows(usize);
+
+  impl<'de> Deserialize<'de> for MaxWindows {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      CountOf(FIELDS[3]).deserialize(deserializer).map(MaxWindows)
+    }
+  }
+
+  struct OptionsVisitor;
+
+  impl<'de> Visitor<'de> for OptionsVisitor {
+    type Value = WindowOptions;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+      f.write_str("struct WindowOptions")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<WindowOptions, A::Error> {
+      let mut keys = crate::keys::Keys::new("`WindowOptions`", FIELDS);
+      let (mut window, mut hop, mut tail, mut max_windows) = (None, None, None, None);
+      while let Some(at) = keys.next(&mut map)? {
+        match at {
+          0 => window = Some(map.next_value_seed(CountOf(FIELDS[0]))?),
+          1 => hop = Some(map.next_value_seed(CountOf(FIELDS[1]))?),
+          2 => tail = Some(map.next_value::<TailPolicy>()?),
+          _ => max_windows = map.next_value::<Option<MaxWindows>>()?,
+        }
+      }
+      Ok(WindowOptions {
+        window: window.ok_or_else(|| A::Error::missing_field(FIELDS[0]))?,
+        hop: hop.ok_or_else(|| A::Error::missing_field(FIELDS[1]))?,
+        tail: tail.ok_or_else(|| A::Error::missing_field(FIELDS[2]))?,
+        max_windows: max_windows.map(|MaxWindows(cap)| cap),
+      })
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<WindowOptions, A::Error> {
+      let window = seq
+        .next_element_seed(CountOf(FIELDS[0]))?
+        .ok_or_else(|| A::Error::invalid_length(0, &ELEMENTS))?;
+      let hop = seq
+        .next_element_seed(CountOf(FIELDS[1]))?
+        .ok_or_else(|| A::Error::invalid_length(1, &ELEMENTS))?;
+      let tail = seq
+        .next_element::<TailPolicy>()?
+        .ok_or_else(|| A::Error::invalid_length(2, &ELEMENTS))?;
+      let max_windows = seq
+        .next_element::<Option<MaxWindows>>()?
+        .ok_or_else(|| A::Error::invalid_length(3, &ELEMENTS))?;
+      exhausted(&mut seq, FIELDS.len(), "WindowOptions")?;
+      Ok(WindowOptions {
+        window,
+        hop,
+        tail,
+        max_windows: max_windows.map(|MaxWindows(cap)| cap),
+      })
+    }
+  }
+
+  impl<'de> Deserialize<'de> for WindowOptions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+      deserializer.deserialize_struct("WindowOptions", FIELDS, OptionsVisitor)
+    }
+  }
+};
 
 impl WindowOptions {
   /// A geometry with the given window size, no overlap (`hop == window`),

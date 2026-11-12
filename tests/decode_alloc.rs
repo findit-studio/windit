@@ -5,9 +5,10 @@
 //! smoother feeding a `Hangover(Dwell(Vote))` gate, every P3 state machine active —
 //! touches the heap zero times.
 //!
-//! Proving that needs an allocator that refuses, which is a process-wide setting,
-//! so the whole file is a single test in its own binary: nothing else runs while
-//! the refusal is armed. The refusal is armed at a one-byte threshold around the
+//! Proving that needs an allocator that refuses, and the allocator is process-wide:
+//! the harness's own threads allocate while the test runs (its main thread records
+//! each running test). So the refusal is armed on the test's own thread alone, and
+//! the harness is never refused. It is armed at a one-byte threshold around the
 //! streaming drives alone, so *any* heap allocation on that path is caught.
 //!
 //! The failure mode: the streaming path has no error channel for an allocation (it
@@ -33,7 +34,8 @@
 use core::mem::{align_of, size_of};
 use std::{
   alloc::{GlobalAlloc, Layout, System},
-  sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+  cell::Cell,
+  sync::atomic::{AtomicUsize, Ordering},
 };
 
 use windit::{
@@ -51,8 +53,14 @@ use windit::{
 /// else to the system allocator.
 struct Refusing;
 
-/// Whether the refusal is in effect.
-static ARMED: AtomicBool = AtomicBool::new(false);
+std::thread_local! {
+  /// Whether the refusal is in effect on this thread. Only the test's own
+  /// thread arms it, so the harness's threads, which allocate while the test
+  /// runs, are never refused. A `const`-initialized `Cell` has no destructor,
+  /// so it is read without allocating, which is what lets the allocator read
+  /// it.
+  static ARMED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// The size at or above which an armed allocation is refused. Left at `MAX`
 /// (refuse nothing) except around the streaming drives, where it drops to one byte
@@ -65,7 +73,7 @@ static LIMIT: AtomicUsize = AtomicUsize::new(usize::MAX);
 // is freed by an allocator that did not allocate it.
 unsafe impl GlobalAlloc for Refusing {
   unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && layout.size() >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && layout.size() >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.alloc(layout) }
@@ -76,7 +84,7 @@ unsafe impl GlobalAlloc for Refusing {
   }
 
   unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if ARMED.load(Ordering::Relaxed) && new_size >= LIMIT.load(Ordering::Relaxed) {
+    if ARMED.get() && new_size >= LIMIT.load(Ordering::Relaxed) {
       return core::ptr::null_mut();
     }
     unsafe { System.realloc(ptr, layout, new_size) }
@@ -206,10 +214,10 @@ fn decoder_drive_does_not_allocate_and_state_sizes_are_pinned() {
   // assertions at all means neither drive asked the heap for anything: a refusal
   // would have aborted this binary through `handle_alloc_error`.
   LIMIT.store(1, Ordering::Relaxed);
-  ARMED.store(true, Ordering::Relaxed);
+  ARMED.set(true);
   let armed_separate = drive_decoder_checksum(&input, separate);
   let armed_unbounded = drive_decoder_checksum(&input, unbounded);
-  ARMED.store(false, Ordering::Relaxed);
+  ARMED.set(false);
 
   assert_eq!(armed_separate, expect_separate);
   assert_eq!(armed_unbounded, expect_unbounded);

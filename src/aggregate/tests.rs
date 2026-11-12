@@ -3816,6 +3816,18 @@ fn kind_serde_wire_format_is_pinned() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn kind_refuses_an_unknown_key_inside_ema() {
+  use std::string::ToString;
+
+  // A key `Ema` does not have is refused by name, as every windit wire type
+  // refuses one; dropped, it would configure nothing without a word.
+  let refused =
+    serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5,"window":3}}"#).unwrap_err();
+  assert!(refused.to_string().contains("window"), "{refused}");
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn kind_serde_round_trip() {
   for kind in [
     AggregatePolicyKind::CoverageWeightedMean,
@@ -3832,6 +3844,150 @@ fn kind_serde_round_trip() {
   let json = serde_json::to_string(&AggregatePolicyKind::Ema { alpha: 0.75 }).unwrap();
   let back: AggregatePolicyKind = serde_json::from_str(&json).unwrap();
   assert!(matches!(back, AggregatePolicyKind::Ema { alpha } if alpha == 0.75));
+}
+
+/// Every variant, in each format the crate's laws read: the three
+/// human-readable ones through the strict road, CBOR and postcard through the
+/// derived one. TOML holds the selector inside a document, as a configuration
+/// does.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_round_trips_through_every_format() {
+  #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+  struct Document {
+    aggregate: AggregatePolicyKind,
+  }
+
+  for kind in [
+    AggregatePolicyKind::CoverageWeightedMean,
+    AggregatePolicyKind::MeanRenormalized,
+    AggregatePolicyKind::Ema { alpha: 0.25 },
+    AggregatePolicyKind::SaliencyWeighted,
+  ] {
+    let json = serde_json::to_string(&kind).unwrap();
+    assert_eq!(
+      serde_json::from_str::<AggregatePolicyKind>(&json).unwrap(),
+      kind,
+      "JSON"
+    );
+    let yaml = serde_yaml_ng::to_string(&kind).unwrap();
+    assert_eq!(
+      serde_yaml_ng::from_str::<AggregatePolicyKind>(&yaml).unwrap(),
+      kind,
+      "YAML {yaml}"
+    );
+    let document = Document { aggregate: kind };
+    let toml = toml::to_string(&document).unwrap();
+    assert_eq!(
+      toml::from_str::<Document>(&toml).unwrap(),
+      document,
+      "TOML {toml}"
+    );
+    let mut cbor = Vec::new();
+    ciborium::into_writer(&kind, &mut cbor).unwrap();
+    assert_eq!(
+      ciborium::from_reader::<AggregatePolicyKind, _>(cbor.as_slice()).unwrap(),
+      kind,
+      "CBOR"
+    );
+    let compact = postcard::to_allocvec(&kind).unwrap();
+    assert_eq!(
+      postcard::from_bytes::<AggregatePolicyKind>(&compact).unwrap(),
+      kind,
+      "postcard"
+    );
+  }
+}
+
+/// In JSON, a unit variant is a name: written as a one-entry map, it is
+/// refused by name whatever its value, `null` included.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_json() {
+  use std::string::ToString;
+
+  for (document, named) in [
+    (r#"{"MeanRenormalized":null}"#, "MeanRenormalized"),
+    (r#"{"CoverageWeightedMean":{}}"#, "CoverageWeightedMean"),
+    (r#"{"SaliencyWeighted":{"alpha":0.5}}"#, "SaliencyWeighted"),
+  ] {
+    let refused = serde_json::from_str::<AggregatePolicyKind>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    serde_json::from_str::<AggregatePolicyKind>(r#""MeanRenormalized""#).unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5}}"#).unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+}
+
+/// In TOML, the same: a unit variant written as a table, empty or not, or as
+/// an array, is refused by name.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_toml() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    aggregate: AggregatePolicyKind,
+  }
+
+  let read = |text: &str| toml::from_str::<Document>(text).map(|document| document.aggregate);
+  for (document, named) in [
+    ("aggregate = { MeanRenormalized = {} }", "MeanRenormalized"),
+    ("aggregate = { SaliencyWeighted = [] }", "SaliencyWeighted"),
+    (
+      "aggregate = { CoverageWeightedMean = { alpha = 0.5 } }",
+      "CoverageWeightedMean",
+    ),
+  ] {
+    let refused = read(document).unwrap_err().to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    read("aggregate = \"MeanRenormalized\"").unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    read("aggregate = { Ema = { alpha = 0.5 } }").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+}
+
+/// In YAML, the same, and the tagged forms YAML writes an enum in still read.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_refuses_a_value_on_a_unit_variant_in_yaml() {
+  use std::string::ToString;
+
+  for (document, named) in [
+    ("MeanRenormalized: ~", "MeanRenormalized"),
+    ("CoverageWeightedMean: {}", "CoverageWeightedMean"),
+    ("SaliencyWeighted: {alpha: 0.5}", "SaliencyWeighted"),
+  ] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(document)
+      .unwrap_err()
+      .to_string();
+    assert!(refused.contains(named), "{document}: {refused}");
+  }
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("MeanRenormalized").unwrap(),
+    AggregatePolicyKind::MeanRenormalized
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("Ema: {alpha: 0.5}").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
+  assert_eq!(
+    serde_yaml_ng::from_str::<AggregatePolicyKind>("!Ema {alpha: 0.5}").unwrap(),
+    AggregatePolicyKind::Ema { alpha: 0.5 }
+  );
 }
 
 // Shared quantized fixture: W = 3, D = 8, mixed-sign non-cancelling codes with
@@ -4282,5 +4438,214 @@ fn half_stored_non_finite_is_rejected() {
       aggregate(&MeanRenormalized, &windows),
       Err(WinditError::NonFinite)
     ));
+  }
+}
+
+/// `Ema` is read from a map only: TOML's array form, which the derive read
+/// as `alpha` with the rest dropped, is refused naming `Ema`.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_reads_ema_from_a_map_only_in_toml() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let refused = toml::from_str::<Document>("aggregate = { Ema = [0.5, 0.75] }")
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("Ema"), "{refused}");
+}
+
+/// A key beside the variant is refused by its name.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_names_a_key_beside_its_variant() {
+  use std::string::ToString;
+
+  let refused = serde_json::from_str::<AggregatePolicyKind>(r#"{"Ema":{"alpha":0.5},"bogus":1}"#)
+    .unwrap_err()
+    .to_string();
+  assert!(refused.contains("bogus"), "{refused}");
+}
+
+/// A tagged YAML value that a unit variant refuses names the variant.
+#[cfg(feature = "serde")]
+#[test]
+fn kind_names_its_variant_in_a_refused_yaml_tag() {
+  use std::string::ToString;
+
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  // The tagged value is refused by the reader YAML asked for it, which names
+  // the variant, and YAML locates the refusal at the tagged value.
+  for doc in [
+    "aggregate: !MeanRenormalized {alpha: 0.5}",
+    "aggregate: !MeanRenormalized 7",
+  ] {
+    let refused = serde_yaml_ng::from_str::<Document>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    let column = doc.find('!').unwrap() + 1;
+    assert_eq!((at.line(), at.column()), (1, column), "{doc}: {refused}");
+    assert!(
+      refused.to_string().contains("`MeanRenormalized`"),
+      "{doc}: {refused}"
+    );
+  }
+}
+
+/// The 1-based column at which serde_json reports a refused `token` in `doc`:
+/// the token's last character.
+#[cfg(feature = "serde")]
+fn json_column(doc: &str, token: &str) -> usize {
+  doc.find(token).expect("the token is in the document") + token.len()
+}
+
+/// `Ema`'s refused `alpha` is named by the reader JSON asked for it, and JSON
+/// places the refusal at the value.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_json() {
+  use std::string::ToString;
+
+  let doc = r#"{"Ema":{"alpha":"0.5"}}"#;
+  let refused = serde_json::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  assert!(
+    refused
+      .to_string()
+      .contains("expected `Ema`'s `alpha`, a number"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, r#""0.5""#)),
+    "{refused}"
+  );
+}
+
+/// TOML marks `Ema`'s refused `alpha` with the value's own span.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_toml() {
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let doc = r#"aggregate = { Ema = { alpha = "0.5" } }"#;
+  let refused = toml::from_str::<Document>(doc).unwrap_err();
+  let at = doc.find(r#""0.5""#).unwrap();
+  assert_eq!(refused.span(), Some(at..at + 5), "{refused}");
+  assert!(refused.message().contains("`Ema`'s `alpha`"), "{refused}");
+}
+
+/// YAML locates `Ema`'s refused `alpha` at the value, in a map and under a tag.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_is_named_and_located_in_yaml() {
+  use std::string::ToString;
+
+  for doc in [r#"Ema: {alpha: "0.5"}"#, r#"!Ema {alpha: "0.5"}"#] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    let column = doc.find(r#""0.5""#).unwrap() + 1;
+    assert_eq!((at.line(), at.column()), (1, column), "{doc}: {refused}");
+    assert!(
+      refused.to_string().contains("`Ema`'s `alpha`"),
+      "{doc}: {refused}"
+    );
+  }
+}
+
+/// serde's `f64` takes no integer offered as an `i128` or a `u128`, and neither
+/// does `alpha`'s reader: TOML offers an integer past `u64` as one, and it is
+/// refused, named, at the value.
+#[cfg(feature = "serde")]
+#[test]
+fn ema_alpha_refuses_a_128_bit_integer_as_f64_does() {
+  #[derive(Debug, serde::Deserialize)]
+  struct Document {
+    #[allow(dead_code)]
+    aggregate: AggregatePolicyKind,
+  }
+
+  let doc = "aggregate = { Ema = { alpha = 18446744073709551616 } }";
+  let refused = toml::from_str::<Document>(doc).unwrap_err();
+  let at = doc.find("18446744073709551616").unwrap();
+  assert_eq!(refused.span(), Some(at..at + 20), "{refused}");
+  assert!(
+    refused
+      .message()
+      .contains("expected `Ema`'s `alpha`, a number"),
+    "{refused}"
+  );
+}
+
+/// A key beside the variant is refused by its own reader, so the format places
+/// the refusal at that key.
+#[cfg(feature = "serde")]
+#[test]
+fn a_key_beside_the_variant_is_named_and_located() {
+  use std::string::ToString;
+
+  let doc = "Ema: {alpha: 0.5}\nbogus: 1";
+  let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  let at = refused.location().expect("a located refusal");
+  assert_eq!((at.line(), at.column()), (2, 1), "{refused}");
+  assert!(
+    refused.to_string().contains("`bogus` beside `Ema`"),
+    "{refused}"
+  );
+
+  let doc = r#"{"Ema":{"alpha":0.5},"bogus":1}"#;
+  let refused = serde_json::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+  assert!(
+    refused.to_string().contains("`bogus` beside `Ema`"),
+    "{refused}"
+  );
+  assert_eq!(
+    (refused.line(), refused.column()),
+    (1, json_column(doc, r#""bogus""#)),
+    "{refused}"
+  );
+}
+
+/// A policy's keys and `Ema`'s are read by windit's own readers, whatever their
+/// shape: a key that is not a name is refused naming what is expected, and a
+/// repeated field as a duplicate, each at the key.
+#[cfg(feature = "serde")]
+#[test]
+fn policy_keys_are_named_and_located() {
+  use std::string::ToString;
+
+  for (doc, (line, column), named) in [
+    (
+      "? [Ema]\n: {alpha: 0.5}",
+      (1, 3),
+      "expected a policy's name: `CoverageWeightedMean`, `MeanRenormalized`, `Ema`, `SaliencyWeighted`",
+    ),
+    (
+      "Ema: {? [alpha] : 0.5}",
+      (1, 9),
+      "expected a field of `Ema`: `alpha`",
+    ),
+    (
+      "Ema: {alpha: 0.5, alpha: 0.6}",
+      (1, 19),
+      "duplicate field `alpha`",
+    ),
+  ] {
+    let refused = serde_yaml_ng::from_str::<AggregatePolicyKind>(doc).unwrap_err();
+    let at = refused.location().expect("a located refusal");
+    assert_eq!((at.line(), at.column()), (line, column), "{doc}: {refused}");
+    assert!(refused.to_string().contains(named), "{doc}: {refused}");
   }
 }

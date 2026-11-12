@@ -55,6 +55,12 @@ pub mod windowed;
 
 mod error;
 
+#[cfg(feature = "serde")]
+mod keys;
+
+#[cfg(feature = "serde")]
+mod refusal;
+
 #[cfg(all(test, any(feature = "std", feature = "alloc")))]
 mod test_support;
 
